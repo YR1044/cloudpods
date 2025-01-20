@@ -23,6 +23,7 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/netutils"
 
+	comapi "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/hostman/guestfs/fsdriver"
 	deployapi "yunion.io/x/onecloud/pkg/hostman/hostdeployer/apis"
 )
@@ -30,6 +31,7 @@ import (
 func DetectRootFs(part fsdriver.IDiskPartition) (fsdriver.IRootFsDriver, error) {
 	for _, newDriverFunc := range fsdriver.GetRootfsDrivers() {
 		d := newDriverFunc(part)
+		d.SetVirtualObject(d)
 		if testRootfs(d) {
 			return d, nil
 		}
@@ -99,15 +101,21 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 	}
 
 	if deployInfo.IsInit {
-		if err = rootfs.CleanNetworkScripts(partition); err != nil {
+		if err := rootfs.CleanNetworkScripts(partition); err != nil {
 			return nil, errors.Wrap(err, "Clean network scripts")
 		}
-	}
-	if len(deployInfo.Deploys) > 0 {
-		if err = rootfs.DeployFiles(deployInfo.Deploys); err != nil {
-			return nil, fmt.Errorf("DeployFiles: %v", err)
+		if len(deployInfo.Deploys) > 0 {
+			if err := rootfs.DeployFiles(deployInfo.Deploys); err != nil {
+				return nil, errors.Wrap(err, "DeployFiles")
+			}
+		}
+		if len(deployInfo.UserData) > 0 {
+			if err := rootfs.DeployUserData(deployInfo.UserData); err != nil {
+				return nil, errors.Wrap(err, "DeployUserData")
+			}
 		}
 	}
+
 	if deployInfo.Telegraf != nil {
 		if deployed, err := rootfs.DeployTelegraf(deployInfo.Telegraf.TelegrafConf); err != nil {
 			return nil, errors.Wrap(err, "deploy telegraf")
@@ -116,26 +124,36 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 		}
 	}
 
-	if err = rootfs.DeployHostname(partition, hn, domain); err != nil {
-		return nil, fmt.Errorf("DeployHostname: %v", err)
+	if err := rootfs.DeployHostname(partition, hn, domain); err != nil {
+		return nil, errors.Wrap(err, "DeployHostname")
 	}
-	if err = rootfs.DeployHosts(partition, hn, domain, ips); err != nil {
-		return nil, fmt.Errorf("DeployHosts: %v", err)
+	if err := rootfs.DeployHosts(partition, hn, domain, ips); err != nil {
+		return nil, errors.Wrap(err, "DeployHosts")
 	}
-	if err = rootfs.DeployNetworkingScripts(partition, nics); err != nil {
-		return nil, fmt.Errorf("DeployNetworkingScripts: %v", err)
-	}
-	if len(nicsStandby) > 0 {
-		if err = rootfs.DeployStandbyNetworkingScripts(partition, nics, nicsStandby); err != nil {
-			return nil, fmt.Errorf("DeployStandbyNetworkingScripts: %v", err)
+
+	if guestDesc.Hypervisor == comapi.HYPERVISOR_KVM {
+		if err := rootfs.DeployQgaService(partition); err != nil {
+			return nil, errors.Wrap(err, "DeployQgaService")
+		}
+		if err := rootfs.DeployQgaBlackList(partition); err != nil {
+			return nil, errors.Wrap(err, "DeployQgaBlackList")
 		}
 	}
-	if err = rootfs.DeployUdevSubsystemScripts(partition); err != nil {
-		return nil, fmt.Errorf("DeployUdevSubsystemScripts: %v", err)
+
+	if err := rootfs.DeployNetworkingScripts(partition, nics); err != nil {
+		return nil, errors.Wrap(err, "DeployNetworkingScripts")
+	}
+	if len(nicsStandby) > 0 {
+		if err := rootfs.DeployStandbyNetworkingScripts(partition, nics, nicsStandby); err != nil {
+			return nil, errors.Wrap(err, "DeployStandbyNetworkingScripts")
+		}
+	}
+	if err := rootfs.DeployUdevSubsystemScripts(partition); err != nil {
+		return nil, errors.Wrap(err, "DeployUdevSubsystemScripts")
 	}
 	if deployInfo.IsInit {
-		if err = rootfs.DeployFstabScripts(partition, guestDesc.Disks); err != nil {
-			return nil, fmt.Errorf("DeployFstabScripts: %v", err)
+		if err := rootfs.DeployFstabScripts(partition, guestDesc.Disks); err != nil {
+			return nil, errors.Wrap(err, "DeployFstabScripts")
 		}
 	}
 
@@ -147,12 +165,12 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 		}
 		if len(account) > 0 {
 			if err = rootfs.DeployPublicKey(partition, account, deployInfo.PublicKey); err != nil {
-				return nil, fmt.Errorf("DeployPublicKey: %v", err)
+				return nil, errors.Wrap(err, "DeployPublicKey")
 			}
 			var secret string
 			if secret, err = rootfs.ChangeUserPasswd(partition, account, gid,
 				deployInfo.PublicKey.PublicKey, deployInfo.Password); err != nil {
-				return nil, fmt.Errorf("ChangeUserPasswd: %v", err)
+				return nil, errors.Wrap(err, "ChangeUserPasswd")
 			}
 			if len(secret) > 0 {
 				ret.Key = secret
@@ -162,7 +180,7 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 	}
 
 	if err = rootfs.DeployYunionroot(partition, deployInfo.PublicKey, deployInfo.IsInit, deployInfo.EnableCloudInit); err != nil {
-		return nil, fmt.Errorf("DeployYunionroot: %v", err)
+		return nil, errors.Wrap(err, "DeployYunionroot")
 	}
 	if partition.SupportSerialPorts() {
 		if deployInfo.EnableTty {
@@ -178,7 +196,7 @@ func DoDeployGuestFs(rootfs fsdriver.IRootFsDriver, guestDesc *deployapi.GuestDe
 		}
 	}
 	if err = rootfs.CommitChanges(partition); err != nil {
-		return nil, fmt.Errorf("CommitChanges: %v", err)
+		return nil, errors.Wrap(err, "CommitChanges")
 	}
 
 	log.Infof("Deploy finished, return: %s", ret.String())

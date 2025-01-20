@@ -25,12 +25,15 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/gotypes"
 	"yunion.io/x/pkg/util/billing"
 	"yunion.io/x/pkg/util/netutils"
-	"yunion.io/x/pkg/util/pinyinutils"
-	"yunion.io/x/pkg/util/rbacscope"
+	"yunion.io/x/pkg/util/regutils"
+	"yunion.io/x/pkg/util/secrules"
 	"yunion.io/x/pkg/utils"
+	"yunion.io/x/sqlchemy"
 
+	"yunion.io/x/onecloud/pkg/apis"
 	billing_api "yunion.io/x/onecloud/pkg/apis/billing"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -47,14 +50,6 @@ import (
 
 type SManagedVirtualizationRegionDriver struct {
 	SVirtualizationRegionDriver
-}
-
-func (self *SManagedVirtualizationRegionDriver) IsAllowSecurityGroupNameRepeat() bool {
-	return true
-}
-
-func (self *SManagedVirtualizationRegionDriver) GenerateSecurityGroupName(name string) string {
-	return pinyinutils.Text2Pinyin(name)
 }
 
 func (self *SManagedVirtualizationRegionDriver) IsSupportedElasticcacheSecgroup() bool {
@@ -111,7 +106,7 @@ func (self *SManagedVirtualizationRegionDriver) IsSupportLoadbalancerListenerRul
 
 func validateUniqueById(ctx context.Context, userCred mcclient.TokenCredential, man db.IResourceModelManager, id string) error {
 	q := man.Query().Equals("id", id)
-	q = man.FilterByOwner(q, man, userCred, userCred, man.NamespaceScope())
+	q = man.FilterByOwner(ctx, q, man, userCred, userCred, man.NamespaceScope())
 	count, err := q.CountWithError()
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -197,7 +192,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateLoadbalancerInstanc
 		networks = append(networks, input.Networks...)
 		for i := range networks {
 			if len(networks[i]) > 0 {
-				netObj, err := validators.ValidateModel(userCred, models.NetworkManager, &networks[i])
+				netObj, err := validators.ValidateModel(ctx, userCred, models.NetworkManager, &networks[i])
 				if err != nil {
 					return nil, err
 				}
@@ -211,7 +206,9 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateLoadbalancerInstanc
 		manager := lb.GetCloudprovider()
 		params.ProjectId, err = manager.SyncProject(ctx, userCred, lb.ProjectId)
 		if err != nil {
-			logclient.AddSimpleActionLog(lb, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+			if errors.Cause(err) != cloudprovider.ErrNotSupported && errors.Cause(err) != cloudprovider.ErrNotImplemented {
+				logclient.AddSimpleActionLog(lb, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+			}
 		}
 
 		log.Debugf("create lb with params: %s", jsonutils.Marshal(params).String())
@@ -320,80 +317,144 @@ func (self *SManagedVirtualizationRegionDriver) RequestDeleteLoadbalancer(ctx co
 			if errors.Cause(err) == cloudprovider.ErrNotFound {
 				return nil, nil
 			}
+			return nil, errors.Wrapf(err, "GetILoadbalancer")
 		}
-		return nil, iLb.Delete(ctx)
-	})
-	return nil
-}
-
-func (self *SManagedVirtualizationRegionDriver) RequestCreateLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SCachedLoadbalancerAcl, task taskman.ITask) error {
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		return nil, lbacl.CreateIAcl(ctx)
-	})
-	return nil
-}
-
-func (self *SManagedVirtualizationRegionDriver) RequestSyncLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SCachedLoadbalancerAcl, task taskman.ITask) error {
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		return nil, lbacl.SyncIAcl(ctx)
-	})
-	return nil
-}
-
-func (self *SManagedVirtualizationRegionDriver) deleteLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SCachedLoadbalancerAcl, task taskman.ITask) (jsonutils.JSONObject, error) {
-	if jsonutils.QueryBoolean(task.GetParams(), "purge", false) {
+		err = iLb.Delete(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "iLb.Delete")
+		}
 		return nil, nil
-	}
-	iRegion, err := lbacl.GetIRegion(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(lbacl.ExternalId) == 0 {
-		return nil, nil
-	}
-
-	iLoadbalancerAcl, err := iRegion.GetILoadBalancerAclById(lbacl.ExternalId)
-	if err != nil {
-		if errors.Cause(err) == cloudprovider.ErrNotFound {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return nil, iLoadbalancerAcl.Delete()
-}
-
-func (self *SManagedVirtualizationRegionDriver) RequestDeleteLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SCachedLoadbalancerAcl, task taskman.ITask) error {
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		return self.deleteLoadbalancerAcl(ctx, userCred, lbacl, task)
 	})
 	return nil
 }
 
-func (self *SManagedVirtualizationRegionDriver) RequestCreateLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *models.SCachedLoadbalancerCertificate, task taskman.ITask) error {
+func (self *SManagedVirtualizationRegionDriver) RequestCreateLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SLoadbalancerAcl, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		return nil, lbcert.CreateICertificate(ctx)
+		iRegion, err := lbacl.GetIRegion(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetIRegion")
+		}
+		opts := &cloudprovider.SLoadbalancerAccessControlList{
+			Name:   lbacl.Name,
+			Entrys: []cloudprovider.SLoadbalancerAccessControlListEntry{},
+		}
+		if lbacl.AclEntries != nil {
+			for _, entry := range *lbacl.AclEntries {
+				opts.Entrys = append(opts.Entrys, cloudprovider.SLoadbalancerAccessControlListEntry{
+					Comment: entry.Comment,
+					CIDR:    entry.Cidr,
+				})
+			}
+		}
+		iAcl, err := iRegion.CreateILoadBalancerAcl(opts)
+		if err != nil {
+			return nil, errors.Wrapf(err, "CreateILoadBalancerAcl")
+		}
+		_, err = db.Update(lbacl, func() error {
+			lbacl.ExternalId = iAcl.GetGlobalId()
+			return nil
+		})
+		return nil, err
 	})
 	return nil
 }
 
-func (self *SManagedVirtualizationRegionDriver) RequestDeleteLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *models.SCachedLoadbalancerCertificate, task taskman.ITask) error {
+func (self *SManagedVirtualizationRegionDriver) RequestUpdateLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SLoadbalancerAcl, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		if jsonutils.QueryBoolean(task.GetParams(), "purge", false) {
-			return nil, nil
+		iAcl, err := lbacl.GetILoadbalancerAcl(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetILoadbalancerAcl")
 		}
+		opts := &cloudprovider.SLoadbalancerAccessControlList{
+			Name:   lbacl.Name,
+			Entrys: []cloudprovider.SLoadbalancerAccessControlListEntry{},
+		}
+		if lbacl.AclEntries != nil {
+			for _, entry := range *lbacl.AclEntries {
+				opts.Entrys = append(opts.Entrys, cloudprovider.SLoadbalancerAccessControlListEntry{
+					Comment: entry.Comment,
+					CIDR:    entry.Cidr,
+				})
+			}
+		}
+		return nil, iAcl.Sync(opts)
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestLoadbalancerAclSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SLoadbalancerAcl, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iAcl, err := lbacl.GetILoadbalancerAcl(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetILoadbalancerAcl")
+		}
+		return nil, lbacl.SyncWithCloudAcl(ctx, userCred, iAcl, lbacl.GetCloudprovider())
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestDeleteLoadbalancerAcl(ctx context.Context, userCred mcclient.TokenCredential, lbacl *models.SLoadbalancerAcl, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iAcl, err := lbacl.GetILoadbalancerAcl(ctx)
+		if err != nil {
+			if errors.Cause(err) == cloudprovider.ErrNotFound {
+				return nil, nil
+			}
+			return nil, errors.Wrapf(err, "GetILoadbalancerAcl")
+		}
+		return nil, iAcl.Delete()
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestCreateLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *models.SLoadbalancerCertificate, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
 		iRegion, err := lbcert.GetIRegion(ctx)
 		if err != nil {
 			return nil, err
 		}
-		iLoadbalancerCert, err := iRegion.GetILoadBalancerCertificateById(lbcert.ExternalId)
+
+		opts := &cloudprovider.SLoadbalancerCertificate{
+			Name:        lbcert.Name,
+			PrivateKey:  lbcert.PrivateKey,
+			Certificate: lbcert.Certificate,
+		}
+
+		iCert, err := iRegion.CreateILoadBalancerCertificate(opts)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = db.Update(lbcert, func() error {
+			lbcert.ExternalId = iCert.GetGlobalId()
+			return nil
+		})
+		return nil, err
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestDeleteLoadbalancerCertificate(ctx context.Context, userCred mcclient.TokenCredential, lbcert *models.SLoadbalancerCertificate, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iCert, err := lbcert.GetILoadbalancerCertificate(ctx)
 		if err != nil {
 			if errors.Cause(err) == cloudprovider.ErrNotFound {
 				return nil, nil
 			}
 			return nil, err
 		}
-		return nil, iLoadbalancerCert.Delete()
+		return nil, iCert.Delete()
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestLoadbalancerCertificateSyncstatus(ctx context.Context, userCred mcclient.TokenCredential, lbcert *models.SLoadbalancerCertificate, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iCert, err := lbcert.GetILoadbalancerCertificate(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return nil, lbcert.SyncWithCloudCert(ctx, userCred, iCert, lbcert.GetCloudprovider())
 	})
 	return nil
 }
@@ -609,12 +670,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateLoadbalancerListene
 				if err != nil {
 					return nil, errors.Wrapf(err, "GetCertificate")
 				}
-
-				lbcert, err := models.CachedLoadbalancerCertificateManager.GetOrCreateCachedCertificate(ctx, userCred, provider, lblis, cert)
-				if err != nil {
-					return nil, errors.Wrap(err, "CachedLoadbalancerCertificateManager.GetOrCreateCachedCertificate")
-				}
-				params.CertificateId = lbcert.ExternalId
+				params.CertificateId = cert.ExternalId
 			}
 		}
 
@@ -624,12 +680,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateLoadbalancerListene
 				if err != nil {
 					return nil, errors.Wrap(err, "GetAcl")
 				}
-
-				lbacl, err := models.CachedLoadbalancerAclManager.GetOrCreateCachedAcl(ctx, userCred, provider, lblis, acl)
-				if err != nil {
-					return nil, errors.Wrap(err, "CachedLoadbalancerAclManager.GetOrCreateCachedAcl")
-				}
-				params.AccessControlListId = lbacl.ExternalId
+				params.AccessControlListId = acl.ExternalId
 				params.AccessControlListType = lblis.AclType
 				params.AccessControlListStatus = lblis.AclStatus
 			}
@@ -726,12 +777,8 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncLoadbalancerListener(
 				if err != nil {
 					return nil, errors.Wrapf(err, "GetCertificate")
 				}
-				lbcert, err := models.CachedLoadbalancerCertificateManager.GetOrCreateCachedCertificate(ctx, userCred, provider, lblis, cert)
-				if err != nil {
-					return nil, errors.Wrap(err, "GetOrCreateCachedCertificate")
-				}
 				err = iLis.ChangeCertificate(ctx, &cloudprovider.ListenerCertificateOptions{
-					CertificateId: lbcert.ExternalId,
+					CertificateId: cert.ExternalId,
 				})
 				if err != nil && errors.Cause(err) != cloudprovider.ErrNotSupported && errors.Cause(err) != cloudprovider.ErrNotImplemented {
 					return nil, errors.Wrapf(err, "ChangeCertificate")
@@ -747,12 +794,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncLoadbalancerListener(
 					if err != nil {
 						return nil, errors.Wrapf(err, "GetAcl")
 					}
-
-					lbacl, err := models.CachedLoadbalancerAclManager.GetOrCreateCachedAcl(ctx, userCred, provider, lblis, acl)
-					if err != nil {
-						return nil, errors.Wrap(err, "regionDriver.RequestSyncLoadbalancerListener.GetAcl")
-					}
-					opts.AclId = lbacl.ExternalId
+					opts.AclId = acl.ExternalId
 				}
 				err := iLis.SetAcl(ctx, opts)
 				if err != nil && errors.Cause(err) != cloudprovider.ErrNotSupported {
@@ -843,7 +885,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncstatusLoadbalancerLis
 		}
 		status := iListener.GetStatus()
 		if utils.IsInStringArray(status, []string{api.LB_STATUS_ENABLED, api.LB_STATUS_DISABLED}) {
-			return nil, lblis.SetStatus(userCred, status, "")
+			return nil, lblis.SetStatus(ctx, userCred, status, "")
 		}
 		return nil, fmt.Errorf("Unknown loadbalancer listener status %s", status)
 	})
@@ -940,12 +982,15 @@ func (self *SManagedVirtualizationRegionDriver) RequestDeleteLoadbalancerListene
 func (self *SManagedVirtualizationRegionDriver) ValidateCreateVpcData(ctx context.Context, userCred mcclient.TokenCredential, input api.VpcCreateInput) (api.VpcCreateInput, error) {
 	return input, nil
 }
+
 func (self *SManagedVirtualizationRegionDriver) GetEipDefaultChargeType() string {
 	return api.EIP_CHARGE_TYPE_BY_TRAFFIC
 }
+
 func (self *SManagedVirtualizationRegionDriver) ValidateEipChargeType(chargeType string) error {
 	return nil
 }
+
 func (self *SManagedVirtualizationRegionDriver) ValidateCreateEipData(ctx context.Context, userCred mcclient.TokenCredential, input *api.SElasticipCreateInput) error {
 	return nil
 }
@@ -1002,6 +1047,27 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateVpc(ctx context.Con
 
 func (self *SManagedVirtualizationRegionDriver) RequestDeleteVpc(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, vpc *models.SVpc, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		secgroups, err := vpc.GetSecurityGroups()
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetSecurityGroups")
+		}
+		for i := range secgroups {
+			iGroup, err := secgroups[i].GetISecurityGroup(ctx)
+			if err != nil {
+				if errors.Cause(err) == cloudprovider.ErrNotFound {
+					continue
+				}
+				return nil, errors.Wrapf(err, "GetISecurityGroup")
+			}
+			err = iGroup.Delete()
+			if err != nil && errors.Cause(err) != cloudprovider.ErrNotSupported {
+				return nil, errors.Wrapf(err, "delete secgroup %s", secgroups[i].Name)
+			}
+			err = secgroups[i].RealDelete(ctx, userCred)
+			if err != nil {
+				return nil, errors.Wrapf(err, "real delete secgroup %s", secgroups[i].Name)
+			}
+		}
 		ivpc, err := vpc.GetIVpc(ctx)
 		if err != nil {
 			if errors.Cause(err) == cloudprovider.ErrNotFound {
@@ -1012,97 +1078,13 @@ func (self *SManagedVirtualizationRegionDriver) RequestDeleteVpc(ctx context.Con
 		}
 		err = ivpc.Delete()
 		if err != nil {
-			return nil, errors.Wrap(err, "ivpc.Delete(")
+			return nil, errors.Wrap(err, "Delete")
 		}
 		err = cloudprovider.WaitDeleted(ivpc, 10*time.Second, 300*time.Second)
 		if err != nil {
 			return nil, errors.Wrap(err, "cloudprovider.WaitDeleted")
 		}
 		return nil, nil
-	})
-	return nil
-}
-
-func (self *SManagedVirtualizationRegionDriver) RequestUpdateSnapshotPolicy(ctx context.Context, userCred mcclient.
-	TokenCredential, sp *models.SSnapshotPolicy, input cloudprovider.SnapshotPolicyInput, task taskman.ITask) error {
-	// it's too cumbersome to pass parameters in taskman, so change a simple way for the moment
-
-	//spcache, err := models.SnapshotPolicyCacheManager.FetchSnapshotPolicyCache(sp.GetId(), sp.CloudregionId, sp.ManagerId)
-	//if err != nil {
-	//	return errors.Wrapf(err, "Fetch cache ofsnapshotpolicy %s", sp.GetId())
-	//}
-	//return spcache.UpdateCloudSnapshotPolicy(&input)
-
-	return nil
-}
-
-// RequestApplySnapshotPolicy apply snapshotpolicy for public cloud.
-// In our system, one disk only can hava one snapshot policy attached.
-// Default, some public cloud such as Aliyun is same with us and this function shoule be used for these public cloud.
-// But in Some public cloud such as Qcloud different with us,
-// we should wirte a new function in corressponding regiondriver which detach all snapshotpolicy of disk after
-// attache new one.
-// You can refer to the implementations of function SQcloudRegionDriver.RequestApplySnapshotPolicy().
-func (self *SManagedVirtualizationRegionDriver) RequestApplySnapshotPolicy(ctx context.Context,
-	userCred mcclient.TokenCredential, task taskman.ITask, disk *models.SDisk, sp *models.SSnapshotPolicy,
-	data jsonutils.JSONObject) error {
-
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-
-		storage, _ := disk.GetStorage()
-		region, _ := storage.GetRegion()
-		regionId := region.GetId()
-		providerId := storage.ManagerId
-		spcache, err := models.SnapshotPolicyCacheManager.Register(ctx, userCred, sp.GetId(), regionId, providerId)
-		if err != nil {
-			return nil, errors.Wrap(err, "registersnapshotpolicy cache failed")
-		}
-
-		iRegion, err := disk.GetIRegion(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		err = iRegion.ApplySnapshotPolicyToDisks(spcache.GetExternalId(), disk.GetExternalId())
-		if err != nil {
-			return nil, err
-		}
-		data := jsonutils.NewDict()
-		data.Add(jsonutils.NewString(sp.GetId()), "snapshotpolicy_id")
-		return data, nil
-	})
-	return nil
-}
-
-func (self *SManagedVirtualizationRegionDriver) RequestCancelSnapshotPolicy(ctx context.Context, userCred mcclient.
-	TokenCredential, task taskman.ITask, disk *models.SDisk, sp *models.SSnapshotPolicy, data jsonutils.JSONObject) error {
-
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-
-		storage, _ := disk.GetStorage()
-		region, _ := storage.GetRegion()
-		regionId := region.GetId()
-		providerId := storage.ManagerId
-		spcache, err := models.SnapshotPolicyCacheManager.FetchSnapshotPolicyCache(sp.GetId(), regionId, providerId)
-
-		if err != nil {
-			return nil, errors.Wrap(err, "registersnapshotpolicy cache failed")
-		}
-
-		iRegion, err := spcache.GetIRegion(ctx)
-		if err != nil {
-			return nil, err
-		}
-		data := jsonutils.NewDict()
-		data.Add(jsonutils.NewString(sp.GetId()), "snapshotpolicy_id")
-		err = iRegion.CancelSnapshotPolicyToDisks(spcache.GetExternalId(), disk.GetExternalId())
-		if errors.Cause(err) == cloudprovider.ErrNotFound {
-			return data, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		return data, nil
 	})
 	return nil
 }
@@ -1195,20 +1177,6 @@ func (self *SManagedVirtualizationRegionDriver) OnDiskReset(ctx context.Context,
 	return nil
 }
 
-func (self *SManagedVirtualizationRegionDriver) ValidateCreateSnapshopolicyDiskData(ctx context.Context,
-	userCred mcclient.TokenCredential, disk *models.SDisk, snapshotPolicy *models.SSnapshotPolicy) error {
-
-	err := self.SBaseRegionDriver.ValidateCreateSnapshopolicyDiskData(ctx, userCred, disk, snapshotPolicy)
-	if err != nil {
-		return err
-	}
-
-	if snapshotPolicy.RetentionDays < -1 || snapshotPolicy.RetentionDays == 0 || snapshotPolicy.RetentionDays > 65535 {
-		return httperrors.NewInputParameterError("Retention days must in 1~65535 or -1")
-	}
-	return nil
-}
-
 func (self *SManagedVirtualizationRegionDriver) OnSnapshotDelete(ctx context.Context, snapshot *models.SSnapshot, task taskman.ITask, data jsonutils.JSONObject) error {
 	task.SetStage("OnManagedSnapshotDelete", nil)
 	task.ScheduleRun(data)
@@ -1221,67 +1189,6 @@ func (self *SManagedVirtualizationRegionDriver) RequestAssociateEipForNAT(ctx co
 		InstanceId:   nat.Id,
 	}
 	return eip.StartEipAssociateTask(ctx, userCred, jsonutils.Marshal(opts).(*jsonutils.JSONDict), task.GetTaskId())
-}
-
-func (self *SManagedVirtualizationRegionDriver) RequestPreSnapshotPolicyApply(ctx context.Context, userCred mcclient.
-	TokenCredential, task taskman.ITask, disk *models.SDisk, sp *models.SSnapshotPolicy, data jsonutils.JSONObject) error {
-
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-
-		return data, nil
-	})
-	return nil
-}
-
-func (self *SManagedVirtualizationRegionDriver) GetSecurityGroupVpcId(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, host *models.SHost, vpc *models.SVpc) (string, error) {
-	if region.GetDriver().IsSecurityGroupBelongGlobalVpc() {
-		gvpc, err := vpc.GetGlobalVpc()
-		if err != nil {
-			return "", err
-		}
-		return gvpc.ExternalId, nil
-	} else if region.GetDriver().IsSecurityGroupBelongVpc() {
-		return vpc.ExternalId, nil
-	}
-	return region.GetDriver().GetDefaultSecurityGroupVpcId(), nil
-}
-
-func (self *SManagedVirtualizationRegionDriver) RequestSyncSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, vpcId string, vpc *models.SVpc, secgroup *models.SSecurityGroup, remoteProjectId, service string) (string, error) {
-	lockman.LockRawObject(ctx, models.SecurityGroupCacheManager.Keyword(), fmt.Sprintf("%s-%s-%s", secgroup.Id, vpcId, vpc.ManagerId))
-	defer lockman.ReleaseRawObject(ctx, models.SecurityGroupCacheManager.Keyword(), fmt.Sprintf("%s-%s-%s", secgroup.Id, vpcId, vpc.ManagerId))
-
-	region, err := vpc.GetRegion()
-	if err != nil {
-		return "", errors.Wrap(err, "vpc.GetRegon")
-	}
-
-	if region.GetDriver().GetSecurityGroupPublicScope(service) == rbacscope.ScopeSystem {
-		remoteProjectId = ""
-	}
-
-	cache, err := models.SecurityGroupCacheManager.Register(ctx, userCred, secgroup.Id, vpcId, region.Id, vpc.ManagerId, remoteProjectId)
-	if err != nil {
-		return "", errors.Wrap(err, "SSecurityGroupCache.Register")
-	}
-
-	_, err = cache.GetOrCreateISecurityGroup(ctx)
-	if err != nil {
-		return "", errors.Wrapf(err, "GetOrCreateISecurityGroup")
-	}
-
-	return cache.ExternalId, nil
-}
-
-func (self *SManagedVirtualizationRegionDriver) RequestCacheSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, vpc *models.SVpc, secgroup *models.SSecurityGroup, removeProjectId string, task taskman.ITask) error {
-	vpcId, err := region.GetDriver().GetSecurityGroupVpcId(ctx, userCred, region, nil, vpc)
-	if err != nil {
-		return errors.Wrap(err, "GetSecurityGroupVpcId")
-	}
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		_, err := self.RequestSyncSecurityGroup(ctx, userCred, vpcId, vpc, secgroup, removeProjectId, "")
-		return nil, err
-	})
-	return nil
 }
 
 func (self *SManagedVirtualizationRegionDriver) RequestCreateDBInstance(ctx context.Context, userCred mcclient.TokenCredential, dbinstance *models.SDBInstance, task taskman.ITask) error {
@@ -1334,7 +1241,9 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateDBInstance(ctx cont
 		_cloudprovider := dbinstance.GetCloudprovider()
 		desc.ProjectId, err = _cloudprovider.SyncProject(ctx, userCred, dbinstance.ProjectId)
 		if err != nil {
-			logclient.AddSimpleActionLog(dbinstance, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+			if errors.Cause(err) != cloudprovider.ErrNotSupported && errors.Cause(err) != cloudprovider.ErrNotImplemented {
+				logclient.AddSimpleActionLog(dbinstance, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+			}
 		}
 
 		region, err := dbinstance.GetRegion()
@@ -1351,16 +1260,32 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateDBInstance(ctx cont
 		if err != nil {
 			return nil, errors.Wrapf(err, "GetSecgroups")
 		}
+		driver := region.GetDriver()
+		ownerId := dbinstance.GetOwnerId()
 		for i := range secgroups {
-			vpcId, err := region.GetDriver().GetSecurityGroupVpcId(ctx, userCred, region, nil, vpc)
-			if err != nil {
-				return nil, errors.Wrap(err, "GetSecurityGroupVpcId")
+			if secgroups[i].Id == api.SECGROUP_DEFAULT_ID {
+				filter, err := driver.GetSecurityGroupFilter(vpc)
+				if err != nil {
+					return nil, errors.Wrapf(err, "GetSecurityGroupFilter")
+				}
+				group, err := vpc.GetDefaultSecurityGroup(ownerId, filter)
+				if err != nil && errors.Cause(err) != sql.ErrNoRows {
+					return nil, err
+				}
+				if gotypes.IsNil(group) {
+					group, err = driver.CreateDefaultSecurityGroup(ctx, userCred, ownerId, vpc)
+					if err != nil {
+						return nil, errors.Wrapf(err, "CreateDefaultSecurityGroup")
+					}
+				}
+				if !utils.IsInStringArray(group.ExternalId, desc.SecgroupIds) {
+					desc.SecgroupIds = append(desc.SecgroupIds, group.ExternalId)
+				}
+				continue
 			}
-			secId, err := region.GetDriver().RequestSyncSecurityGroup(ctx, userCred, vpcId, vpc, &secgroups[i], desc.ProjectId, "")
-			if err != nil {
-				return nil, errors.Wrap(err, "SyncSecurityGroup")
+			if !utils.IsInStringArray(secgroups[i].ExternalId, desc.SecgroupIds) {
+				desc.SecgroupIds = append(desc.SecgroupIds, secgroups[i].ExternalId)
 			}
-			desc.SecgroupIds = append(desc.SecgroupIds, secId)
 		}
 
 		if dbinstance.BillingType == billing_api.BILLING_TYPE_PREPAID {
@@ -1496,7 +1421,9 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateDBInstanceFromBacku
 		_cloudprovider := rds.GetCloudprovider()
 		desc.ProjectId, err = _cloudprovider.SyncProject(ctx, userCred, rds.ProjectId)
 		if err != nil {
-			logclient.AddSimpleActionLog(rds, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+			if errors.Cause(err) != cloudprovider.ErrNotSupported && errors.Cause(err) != cloudprovider.ErrNotImplemented {
+				logclient.AddSimpleActionLog(rds, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+			}
 		}
 
 		region, err := rds.GetRegion()
@@ -1513,16 +1440,32 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateDBInstanceFromBacku
 		if err != nil {
 			return nil, errors.Wrapf(err, "GetSecgroups")
 		}
+		driver := region.GetDriver()
+		ownerId := rds.GetOwnerId()
 		for i := range secgroups {
-			vpcId, err := region.GetDriver().GetSecurityGroupVpcId(ctx, userCred, region, nil, vpc)
-			if err != nil {
-				return nil, errors.Wrap(err, "GetSecurityGroupVpcId")
+			if secgroups[i].Id == api.SECGROUP_DEFAULT_ID {
+				filter, err := driver.GetSecurityGroupFilter(vpc)
+				if err != nil {
+					return nil, errors.Wrapf(err, "GetSecurityGroupFilter")
+				}
+				group, err := vpc.GetDefaultSecurityGroup(ownerId, filter)
+				if err != nil && errors.Cause(err) != sql.ErrNoRows {
+					return nil, err
+				}
+				if gotypes.IsNil(group) {
+					group, err = driver.CreateDefaultSecurityGroup(ctx, userCred, ownerId, vpc)
+					if err != nil {
+						return nil, errors.Wrapf(err, "CreateDefaultSecurityGroup")
+					}
+				}
+				if !utils.IsInStringArray(group.ExternalId, desc.SecgroupIds) {
+					desc.SecgroupIds = append(desc.SecgroupIds, group.ExternalId)
+				}
+				continue
 			}
-			secId, err := region.GetDriver().RequestSyncSecurityGroup(ctx, userCred, vpcId, vpc, &secgroups[i], desc.ProjectId, "")
-			if err != nil {
-				return nil, errors.Wrap(err, "SyncSecurityGroup")
+			if !utils.IsInStringArray(secgroups[i].ExternalId, desc.SecgroupIds) {
+				desc.SecgroupIds = append(desc.SecgroupIds, secgroups[i].ExternalId)
 			}
-			desc.SecgroupIds = append(desc.SecgroupIds, secId)
 		}
 
 		if rds.BillingType == billing_api.BILLING_TYPE_PREPAID {
@@ -1655,7 +1598,9 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateElasticcache(ctx co
 		provider := iprovider.(*models.SCloudprovider)
 		params.ProjectId, err = provider.SyncProject(ctx, userCred, ec.ProjectId)
 		if err != nil {
-			logclient.AddSimpleActionLog(ec, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+			if errors.Cause(err) != cloudprovider.ErrNotSupported && errors.Cause(err) != cloudprovider.ErrNotImplemented {
+				logclient.AddSimpleActionLog(ec, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+			}
 		}
 
 		iec, err := iRegion.CreateIElasticcaches(params)
@@ -1750,7 +1695,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestRestartElasticcache(ctx c
 		return err
 	}
 
-	return ec.SetStatus(userCred, api.ELASTIC_CACHE_STATUS_RUNNING, "")
+	return ec.SetStatus(ctx, userCred, api.ELASTIC_CACHE_STATUS_RUNNING, "")
 }
 
 func (self *SManagedVirtualizationRegionDriver) RequestSyncElasticcache(ctx context.Context, userCred mcclient.TokenCredential, ec *models.SElasticcache, task taskman.ITask) error {
@@ -2199,18 +2144,18 @@ func (self *SManagedVirtualizationRegionDriver) ValidateCreateElasticcacheAclDat
 		params := jsonutils.NewDict()
 		params.Set("ip", jsonutils.NewString(ip))
 		if strings.Contains(ip, "/") {
-			if err := cidrV.Validate(params); err != nil {
+			if err := cidrV.Validate(ctx, params); err != nil {
 				return nil, err
 			}
 		} else {
-			if err := ipV.Validate(params); err != nil {
+			if err := ipV.Validate(ctx, params); err != nil {
 				return nil, err
 			}
 		}
 	}
 
 	elasticcacheV := validators.NewModelIdOrNameValidator("elasticcache", "elasticcache", ownerId)
-	if err := elasticcacheV.Validate(data); err != nil {
+	if err := elasticcacheV.Validate(ctx, data); err != nil {
 		return nil, err
 	}
 
@@ -2223,7 +2168,7 @@ func (self *SManagedVirtualizationRegionDriver) AllowCreateElasticcacheBackup(ct
 
 func (self *SManagedVirtualizationRegionDriver) ValidateCreateElasticcacheBackupData(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, data *jsonutils.JSONDict) (*jsonutils.JSONDict, error) {
 	elasticcacheV := validators.NewModelIdOrNameValidator("elasticcache", "elasticcache", ownerId)
-	if err := elasticcacheV.Validate(data); err != nil {
+	if err := elasticcacheV.Validate(ctx, data); err != nil {
 		return nil, err
 	}
 
@@ -2375,7 +2320,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateDBInstanceBackup(ct
 			return nil, errors.Wrapf(err, "cloudprovider.Wait backup sync")
 		}
 
-		instance.SetStatus(userCred, api.DBINSTANCE_RUNNING, "")
+		instance.SetStatus(ctx, userCred, api.DBINSTANCE_RUNNING, "")
 		return nil, nil
 	})
 	return nil
@@ -2412,6 +2357,14 @@ func (self *SManagedVirtualizationRegionDriver) RequestRemoteUpdateDBInstance(ct
 			return nil, errors.Wrap(err, "iRds.SetTags")
 		}
 		logclient.AddActionLogWithStartable(task, instance, logclient.ACT_UPDATE_TAGS, tagsUpdateInfo, userCred, true)
+
+		err = iRds.Update(ctx, cloudprovider.SDBInstanceUpdateOptions{NAME: instance.Name, Description: instance.Description})
+		if err != nil {
+			if errors.Cause(err) == cloudprovider.ErrNotSupported || errors.Cause(err) == cloudprovider.ErrNotImplemented {
+				return nil, nil
+			}
+			return nil, errors.Wrap(err, "iRds.Update")
+		}
 		return nil, nil
 	})
 	return nil
@@ -2606,7 +2559,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestElasticcacheAccountResetP
 		return errors.Wrap(err, "managedVirtualizationRegionDriver.RequestElasticcacheAccountResetPassword.SavePassword")
 	}
 
-	return ea.SetStatus(userCred, api.ELASTIC_CACHE_ACCOUNT_STATUS_AVAILABLE, "")
+	return ea.SetStatus(ctx, userCred, api.ELASTIC_CACHE_ACCOUNT_STATUS_AVAILABLE, "")
 }
 
 func (self *SManagedVirtualizationRegionDriver) RequestElasticcacheAclUpdate(ctx context.Context, userCred mcclient.TokenCredential, ea *models.SElasticcacheAcl, task taskman.ITask) error {
@@ -2638,7 +2591,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestElasticcacheAclUpdate(ctx
 			return nil, errors.Wrap(err, "managedVirtualizationRegionDriver.CreateElasticcacheAcl.UpdateAcl")
 		}
 
-		err = ea.SetStatus(userCred, api.ELASTIC_CACHE_ACL_STATUS_AVAILABLE, "")
+		err = ea.SetStatus(ctx, userCred, api.ELASTIC_CACHE_ACL_STATUS_AVAILABLE, "")
 		if err != nil {
 			return nil, errors.Wrap(err, "managedVirtualizationRegionDriver.CreateElasticcacheAcl.UpdateAclStatus")
 		}
@@ -2712,7 +2665,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncDiskStatus(ctx contex
 			return nil, errors.Wrap(err, "disk.GetIDisk")
 		}
 
-		return nil, disk.SetStatus(userCred, iDisk.GetStatus(), "syncstatus")
+		return nil, disk.SetStatus(ctx, userCred, iDisk.GetStatus(), "syncstatus")
 	})
 	return nil
 }
@@ -2733,7 +2686,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncSnapshotStatus(ctx co
 			return nil, errors.Wrapf(err, "iRegion.GetISnapshotById(%s)", snapshot.ExternalId)
 		}
 
-		return nil, snapshot.SetStatus(userCred, iSnapshot.GetStatus(), "syncstatus")
+		return nil, snapshot.SetStatus(ctx, userCred, iSnapshot.GetStatus(), "syncstatus")
 	})
 	return nil
 }
@@ -2758,7 +2711,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncBucketStatus(ctx cont
 			return nil, errors.Wrap(err, "bucket.GetIBucket")
 		}
 
-		return nil, bucket.SetStatus(userCred, iBucket.GetStatus(), "syncstatus")
+		return nil, bucket.SyncWithCloudBucket(ctx, userCred, iBucket, false)
 	})
 	return nil
 }
@@ -2770,7 +2723,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncDBInstanceBackupStatu
 			return nil, errors.Wrap(err, "backup.GetIDBInstanceBackup")
 		}
 
-		return nil, backup.SetStatus(userCred, iDBInstanceBackup.GetStatus(), "syncstatus")
+		return nil, backup.SetStatus(ctx, userCred, iDBInstanceBackup.GetStatus(), "syncstatus")
 	})
 	return nil
 }
@@ -2786,8 +2739,10 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncElasticcacheStatus(ct
 		if err != nil {
 			return nil, errors.Wrap(err, "elasticcache.GetIElasticcache")
 		}
-		models.SyncVirtualResourceMetadata(ctx, userCred, elasticcache, iElasticcache)
-		return nil, elasticcache.SetStatus(userCred, iElasticcache.GetStatus(), "syncstatus")
+		if account := elasticcache.GetCloudaccount(); account != nil {
+			models.SyncVirtualResourceMetadata(ctx, userCred, elasticcache, iElasticcache, account.ReadOnly)
+		}
+		return nil, elasticcache.SetStatus(ctx, userCred, iElasticcache.GetStatus(), "syncstatus")
 	})
 	return nil
 }
@@ -2840,16 +2795,6 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncSecgroupsForElasticca
 		// sync secgroups to cloud
 		secgroupExternalIds := []string{}
 		{
-			ess, err := ec.GetElasticcacheSecgroups()
-			if err != nil {
-				return nil, errors.Wrap(err, "GetElasticcacheSecgroups")
-			}
-
-			provider := ec.GetCloudprovider()
-			if provider == nil {
-				return nil, errors.Wrap(httperrors.ErrInvalidStatus, "GetCloudprovider")
-			}
-
 			vpc, err := ec.GetVpc()
 			if err != nil {
 				return nil, errors.Wrapf(err, "GetVpc")
@@ -2858,17 +2803,36 @@ func (self *SManagedVirtualizationRegionDriver) RequestSyncSecgroupsForElasticca
 			if err != nil {
 				return nil, errors.Wrapf(err, "GetRegion")
 			}
-			vpcId, err := self.GetSecurityGroupVpcId(ctx, userCred, region, nil, vpc)
+			secgroups, err := ec.GetSecgroups()
 			if err != nil {
-				return nil, errors.Wrap(err, "GetSecurityGroupVpcId")
+				return nil, errors.Wrapf(err, "GetSecgroups")
 			}
-
-			for i := range ess {
-				externalId, err := self.RequestSyncSecurityGroup(ctx, task.GetUserCred(), vpcId, vpc, ess[i].GetSecGroup(), "", "redis")
-				if err != nil {
-					return nil, errors.Wrap(err, "RequestSyncSecurityGroup")
+			driver := region.GetDriver()
+			ownerId := ec.GetOwnerId()
+			for i := range secgroups {
+				if secgroups[i].Id == api.SECGROUP_DEFAULT_ID {
+					filter, err := driver.GetSecurityGroupFilter(vpc)
+					if err != nil {
+						return nil, errors.Wrapf(err, "GetSecurityGroupFilter")
+					}
+					group, err := vpc.GetDefaultSecurityGroup(ownerId, filter)
+					if err != nil && errors.Cause(err) != sql.ErrNoRows {
+						return nil, err
+					}
+					if gotypes.IsNil(group) {
+						group, err = driver.CreateDefaultSecurityGroup(ctx, userCred, ownerId, vpc)
+						if err != nil {
+							return nil, errors.Wrapf(err, "CreateDefaultSecurityGroup")
+						}
+					}
+					if !utils.IsInStringArray(group.ExternalId, secgroupExternalIds) {
+						secgroupExternalIds = append(secgroupExternalIds, group.ExternalId)
+					}
+					continue
 				}
-				secgroupExternalIds = append(secgroupExternalIds, externalId)
+				if !utils.IsInStringArray(secgroups[i].ExternalId, secgroupExternalIds) {
+					secgroupExternalIds = append(secgroupExternalIds, secgroups[i].ExternalId)
+				}
 			}
 		}
 
@@ -2962,25 +2926,50 @@ func IsInPrivateIpRange(ar netutils.IPV4AddrRange) error {
 
 func (self *SManagedVirtualizationRegionDriver) RequestSyncRdsSecurityGroups(ctx context.Context, userCred mcclient.TokenCredential, rds *models.SDBInstance, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		vpc, err := rds.GetVpc()
-		if err != nil {
-			return nil, errors.Wrapf(err, "rds.GetVpc")
-		}
 		secgroups, err := rds.GetSecgroups()
 		if err != nil {
 			return nil, errors.Wrapf(err, "GetSecgroups")
 		}
+		vpc, err := rds.GetVpc()
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetVpc")
+		}
+		region, err := vpc.GetRegion()
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetRegion")
+		}
+		driver := region.GetDriver()
+		ownerId := rds.GetOwnerId()
+		secgroupIds := []string{}
+		for i := range secgroups {
+			if secgroups[i].Id == api.SECGROUP_DEFAULT_ID {
+				filter, err := driver.GetSecurityGroupFilter(vpc)
+				if err != nil {
+					return nil, errors.Wrapf(err, "GetSecurityGroupFilter")
+				}
+				group, err := vpc.GetDefaultSecurityGroup(ownerId, filter)
+				if err != nil && errors.Cause(err) != sql.ErrNoRows {
+					return nil, err
+				}
+				if gotypes.IsNil(group) {
+					group, err = driver.CreateDefaultSecurityGroup(ctx, userCred, ownerId, vpc)
+					if err != nil {
+						return nil, errors.Wrapf(err, "CreateDefaultSecurityGroup")
+					}
+				}
+				if !utils.IsInStringArray(group.ExternalId, secgroupIds) {
+					secgroupIds = append(secgroupIds, group.ExternalId)
+				}
+				continue
+			}
+			if !utils.IsInStringArray(secgroups[i].ExternalId, secgroupIds) {
+				secgroupIds = append(secgroupIds, secgroups[i].ExternalId)
+			}
+		}
+
 		iRds, err := rds.GetIDBInstance(ctx)
 		if err != nil {
 			return nil, errors.Wrapf(err, "GetIDBInstance")
-		}
-		secgroupIds := []string{}
-		for i := range secgroups {
-			secgroupId, err := self.RequestSyncSecurityGroup(ctx, userCred, vpc.ExternalId, vpc, &secgroups[i], iRds.GetProjectId(), "rds")
-			if err != nil {
-				return nil, errors.Wrapf(err, "RequestSyncSecurityGroup")
-			}
-			secgroupIds = append(secgroupIds, secgroupId)
 		}
 		err = iRds.SetSecurityGroups(secgroupIds)
 		if err != nil {
@@ -3016,7 +3005,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestAssociateEip(ctx context.
 		}
 
 		if obj.GetStatus() != api.INSTANCE_ASSOCIATE_EIP {
-			db.StatusBaseSetStatus(obj, userCred, api.INSTANCE_ASSOCIATE_EIP, "associate eip")
+			db.StatusBaseSetStatus(ctx, obj, userCred, api.INSTANCE_ASSOCIATE_EIP, "associate eip")
 		}
 
 		err = eip.AssociateInstance(ctx, userCred, input.InstanceType, obj)
@@ -3024,7 +3013,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestAssociateEip(ctx context.
 			return nil, errors.Wrapf(err, "eip.AssociateVM")
 		}
 
-		eip.SetStatus(userCred, api.EIP_STATUS_READY, api.EIP_STATUS_ASSOCIATE)
+		eip.SetStatus(ctx, userCred, api.EIP_STATUS_READY, api.EIP_STATUS_ASSOCIATE)
 		return nil, nil
 	})
 	return nil
@@ -3056,7 +3045,9 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateNetwork(ctx context
 	provider := wire.GetCloudprovider()
 	opts.ProjectId, err = provider.SyncProject(ctx, userCred, net.ProjectId)
 	if err != nil {
-		logclient.AddSimpleActionLog(net, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+		if errors.Cause(err) != cloudprovider.ErrNotSupported && errors.Cause(err) != cloudprovider.ErrNotImplemented {
+			logclient.AddSimpleActionLog(net, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+		}
 	}
 
 	inet, err := iwire.CreateINetwork(&opts)
@@ -3074,7 +3065,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateNetwork(ctx context
 		return errors.Wrapf(err, "wait network available after 5 minutes, current status: %s", inet.GetStatus())
 	}
 
-	return net.SyncWithCloudNetwork(ctx, userCred, inet, nil, nil)
+	return net.SyncWithCloudNetwork(ctx, userCred, inet)
 }
 
 func (self *SManagedVirtualizationRegionDriver) RequestRemoteUpdateElasticSearch(ctx context.Context, userCred mcclient.TokenCredential, instance *models.SElasticSearch, replaceTags bool, task taskman.ITask) error {
@@ -3186,7 +3177,7 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateKubeCluster(ctx con
 			return nil, errors.Wrapf(err, "db.SetExternalId")
 		}
 		err = cloudprovider.WaitStatusWithSync(icluster, api.KUBE_CLUSTER_STATUS_RUNNING, func(status string) {
-			cluster.SetStatus(userCred, status, "")
+			cluster.SetStatus(ctx, userCred, status, "")
 		}, time.Second*30, time.Hour*1)
 		if err != nil {
 			return nil, errors.Wrapf(err, "wait cluster status timeout, current status: %s", icluster.GetStatus())
@@ -3247,7 +3238,413 @@ func (self *SManagedVirtualizationRegionDriver) RequestCreateKubeNodePool(ctx co
 		if err != nil {
 			return nil, errors.Wrapf(err, "wait node pool status timeout, current status: %s", icluster.GetStatus())
 		}
-		return nil, pool.SetStatus(userCred, api.KUBE_CLUSTER_STATUS_RUNNING, "")
+		return nil, pool.SetStatus(ctx, userCred, api.KUBE_CLUSTER_STATUS_RUNNING, "")
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestDeleteSecurityGroup(ctx context.Context, userCred mcclient.TokenCredential, secgroup *models.SSecurityGroup, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iGroup, err := secgroup.GetISecurityGroup(ctx)
+		if err != nil {
+			if errors.Cause(err) == cloudprovider.ErrNotFound || errors.Cause(err) == sql.ErrNoRows {
+				return nil, nil
+			}
+			return nil, errors.Wrapf(err, "GetISecurityGroup")
+		}
+		return nil, iGroup.Delete()
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestCreateSecurityGroup(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	secgroup *models.SSecurityGroup,
+	rules api.SSecgroupRuleResourceSet,
+) error {
+
+	vpcId := ""
+	if len(secgroup.VpcId) > 0 {
+		vpc, err := secgroup.GetVpc()
+		if err != nil {
+			return errors.Wrapf(err, "GetVpc")
+		}
+		vpcId = vpc.ExternalId
+	}
+
+	provider, err := secgroup.GetCloudprovider()
+	if err != nil {
+		return errors.Wrapf(err, "GetCloudprovider")
+	}
+
+	iRegion, err := secgroup.GetIRegion(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "GetIRegion")
+	}
+
+	opts := &cloudprovider.SecurityGroupCreateInput{
+		Name:  secgroup.Name,
+		Desc:  secgroup.Description,
+		VpcId: vpcId,
+	}
+	opts.Tags, _ = secgroup.GetAllUserMetadata()
+
+	opts.ProjectId, err = provider.SyncProject(ctx, userCred, secgroup.ProjectId)
+	if err != nil {
+		if errors.Cause(err) != cloudprovider.ErrNotSupported && errors.Cause(err) != cloudprovider.ErrNotImplemented {
+			logclient.AddSimpleActionLog(secgroup, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+		}
+	}
+
+	iGroup, err := iRegion.CreateISecurityGroup(opts)
+	if err != nil {
+		return errors.Wrapf(err, "CreateISecurityGroup")
+	}
+
+	_, err = db.Update(secgroup, func() error {
+		secgroup.ExternalId = iGroup.GetGlobalId()
+		if len(iGroup.GetVpcId()) == 0 {
+			secgroup.VpcId = ""
+		}
+		return nil
+	})
+	if err != nil {
+		return errors.Wrapf(err, "SetExternalId")
+	}
+
+	for i := range rules {
+		opts := cloudprovider.SecurityGroupRuleCreateOptions{
+			Desc:      rules[i].Description,
+			Direction: secrules.TSecurityRuleDirection(rules[i].Direction),
+			Action:    secrules.TSecurityRuleAction(rules[i].Action),
+			Protocol:  rules[i].Protocol,
+			CIDR:      rules[i].CIDR,
+			Ports:     rules[i].Ports,
+		}
+		_, err := iGroup.CreateRule(&opts)
+		if err != nil {
+			return errors.Wrapf(err, "CreateRule")
+		}
+	}
+
+	iRules, err := iGroup.GetRules()
+	if err != nil {
+		return errors.Wrapf(err, "GetRules")
+	}
+
+	result := secgroup.SyncRules(ctx, userCred, iRules)
+	if result.IsError() {
+		return result.AllError()
+	}
+	secgroup.SetStatus(ctx, userCred, api.SECGROUP_STATUS_READY, "")
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) ValidateCreateSecurityGroupInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupCreateInput) (*api.SSecgroupCreateInput, error) {
+	for i := range input.Rules {
+		rule := input.Rules[i]
+		if !utils.IsInStringArray(rule.Action, []string{string(secrules.SecurityRuleAllow), string(secrules.SecurityRuleDeny)}) {
+			return nil, httperrors.NewInputParameterError("invalid action %s", rule.Action)
+		}
+		if !utils.IsInStringArray(rule.Protocol, []string{
+			secrules.PROTO_ANY,
+			secrules.PROTO_UDP,
+			secrules.PROTO_TCP,
+			secrules.PROTO_ICMP,
+		}) {
+			return nil, httperrors.NewInputParameterError("invalid protocol %s", rule.Protocol)
+		}
+
+		if len(rule.Ports) > 0 {
+			r := secrules.SecurityRule{}
+			err := r.ParsePorts(rule.Ports)
+			if err != nil {
+				return nil, httperrors.NewInputParameterError("invalid ports %s", rule.Ports)
+			}
+		}
+
+		if len(rule.CIDR) > 0 && !regutils.MatchCIDR(rule.CIDR) && !regutils.MatchCIDR6(rule.CIDR) && !regutils.MatchIP4Addr(rule.CIDR) && !regutils.MatchIP6Addr(rule.CIDR) {
+			return nil, httperrors.NewInputParameterError("invalid cidr %s", rule.CIDR)
+		}
+	}
+	return input, nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) ValidateUpdateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleUpdateInput) (*api.SSecgroupRuleUpdateInput, error) {
+	if input.Action != nil {
+		if !utils.IsInStringArray(*input.Action, []string{string(secrules.SecurityRuleAllow), string(secrules.SecurityRuleDeny)}) {
+			return nil, httperrors.NewInputParameterError("invalid action %s", *input.Action)
+		}
+	}
+	if input.Protocol != nil {
+		if !utils.IsInStringArray(*input.Protocol, []string{
+			secrules.PROTO_ANY,
+			secrules.PROTO_UDP,
+			secrules.PROTO_TCP,
+			secrules.PROTO_ICMP,
+		}) {
+			return nil, httperrors.NewInputParameterError("invalid protocol %s", *input.Protocol)
+		}
+	}
+
+	if input.Ports != nil {
+		rule := secrules.SecurityRule{}
+		err := rule.ParsePorts(*input.Ports)
+		if err != nil {
+			return nil, httperrors.NewInputParameterError("invalid ports %s", *input.Ports)
+		}
+	}
+
+	if input.CIDR != nil && len(*input.CIDR) > 0 && !regutils.MatchCIDR(*input.CIDR) && !regutils.MatchIP4Addr(*input.CIDR) && !regutils.MatchCIDR6(*input.CIDR) && !regutils.MatchIP6Addr(*input.CIDR) {
+		return nil, httperrors.NewInputParameterError("invalid cidr %s", *input.CIDR)
+	}
+
+	return input, nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestPrepareSecurityGroups(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	ownerId mcclient.IIdentityProvider,
+	secgroups []models.SSecurityGroup,
+	vpc *models.SVpc,
+	callback func(ids []string) error,
+	task taskman.ITask,
+) error {
+	region, err := vpc.GetRegion()
+	if err != nil {
+		return errors.Wrapf(err, "GetRegion")
+	}
+	driver := region.GetDriver()
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		groupIds := []string{}
+		for i := range secgroups {
+			if secgroups[i].Id == api.SECGROUP_DEFAULT_ID {
+				filter, err := driver.GetSecurityGroupFilter(vpc)
+				if err != nil {
+					return nil, errors.Wrapf(err, "GetSecurityGroupFilter")
+				}
+				group, err := vpc.GetDefaultSecurityGroup(ownerId, filter)
+				if err != nil && errors.Cause(err) != sql.ErrNoRows {
+					return nil, err
+				}
+				if gotypes.IsNil(group) {
+					group, err = driver.CreateDefaultSecurityGroup(ctx, userCred, ownerId, vpc)
+					if err != nil {
+						return nil, errors.Wrapf(err, "CreateDefaultSecurityGroup")
+					}
+				}
+				if !utils.IsInStringArray(group.Id, groupIds) {
+					groupIds = append(groupIds, group.Id)
+				}
+				continue
+			}
+			if len(secgroups[i].ExternalId) > 0 && !utils.IsInStringArray(secgroups[i].Id, groupIds) {
+				groupIds = append(groupIds, secgroups[i].Id)
+			}
+		}
+		if callback != nil {
+			return nil, callback(groupIds)
+		}
+		return nil, nil
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) GetSecurityGroupFilter(vpc *models.SVpc) (func(q *sqlchemy.SQuery) *sqlchemy.SQuery, error) {
+	return func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+		return q.Equals("vpc_id", vpc.Id)
+	}, nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) CreateDefaultSecurityGroup(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	ownerId mcclient.IIdentityProvider,
+	vpc *models.SVpc,
+) (*models.SSecurityGroup, error) {
+	region, err := vpc.GetRegion()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetRegion")
+	}
+	driver := region.GetDriver()
+	newGroup := &models.SSecurityGroup{}
+	newGroup.SetModelManager(models.SecurityGroupManager, newGroup)
+	newGroup.Name = fmt.Sprintf("%s-%d", driver.GetDefaultSecurityGroupNamePrefix(), time.Now().Unix())
+	newGroup.Description = "auto generage"
+	// 部分云可能不需要vpcId, 创建完安全组后会自动置空
+	newGroup.VpcId = vpc.Id
+	newGroup.ManagerId = vpc.ManagerId
+	newGroup.CloudregionId = vpc.CloudregionId
+	newGroup.DomainId = ownerId.GetProjectDomainId()
+	newGroup.ProjectId = ownerId.GetProjectId()
+	newGroup.ProjectSrc = string(apis.OWNER_SOURCE_LOCAL)
+	err = models.SecurityGroupManager.TableSpec().Insert(ctx, newGroup)
+	if err != nil {
+		return nil, errors.Wrapf(err, "insert")
+	}
+
+	err = driver.RequestCreateSecurityGroup(ctx, userCred, newGroup, api.SSecgroupRuleResourceSet{})
+	if err != nil {
+		return nil, errors.Wrapf(err, "RequestCreateSecurityGroup")
+	}
+	return newGroup, nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) ValidateCreateSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, input *api.SSnapshotPolicyCreateInput) (*api.SSnapshotPolicyCreateInput, error) {
+	if len(input.CloudproviderId) == 0 {
+		return nil, httperrors.NewMissingParameterError("cloudprovider_id")
+	}
+	managerObj, err := validators.ValidateModel(ctx, userCred, models.CloudproviderManager, &input.CloudproviderId)
+	if err != nil {
+		return nil, err
+	}
+	input.ManagerId = input.CloudproviderId
+	manager := managerObj.(*models.SCloudprovider)
+	if manager.Provider != region.Provider {
+		return nil, httperrors.NewConflictError("manager %s is not %s cloud", manager.Name, region.Provider)
+	}
+	return input, nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestCreateSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, sp *models.SSnapshotPolicy, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iRegion, err := sp.GetIRegion(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetIRegion")
+		}
+		opts := &cloudprovider.SnapshotPolicyInput{
+			Name:           sp.Name,
+			Desc:           sp.Description,
+			RetentionDays:  sp.RetentionDays,
+			TimePoints:     sp.TimePoints,
+			RepeatWeekdays: sp.RepeatWeekdays,
+		}
+		opts.Tags, _ = sp.GetAllUserMetadata()
+		id, err := iRegion.CreateSnapshotPolicy(opts)
+		if err != nil {
+			return nil, errors.Wrapf(err, "CreateSnapshotPolicy")
+		}
+		_, err = db.Update(sp, func() error {
+			sp.ExternalId = id
+			sp.Status = apis.STATUS_AVAILABLE
+			return nil
+		})
+		return nil, err
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestDeleteSnapshotPolicy(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, sp *models.SSnapshotPolicy, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iPolicy, err := sp.GetISnapshotPolicy(ctx)
+		if err != nil {
+			if errors.Cause(err) == sql.ErrNoRows || errors.Cause(err) == cloudprovider.ErrNotFound {
+				return nil, nil
+			}
+			return nil, errors.Wrapf(err, "GetISnapshotPolicy")
+		}
+
+		err = iPolicy.Delete()
+		if err != nil {
+			return nil, errors.Wrapf(err, "Delete")
+		}
+
+		return nil, nil
+	})
+	return nil
+
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestSnapshotPolicyBindDisks(ctx context.Context, userCred mcclient.TokenCredential, sp *models.SSnapshotPolicy, diskIds []string, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iPolicy, err := sp.GetISnapshotPolicy(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetISnapshotPolicy")
+		}
+		disks, err := sp.GetUnbindDisks(diskIds)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetUnbindDisks")
+		}
+		externalIds := []string{}
+		for _, disk := range disks {
+			if len(disk.ExternalId) > 0 && !utils.IsInStringArray(disk.ExternalId, externalIds) {
+				externalIds = append(externalIds, disk.ExternalId)
+			}
+		}
+		if len(externalIds) > 0 {
+			err = iPolicy.ApplyDisks(externalIds)
+			if err != nil {
+				return nil, errors.Wrapf(err, "ApplyDisks %s", externalIds)
+			}
+			return nil, sp.BindDisks(ctx, disks)
+		}
+		return nil, nil
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestSnapshotPolicyUnbindDisks(ctx context.Context, userCred mcclient.TokenCredential, sp *models.SSnapshotPolicy, diskIds []string, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iPolicy, err := sp.GetISnapshotPolicy(ctx)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetISnapshotPolicy")
+		}
+		disks, err := sp.GetBindDisks(diskIds)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetBindDisks")
+		}
+		externalIds := []string{}
+		for _, disk := range disks {
+			if len(disk.ExternalId) > 0 && !utils.IsInStringArray(disk.ExternalId, externalIds) {
+				externalIds = append(externalIds, disk.ExternalId)
+			}
+		}
+		if len(externalIds) > 0 {
+			err = iPolicy.CancelDisks(externalIds)
+			if err != nil {
+				return nil, errors.Wrapf(err, "CancelDisks %s", externalIds)
+			}
+			return nil, sp.UnbindDisks(diskIds)
+		}
+		return nil, nil
+	})
+	return nil
+}
+
+func (self *SManagedVirtualizationRegionDriver) RequestRemoteUpdateNetwork(ctx context.Context, userCred mcclient.TokenCredential, net *models.SNetwork, replaceTags bool, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iNet, err := net.GetINetwork(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "GetINetwork")
+		}
+		vpc, err := net.GetVpc()
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetVpc")
+		}
+		oldTags, err := iNet.GetTags()
+		if err != nil {
+			if errors.Cause(err) == cloudprovider.ErrNotSupported || errors.Cause(err) == cloudprovider.ErrNotImplemented {
+				return nil, nil
+			}
+			return nil, errors.Wrap(err, "GetTags()")
+		}
+		tags, err := net.GetAllUserMetadata()
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetAllUserMetadata")
+		}
+		tagsUpdateInfo := cloudprovider.TagsUpdateInfo{OldTags: oldTags, NewTags: tags}
+		err = cloudprovider.SetTags(ctx, iNet, vpc.ManagerId, tags, replaceTags)
+		if err != nil {
+			if errors.Cause(err) == cloudprovider.ErrNotSupported || errors.Cause(err) == cloudprovider.ErrNotImplemented {
+				return nil, nil
+			}
+			logclient.AddActionLogWithStartable(task, net, logclient.ACT_UPDATE_TAGS, err, userCred, false)
+			return nil, errors.Wrap(err, "SetTags")
+		}
+		logclient.AddActionLogWithStartable(task, net, logclient.ACT_UPDATE_TAGS, tagsUpdateInfo, userCred, true)
+		return nil, nil
 	})
 	return nil
 }

@@ -55,7 +55,7 @@ var UserCacheManager *SUserCacheManager
 
 func init() {
 	UserCacheManager = &SUserCacheManager{
-		NewKeystoneCacheObjectManager(SUser{}, "users_cache_tbl", "user", "users")}
+		NewKeystoneCacheObjectManager(SUser{}, "users_cache_tbl", "user_cache", "user_caches")}
 	// log.Debugf("initialize user cache manager %s", UserCacheManager.KeywordPlural())
 	UserCacheManager.SetVirtualObject(UserCacheManager)
 
@@ -124,6 +124,7 @@ func (manager *SUserCacheManager) FetchUserFromKeystone(ctx context.Context, idS
 	query := jsonutils.NewDict()
 	query.Set("scope", jsonutils.NewString("system"))
 	query.Set("system", jsonutils.JSONTrue)
+	query.Set("pending_delete", jsonutils.NewString("all"))
 
 	s := auth.GetAdminSession(ctx, consts.GetRegion())
 	user, err := modules.UsersV3.GetById(s, idStr, query)

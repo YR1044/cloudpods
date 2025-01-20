@@ -274,32 +274,33 @@ func NewNIC(desc string) (*SNIC, error) {
 	nic.BridgeDev, err = hostbridge.NewDriver(options.HostOptions.BridgeDriver,
 		nic.Bridge, nic.Inter, nic.Ip)
 	if err != nil {
-		log.Errorln(err)
-		return nil, err
+		return nil, errors.Wrapf(err, "hostbridge.NewDriver driver: %s, bridge: %s, interface: %s, ip: %s", options.HostOptions.BridgeDriver, nic.Bridge, nic.Inter, nic.Ip)
 	}
 
 	confirm, err := nic.BridgeDev.ConfirmToConfig()
 	if err != nil {
-		log.Errorln(err)
-		return nil, err
+		return nil, errors.Wrapf(err, "nic.BridgeDev.ConfirmToConfig %#v", nic.BridgeDev)
 	}
 	if !confirm {
 		log.Infof("Not confirm to configuration")
 		if err = nic.BridgeDev.Setup(nic.BridgeDev); err != nil {
-			log.Errorln(err)
-			return nil, err
+			return nil, errors.Wrapf(err, "nic.BridgeDev.Setup %v", nic.BridgeDev)
 		}
 		time.Sleep(time.Second * 1)
 	} else {
-		log.Infof("Confirm to configuration!!")
+		log.Infof("Confirm to configuration!! To migrate physical interface configs")
+		err := nic.BridgeDev.MigrateSlaveConfigs(nic.BridgeDev)
+		if err != nil {
+			log.Errorf("fail to migrate configs: %s", err)
+		}
 	}
 	if err := nic.BridgeDev.PersistentConfig(); err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "nic.BridgeDev.PersistentConfig %v", nic.BridgeDev)
 	}
 	if isDHCP, err := nic.BridgeDev.DisableDHCPClient(); err != nil {
 		return nil, errors.Wrap(err, "disable dhcp client")
 	} else if isDHCP {
-		Instance().SysWarning["dhcp"] = "dhcp client is enabled before host agent start, please disable it"
+		Instance().AppendHostError("dhcp client is enabled before host agent start, please disable it")
 	}
 
 	var dhcpRelay []string
@@ -324,18 +325,22 @@ type SSysInfo struct {
 	KernelVersion  string `json:"kernel_version"`
 	QemuVersion    string `json:"qemu_version"`
 	OvsVersion     string `json:"ovs_version"`
+	OvsKmodVersion string `json:"ovs_kmod_version"`
 	KvmModule      string `json:"kvm_module"`
 	CpuModelName   string `json:"cpu_model_name"`
 	CpuMicrocode   string `json:"cpu_microcode"`
 
 	StorageType string `json:"storage_type"`
 
-	HugepagesOption string `json:"hugepages_option"`
-	HugepageSizeKb  int    `json:"hugepage_size_kb"`
-	HugepageNr      *int   `json:"hugepage_nr"`
+	HugepagesOption string                       `json:"hugepages_option"`
+	HugepageSizeKb  int                          `json:"hugepage_size_kb"`
+	HugepageNr      *int                         `json:"hugepage_nr"`
+	NodeHugepages   []hostapi.HostNodeHugepageNr `json:"node_hugepages"`
+	EnableKsm       bool                         `json:"enable_ksm"`
 
-	Topology *hostapi.HostTopology `json:"topology"`
-	CPUInfo  *hostapi.HostCPUInfo  `json:"cpu_info"`
+	Topology        *hostapi.HostTopology `json:"topology"`
+	CPUInfo         *hostapi.HostCPUInfo  `json:"cpu_info"`
+	MotherboardInfo *types.SSystemInfo    `json:"motherboard_info"`
 }
 
 func StartDetachStorages(hs []jsonutils.JSONObject) {

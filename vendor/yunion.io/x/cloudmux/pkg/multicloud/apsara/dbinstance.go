@@ -166,10 +166,6 @@ func (rds *SDBInstance) GetBillingType() string {
 	return convertChargeType(rds.PayType)
 }
 
-func (rds *SDBInstance) GetExpiredAt() time.Time {
-	return rds.ExpireTime
-}
-
 func (rds *SDBInstance) GetCreatedAt() time.Time {
 	return rds.CreateTime
 }
@@ -408,7 +404,7 @@ func (region *SRegion) GetIDBInstances() ([]cloudprovider.ICloudDBInstance, erro
 			return nil, err
 		}
 		instances = append(instances, part...)
-		if len(instances) >= total {
+		if len(instances) >= total || len(part) == 0 {
 			break
 		}
 	}
@@ -799,4 +795,20 @@ func (rds *SDBInstance) GetTags() (map[string]string, error) {
 
 func (rds *SDBInstance) SetTags(tags map[string]string, replace bool) error {
 	return rds.region.SetResourceTags("rds", "INSTANCE", []string{rds.GetId()}, tags, replace)
+}
+
+func (rds *SDBInstance) Update(ctx context.Context, input cloudprovider.SDBInstanceUpdateOptions) error {
+	return rds.region.ModifyDBInstanceName(rds.DBInstanceId, input.NAME)
+}
+
+func (region *SRegion) ModifyDBInstanceName(id, name string) error {
+	params := map[string]string{
+		"DBInstanceId":          id,
+		"DBInstanceDescription": name,
+	}
+	_, err := region.rdsRequest("ModifyDBInstanceDescription", params)
+	if err != nil {
+		return errors.Wrap(err, "ModifyDBInstanceDescription")
+	}
+	return nil
 }

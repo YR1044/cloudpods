@@ -1,3 +1,17 @@
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package common
 
 import (
@@ -91,19 +105,25 @@ func (m *CommonResourceManager[O]) SyncOnce() error {
 	return m.GetStore().Init()
 }
 
+type FGetDBObject func(man db.IModelManager, id string, obj *jsonutils.JSONDict) (db.IModel, error)
+
 type ResourceStore[O lockman.ILockedObject] struct {
-	dataMap    *sync.Map
-	modelMan   db.IModelManager
-	res        informer.IResourceManager
-	getId      func(O) string
-	getWatchId func(*jsonutils.JSONDict) string
+	dataMap     *sync.Map
+	modelMan    db.IModelManager
+	res         informer.IResourceManager
+	getId       func(O) string
+	getWatchId  func(*jsonutils.JSONDict) string
+	getDBObject FGetDBObject
+	onAdd       func(obj db.IModel)
+	onUpdate    func(oldObj *jsonutils.JSONDict, newObj db.IModel)
+	onDelete    func(obj *jsonutils.JSONDict)
 }
 
 func NewResourceStore[O lockman.ILockedObject](
 	modelMan db.IModelManager,
 	res informer.IResourceManager,
-) IResourceStore[O] {
-	return newResourceStore[O](modelMan, res, nil, nil)
+) *ResourceStore[O] {
+	return newResourceStore[O](modelMan, res, nil, nil, nil)
 }
 
 func NewJointResourceStore[O lockman.ILockedObject](
@@ -111,8 +131,9 @@ func NewJointResourceStore[O lockman.ILockedObject](
 	res informer.IResourceManager,
 	getId func(O) string,
 	getWatchId func(*jsonutils.JSONDict) string,
-) IResourceStore[O] {
-	return newResourceStore(modelMan, res, getId, getWatchId)
+	getDBObject FGetDBObject,
+) *ResourceStore[O] {
+	return newResourceStore(modelMan, res, getId, getWatchId, getDBObject)
 }
 
 func newResourceStore[O lockman.ILockedObject](
@@ -120,7 +141,8 @@ func newResourceStore[O lockman.ILockedObject](
 	res informer.IResourceManager,
 	getId func(O) string,
 	getWatchId func(*jsonutils.JSONDict) string,
-) IResourceStore[O] {
+	getDBObject FGetDBObject,
+) *ResourceStore[O] {
 	if getId == nil {
 		getId = func(o O) string {
 			return o.GetId()
@@ -132,13 +154,37 @@ func newResourceStore[O lockman.ILockedObject](
 			return id
 		}
 	}
-	return &ResourceStore[O]{
-		dataMap:    new(sync.Map),
-		modelMan:   modelMan,
-		res:        res,
-		getId:      getId,
-		getWatchId: getWatchId,
+	if getDBObject == nil {
+		getDBObject = func(man db.IModelManager, id string, o *jsonutils.JSONDict) (db.IModel, error) {
+			return man.FetchById(id)
+		}
 	}
+	return &ResourceStore[O]{
+		dataMap:     new(sync.Map),
+		modelMan:    modelMan,
+		res:         res,
+		getId:       getId,
+		getWatchId:  getWatchId,
+		getDBObject: getDBObject,
+		onAdd:       nil,
+		onUpdate:    nil,
+		onDelete:    nil,
+	}
+}
+
+func (s *ResourceStore[O]) WithOnAdd(onAdd func(db.IModel)) *ResourceStore[O] {
+	s.onAdd = onAdd
+	return s
+}
+
+func (s *ResourceStore[O]) WithOnUpdate(onUpdate func(old *jsonutils.JSONDict, newObj db.IModel)) *ResourceStore[O] {
+	s.onUpdate = onUpdate
+	return s
+}
+
+func (s *ResourceStore[O]) WithOnDelete(onDelete func(*jsonutils.JSONDict)) *ResourceStore[O] {
+	s.onDelete = onDelete
+	return s
 }
 
 func (s *ResourceStore[O]) GetInformerResourceManager() informer.IResourceManager {
@@ -189,12 +235,15 @@ func (s *ResourceStore[O]) GetAll() []O {
 func (s *ResourceStore[O]) Add(obj *jsonutils.JSONDict) {
 	id := s.getWatchId(obj)
 	if id != "" {
-		dbObj, err := s.modelMan.FetchById(id)
+		dbObj, err := s.getDBObject(s.modelMan, id, obj)
 		if err == nil {
 			v := reflect.ValueOf(dbObj)
 			tmpObj := v.Elem().Interface()
 			s.dataMap.Store(id, tmpObj)
 			log.Infof("Add %s %s", s.modelMan.Keyword(), obj.String())
+			if s.onAdd != nil {
+				s.onAdd(dbObj)
+			}
 		} else {
 			log.Errorf("Fetch %s by id %s error when created: %v", s.modelMan.Keyword(), id, err)
 		}
@@ -225,6 +274,9 @@ func (s *ResourceStore[O]) Update(oldObj, newObj *jsonutils.JSONDict) {
 			tmpObj := v.Elem().Interface()
 			s.dataMap.Store(id, tmpObj)
 			log.Infof("Update %s %s", s.modelMan.Keyword(), newObj.String())
+			if s.onUpdate != nil {
+				s.onUpdate(oldObj, dbObj)
+			}
 		} else {
 			log.Errorf("Fetch %s by id %s error when updated: %v", s.modelMan.Keyword(), id, err)
 		}
@@ -236,6 +288,9 @@ func (s *ResourceStore[O]) Delete(obj *jsonutils.JSONDict) {
 	if id != "" {
 		s.dataMap.Delete(id)
 		log.Infof("Delete %s %s", s.modelMan.Keyword(), obj.String())
+		if s.onDelete != nil {
+			s.onDelete(obj)
+		}
 	}
 }
 

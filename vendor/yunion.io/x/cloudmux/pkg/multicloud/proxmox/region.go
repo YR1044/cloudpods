@@ -81,10 +81,6 @@ func (self *SRegion) GetISecurityGroupById(secgroupId string) (cloudprovider.ICl
 	return nil, cloudprovider.ErrNotSupported
 }
 
-func (self *SRegion) GetISecurityGroupByName(opts *cloudprovider.SecurityGroupFilterOptions) (cloudprovider.ICloudSecurityGroup, error) {
-	return nil, cloudprovider.ErrNotSupported
-}
-
 func (self *SRegion) CreateISecurityGroup(conf *cloudprovider.SecurityGroupCreateInput) (cloudprovider.ICloudSecurityGroup, error) {
 	return nil, cloudprovider.ErrNotSupported
 }
@@ -218,4 +214,16 @@ func (self *SRegion) put(res string, params url.Values, body jsonutils.JSONObjec
 
 func (self *SRegion) del(res string, params url.Values, retVal interface{}) error {
 	return self.client.del(res, params, retVal)
+}
+
+func (region *SRegion) GetIVMs() ([]cloudprovider.ICloudVM, error) {
+	vms, err := region.GetInstances("")
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetInstances")
+	}
+	ret := []cloudprovider.ICloudVM{}
+	for i := range vms {
+		ret = append(ret, &vms[i])
+	}
+	return ret, nil
 }

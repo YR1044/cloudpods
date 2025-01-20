@@ -32,7 +32,6 @@ type SResourceGroup struct {
 	client *SAliyunClient
 
 	Status      string
-	AccountId   string
 	DisplayName string
 	Id          string
 	CreateDate  time.Time

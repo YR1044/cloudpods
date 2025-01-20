@@ -26,7 +26,6 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/gotypes"
-	"yunion.io/x/pkg/util/filterclause"
 	"yunion.io/x/pkg/util/printutils"
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/version"
@@ -41,6 +40,7 @@ import (
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	"yunion.io/x/onecloud/pkg/util/filterclause"
 	"yunion.io/x/onecloud/pkg/util/logclient"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
@@ -253,7 +253,8 @@ func ListItemQueryFilters(manager IModelManager,
 	return listItemQueryFilters(manager, ctx, q, userCred, query, action, false)
 }
 
-func listItemQueryFiltersRaw(manager IModelManager,
+func listItemQueryFiltersRaw(
+	manager IModelManager,
 	ctx context.Context, q *sqlchemy.SQuery,
 	userCred mcclient.TokenCredential,
 	query jsonutils.JSONObject,
@@ -266,12 +267,15 @@ func listItemQueryFiltersRaw(manager IModelManager,
 		return nil, httperrors.NewGeneralError(err)
 	}
 
-	query.(*jsonutils.JSONDict).Update(policyTagFilters.Json())
+	if !policyTagFilters.IsEmpty() {
+		query.(*jsonutils.JSONDict).Update(policyTagFilters.Json())
+		log.Debugf("policyTagFilers: %s", query)
+	}
 
 	if !useRawQuery {
 		// Specifically for joint resource, these filters will exclude
 		// deleted resources by joining with master/slave tables
-		q = manager.FilterByOwner(q, manager, userCred, ownerId, queryScope)
+		q = manager.FilterByOwner(ctx, q, manager, userCred, ownerId, queryScope)
 		q = manager.FilterBySystemAttributes(q, userCred, query, queryScope)
 		q = manager.FilterByHiddenSystemAttributes(q, userCred, query, queryScope)
 	}
@@ -573,18 +577,15 @@ func ListItems(manager IModelManager, ctx context.Context, userCred mcclient.Tok
 	pagingOrderStr, _ := query.GetString("paging_order")
 	pagingOrder := sqlchemy.QueryOrderType(strings.ToUpper(pagingOrderStr))
 
-	var (
-		q           *sqlchemy.SQuery
-		useRawQuery bool
-	)
-	{
-		// query senders are responsible for clear up other constraint
-		// like setting "pendinge_delete" to "all"
-		queryDelete, _ := query.GetString("delete")
-		if queryDelete == "all" && userCred.HasSystemAdminPrivilege() {
-			useRawQuery = true
-		}
+	// export data only
+	exportLimit, err := query.Int("export_limit")
+	if query.Contains("export_keys") && err == nil {
+		limit = exportLimit
 	}
+
+	var q *sqlchemy.SQuery
+
+	useRawQuery := isRawQuery(manager, userCred, query, policy.PolicyActionList)
 
 	queryDict, ok := query.(*jsonutils.JSONDict)
 	if !ok {
@@ -672,11 +673,7 @@ func ListItems(manager IModelManager, ctx context.Context, userCred mcclient.Tok
 		}
 		q = union.Query()
 	} else {
-		if useRawQuery {
-			q = manager.RawQuery()
-		} else {
-			q = manager.Query()
-		}
+		q = manager.NewQuery(ctx, userCred, queryDict, useRawQuery)
 	}
 
 	q, err = listItemQueryFiltersRaw(manager, ctx, q, userCred, queryDict, policy.PolicyActionList, true, useRawQuery)
@@ -687,11 +684,19 @@ func ListItems(manager IModelManager, ctx context.Context, userCred mcclient.Tok
 	var totalCnt int
 	var totalJson jsonutils.JSONObject
 	if pagingConf == nil {
-		// calculate total
-		totalQ := q.CountQuery()
-		totalCnt, totalJson, err = manager.CustomizedTotalCount(ctx, userCred, query, totalQ)
-		if err != nil {
-			return nil, errors.Wrap(err, "CustomizedTotalCount")
+		summaryStats := jsonutils.QueryBoolean(query, "summary_stats", false)
+		if summaryStats {
+			// calculate total
+			totalQ := q.CountQuery()
+			totalCnt, totalJson, err = manager.CustomizedTotalCount(ctx, userCred, query, totalQ)
+			if err != nil {
+				return nil, errors.Wrap(err, "CustomizedTotalCount")
+			}
+		} else {
+			totalCnt, err = q.CountWithError()
+			if err != nil {
+				return nil, errors.Wrap(err, "CountWithError")
+			}
 		}
 		//log.Debugf("total count %d", totalCnt)
 		if totalCnt == 0 {
@@ -701,12 +706,6 @@ func ListItems(manager IModelManager, ctx context.Context, userCred mcclient.Tok
 	}
 	if int64(totalCnt) > maxLimit && (limit <= 0 || limit > maxLimit) && !forceNoPaging {
 		limit = maxLimit
-	}
-
-	// export data only
-	exportLimit, err := query.Int("export_limit")
-	if query.Contains("export_keys") && err == nil {
-		limit = exportLimit
 	}
 
 	// orders defined in pagingConf should have the highest priority
@@ -912,6 +911,7 @@ func (dispatcher *DBModelDispatcher) List(ctx context.Context, query jsonutils.J
 	userCred := fetchUserCredential(ctx)
 	manager := dispatcher.manager.GetImmutableInstance(ctx, userCred, query)
 
+	ctx = manager.PrepareQueryContext(ctx, userCred, query)
 	// list详情
 	items, err := ListItems(manager, ctx, userCred, query, ctxIds)
 	if err != nil {
@@ -974,24 +974,23 @@ func getItemDetails(manager IModelManager, item IModel, ctx context.Context, use
 	return nil, httperrors.NewInternalServerError("FetchCustomizeColumns returns incorrect results(expect 1 actual %d)", len(extraRows))
 }
 
-func (dispatcher *DBModelDispatcher) tryGetModelProperty(ctx context.Context, property string, query jsonutils.JSONObject) (jsonutils.JSONObject, error) {
-	userCred := fetchUserCredential(ctx)
+func tryGetModelProperty(manager IModelManager, ctx context.Context, userCred mcclient.TokenCredential, property string, query jsonutils.JSONObject) (jsonutils.JSONObject, error) {
 	funcName := fmt.Sprintf("GetProperty%s", utils.Kebab2Camel(property, "-"))
-	manager := dispatcher.manager.GetImmutableInstance(ctx, userCred, query)
+
 	modelValue := reflect.ValueOf(manager)
-	params := []interface{}{ctx, userCred, query}
+	// params := []interface{}{ctx, userCred, query}
 
 	funcValue := modelValue.MethodByName(funcName)
 	if !funcValue.IsValid() || funcValue.IsNil() {
 		return nil, nil
 	}
 
-	_, _, err, _ := FetchCheckQueryOwnerScope(ctx, userCred, query, manager, policy.PolicyActionList, true)
-	if err != nil {
-		return nil, err
-	}
+	// _, _, err, _ := FetchCheckQueryOwnerScope(ctx, userCred, query, manager, policy.PolicyActionList, true)
+	// if err != nil {
+	// 	return nil, err
+	// }
 
-	outs, err := callFunc(funcValue, funcName, params...)
+	outs, err := callFunc(funcValue, funcName, ctx, userCred, query)
 	if err != nil {
 		return nil, httperrors.NewInternalServerError("reflect call %s fail %s", funcName, err)
 	}
@@ -1016,8 +1015,9 @@ func (dispatcher *DBModelDispatcher) Get(ctx context.Context, idStr string, quer
 	// log.Debugf("Get %s", idStr)
 	userCred := fetchUserCredential(ctx)
 	manager := dispatcher.manager.GetImmutableInstance(ctx, userCred, query)
+	ctx = manager.PrepareQueryContext(ctx, userCred, query)
 
-	data, err := dispatcher.tryGetModelProperty(ctx, idStr, query)
+	data, err := tryGetModelProperty(manager, ctx, userCred, idStr, query)
 	if err != nil {
 		return nil, err
 	} else if data != nil {
@@ -1054,6 +1054,8 @@ func (dispatcher *DBModelDispatcher) Get(ctx context.Context, idStr string, quer
 func (dispatcher *DBModelDispatcher) GetSpecific(ctx context.Context, idStr string, spec string, query jsonutils.JSONObject) (jsonutils.JSONObject, error) {
 	userCred := fetchUserCredential(ctx)
 	manager := dispatcher.manager.GetImmutableInstance(ctx, userCred, query)
+	ctx = manager.PrepareQueryContext(ctx, userCred, query)
+
 	model, err := fetchItem(manager, ctx, userCred, idStr, query)
 	if err == sql.ErrNoRows {
 		return nil, httperrors.NewResourceNotFoundError2(manager.Keyword(), idStr)
@@ -1284,7 +1286,7 @@ func _doCreateItem(
 		uniqValues := manager.FetchUniqValues(ctx, dataDict)
 		name, _ := dataDict.GetString("name")
 		if len(name) > 0 {
-			err = NewNameValidator(manager, ownerId, name, uniqValues)
+			err = NewNameValidator(ctx, manager, ownerId, name, uniqValues)
 			if err != nil {
 				return nil, err
 			}
@@ -1420,6 +1422,9 @@ func (dispatcher *DBModelDispatcher) Create(ctx context.Context, query jsonutils
 		defer lockman.ReleaseObject(ctx, model)
 
 		model.PostCreate(ctx, userCred, ownerId, query, data)
+		if err := manager.GetExtraHook().AfterPostCreate(ctx, userCred, ownerId, model, query, data); err != nil {
+			logclient.AddActionLogWithContext(ctx, model, logclient.ACT_POST_CREATE_HOOK, err, userCred, false)
+		}
 	}()
 
 	// 添加操作日志与消息通知
@@ -1428,11 +1433,18 @@ func (dispatcher *DBModelDispatcher) Create(ctx context.Context, query jsonutils
 		OpsLog.LogEvent(model, ACT_CREATE, notes, userCred)
 		logclient.AddActionLogWithContext(ctx, model, logclient.ACT_CREATE, notes, userCred, true)
 	}
-	manager.OnCreateComplete(ctx, []IModel{model}, userCred, ownerId, query, data)
+	manager.OnCreateComplete(ctx, []IModel{model}, userCred, ownerId, query, []jsonutils.JSONObject{data})
 	return getItemDetails(manager, model, ctx, userCred, query)
 }
 
-func expandMultiCreateParams(manager IModelManager, data jsonutils.JSONObject, count int) ([]jsonutils.JSONObject, error) {
+func expandMultiCreateParams(manager IModelManager,
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	ownerId mcclient.IIdentityProvider,
+	query jsonutils.JSONObject,
+	data jsonutils.JSONObject,
+	count int,
+) ([]jsonutils.JSONObject, error) {
 	jsonDict, ok := data.(*jsonutils.JSONDict)
 	if !ok {
 		return nil, httperrors.NewInputParameterError("body is not a json?")
@@ -1450,7 +1462,16 @@ func expandMultiCreateParams(manager IModelManager, data jsonutils.JSONObject, c
 	}
 	ret := make([]jsonutils.JSONObject, count)
 	for i := 0; i < count; i += 1 {
-		ret[i] = jsonDict.Copy()
+		input, err := ExpandBatchCreateData(manager, ctx, userCred, ownerId, query, jsonDict.Copy(), i)
+		if err != nil {
+			if errors.Cause(err) == MethodNotFoundError {
+				ret[i] = jsonDict.Copy()
+			} else {
+				return nil, errors.Wrap(err, "ExpandBatchCreateData")
+			}
+		} else {
+			ret[i] = input
+		}
 	}
 	return ret, nil
 }
@@ -1508,7 +1529,7 @@ func (dispatcher *DBModelDispatcher) BatchCreate(ctx context.Context, query json
 			return nil, errors.Wrap(err, "manager.BatchPreValidate")
 		}
 
-		multiData, err = expandMultiCreateParams(manager, data, count)
+		multiData, err = expandMultiCreateParams(manager, ctx, userCred, ownerId, query, data, count)
 		if err != nil {
 			return nil, errors.Wrap(err, "expandMultiCreateParams")
 		}
@@ -1517,6 +1538,7 @@ func (dispatcher *DBModelDispatcher) BatchCreate(ctx context.Context, query json
 		ret := make([]sCreateResult, len(multiData))
 		for i := range multiData {
 			var model IModel
+			log.Debugf("batchCreateDoCreateItem %d %s", i, multiData[i].String())
 			model, err = batchCreateDoCreateItem(manager, ctx, userCred, ownerId, query, multiData[i], i+1)
 			if err == nil {
 				ret[i] = sCreateResult{model: model, err: nil}
@@ -1576,7 +1598,7 @@ func (dispatcher *DBModelDispatcher) BatchCreate(ctx context.Context, query json
 		lockman.LockClass(ctx, manager, GetLockClassKey(manager, ownerId))
 		defer lockman.ReleaseClass(ctx, manager, GetLockClassKey(manager, ownerId))
 
-		manager.OnCreateComplete(ctx, models, userCred, ownerId, query, multiData[0])
+		manager.OnCreateComplete(ctx, models, userCred, ownerId, query, multiData)
 	}
 	return results, nil
 }
@@ -1728,11 +1750,11 @@ func reflectDispatcherInternal(
 	} else {
 		if model != nil {
 			if _, ok := model.(IStandaloneModel); ok {
-				Metadata.rawSetValues(ctx, model.Keyword(), model.GetId(), tagutils.Tagset2MapString(result.ObjectTags.Flattern()), false, "")
+				Metadata.rawSetValues(ctx, model.Keyword(), model.GetId(), tagutils.TagsetMap2MapString(result.ObjectTags.Flattern()), false, "")
 				if model.Keyword() == "project" {
-					Metadata.rawSetValues(ctx, model.Keyword(), model.GetId(), tagutils.Tagset2MapString(result.ProjectTags.Flattern()), false, "")
+					Metadata.rawSetValues(ctx, model.Keyword(), model.GetId(), tagutils.TagsetMap2MapString(result.ProjectTags.Flattern()), false, "")
 				} else if model.Keyword() == "domain" {
-					Metadata.rawSetValues(ctx, model.Keyword(), model.GetId(), tagutils.Tagset2MapString(result.DomainTags.Flattern()), false, "")
+					Metadata.rawSetValues(ctx, model.Keyword(), model.GetId(), tagutils.TagsetMap2MapString(result.DomainTags.Flattern()), false, "")
 				}
 			}
 		}
@@ -1742,6 +1764,13 @@ func reflectDispatcherInternal(
 			return ValueToJSONObject(resVal), nil
 		}
 	}
+}
+
+func DoUpdate(manager IModelManager, item IModel, ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
+	lockman.LockObject(ctx, item)
+	defer lockman.ReleaseObject(ctx, item)
+
+	return updateItem(manager, item, ctx, userCred, query, data)
 }
 
 func updateItem(manager IModelManager, item IModel, ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, data jsonutils.JSONObject) (jsonutils.JSONObject, error) {
@@ -1796,6 +1825,9 @@ func (dispatcher *DBModelDispatcher) FetchUpdateHeaderData(ctx context.Context, 
 
 func (dispatcher *DBModelDispatcher) Update(ctx context.Context, idStr string, query jsonutils.JSONObject, data jsonutils.JSONObject, ctxIds []dispatcher.SResourceContext) (jsonutils.JSONObject, error) {
 	userCred := fetchUserCredential(ctx)
+	if data == nil {
+		data = jsonutils.NewDict()
+	}
 	manager := dispatcher.manager.GetMutableInstance(ctx, userCred, query, data)
 	model, err := fetchItem(manager, ctx, userCred, idStr, nil)
 	if err == sql.ErrNoRows {

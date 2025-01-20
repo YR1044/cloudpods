@@ -16,7 +16,6 @@ package proxmox
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -29,6 +28,7 @@ import (
 	"yunion.io/x/pkg/util/osprofile"
 	"yunion.io/x/pkg/utils"
 
+	"yunion.io/x/cloudmux/pkg/apis"
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud"
@@ -171,7 +171,10 @@ type SInstance struct {
 }
 
 func (self *SInstance) GetName() string {
-	return self.Name
+	if len(self.Name) > 0 {
+		return self.Name
+	}
+	return self.GetId()
 }
 
 func (self *SInstance) GetId() string {
@@ -190,10 +193,6 @@ func (self *SInstance) Refresh() error {
 	}
 	self.QemuDisks = ins.QemuDisks
 	return jsonutils.Update(self, ins)
-}
-
-func (self *SInstance) AssignSecurityGroup(id string) error {
-	return cloudprovider.ErrNotSupported
 }
 
 func (self *SInstance) AttachDisk(ctx context.Context, diskId string) error {
@@ -249,8 +248,8 @@ func (self *SInstance) DeleteVM(ctx context.Context) error {
 	return self.host.zone.region.DeleteVM(self.VmID)
 }
 
-func (self *SInstance) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
-	return self.host.zone.region.ResetVmPassword(self.VmID, username, password)
+func (self *SInstance) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
+	return self.host.zone.region.ResetVmPassword(self.VmID, opts.Username, opts.Password)
 }
 
 func (self *SInstance) DetachDisk(ctx context.Context, diskId string) error {
@@ -289,7 +288,7 @@ func (self *SInstance) GetError() error {
 }
 
 func (self *SInstance) GetHostname() string {
-	return self.GetName()
+	return ""
 }
 
 func (self *SInstance) GetHypervisor() string {
@@ -398,7 +397,10 @@ func (self *SInstance) GetOsType() cloudprovider.TOsType {
 }
 
 func (ins *SInstance) GetOsArch() string {
-	return "x86_64"
+	if utils.IsInStringArray(ins.QemuCpu, []string{"neoverse-n1"}) || strings.HasPrefix(ins.QemuCpu, "cortex-a") {
+		return apis.OS_ARCH_AARCH64
+	}
+	return ins.host.GetCpuArchitecture()
 }
 
 func (ins *SInstance) GetOsDist() string {
@@ -423,11 +425,10 @@ func (self *SInstance) GetVNCInfo(input *cloudprovider.ServerVncInput) (*cloudpr
 		return nil, err
 	}
 	ret := &cloudprovider.ServerVncOutput{}
-	params := url.Values{}
-	params.Set("port", fmt.Sprintf("%d", vnc.Port))
-	params.Set("vncticket", vnc.Ticket)
-	ret.Url = fmt.Sprintf("wss://%s:%d/api2/json/nodes/%s/qemu/%d/vncwebsocket?%s", self.host.zone.region.client.host, self.host.zone.region.client.port, self.Node, self.VmID, params.Encode())
 	ret.Protocol = "vnc"
+	ret.Host = self.host.zone.region.client.host
+	ret.Port = int64(vnc.Port)
+	ret.Password = vnc.Ticket
 	ret.Hypervisor = api.HYPERVISOR_PROXMOX
 	return ret, nil
 }
@@ -475,7 +476,7 @@ func (self *SInstance) UpdateUserData(userData string) error {
 	return cloudprovider.ErrNotSupported
 }
 
-func (self *SInstance) UpdateVM(ctx context.Context, name string) error {
+func (self *SInstance) UpdateVM(ctx context.Context, input cloudprovider.SInstanceUpdateOptions) error {
 	return cloudprovider.ErrNotSupported
 }
 
@@ -500,7 +501,9 @@ func (self *SRegion) GetVmAgentNetworkInterfaces(node string, VmId int) (map[str
 
 	for _, intermediate := range intermediates {
 		for _, addr := range intermediate.IPAddresses {
-			ipMap[intermediate.HardwareAddress] = addr.IPAddress
+			if strings.ToLower(addr.IPAddressType) == "ipv4" {
+				ipMap[intermediate.HardwareAddress] = addr.IPAddress
+			}
 		}
 	}
 
@@ -548,11 +551,8 @@ func (self *SRegion) GetQemuConfig(node string, VmId int) (*SInstance, error) {
 	if err != nil {
 		return nil, err
 	}
-	byteArr, err := json.Marshal(&vmConfig)
-	if err != nil {
-		return nil, err
-	}
-	err = json.Unmarshal(byteArr, &vmBase)
+
+	err = jsonutils.Update(vmBase, vmConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -823,12 +823,13 @@ func (self *SRegion) GetInstances(hostId string) ([]SInstance, error) {
 	}
 
 	for _, res := range resources {
-		if res.NodeId == hostId {
+		if res.NodeId == hostId || len(hostId) == 0 {
 			instance, err := self.GetQemuConfig(res.Node, res.VmId)
-			if err == nil {
-				ret = append(ret, *instance)
+			if err != nil {
+				log.Warningf("get pve vm %s %d error: %v", res.Node, res.VmId, err)
+				continue
 			}
-
+			ret = append(ret, *instance)
 		}
 	}
 
@@ -844,7 +845,7 @@ func (self *SRegion) GetInstance(id string) (*SInstance, error) {
 	nodeName := ""
 	vmId, _ := strconv.Atoi(id)
 	if resource, ok := resources[vmId]; !ok {
-		return nil, errors.Errorf("failed get Instance id %s", id)
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
 	} else {
 		nodeName = resource.Node
 	}
@@ -1015,7 +1016,10 @@ type InstanceVnc struct {
 
 func (self *SRegion) GetVNCInfo(node string, vmId int) (*InstanceVnc, error) {
 	res := fmt.Sprintf("/nodes/%s/qemu/%d/vncproxy", node, vmId)
-	resp, err := self.post(res, map[string]interface{}{})
+	resp, err := self.post(res, map[string]interface{}{
+		"websocket":         "1",
+		"generate-password": "0",
+	})
 	if err != nil {
 		return nil, err
 	}

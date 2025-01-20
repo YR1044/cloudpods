@@ -18,13 +18,13 @@ import (
 	"fmt"
 	"strings"
 
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
-
-	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
+	"yunion.io/x/pkg/utils"
 )
 
 type sGeneralPCIDevice struct {
-	*sBaseDevice
+	*SBaseDevice
 }
 
 func (dev *sGeneralPCIDevice) GetVGACmd() string {
@@ -39,57 +39,13 @@ func (dev *sGeneralPCIDevice) GetQemuId() string {
 	return fmt.Sprintf("dev_%s", strings.ReplaceAll(dev.GetAddr(), ":", "_"))
 }
 
-func (dev *sGeneralPCIDevice) GetHotPlugOptions(isolatedDev *desc.SGuestIsolatedDevice) ([]*HotPlugOption, error) {
-	ret := make([]*HotPlugOption, 0)
-
-	var masterDevOpt *HotPlugOption
-	for i := 0; i < len(isolatedDev.VfioDevs); i++ {
-		cmd := isolatedDev.VfioDevs[i].HostAddr
-		if optCmd := isolatedDev.VfioDevs[i].OptionsStr(); len(optCmd) > 0 {
-			cmd += fmt.Sprintf(",%s", optCmd)
-		}
-		opts := map[string]string{
-			"host": cmd,
-			"id":   isolatedDev.VfioDevs[i].Id,
-		}
-		devOpt := &HotPlugOption{
-			Device:  isolatedDev.VfioDevs[i].DevType,
-			Options: opts,
-		}
-		if isolatedDev.VfioDevs[i].Function == 0 {
-			masterDevOpt = devOpt
-		} else {
-			ret = append(ret, devOpt)
-		}
-	}
-	// if PCI slot function 0 already assigned, qemu will reject hotplug function
-	// so put function 0 at the enda
-	if masterDevOpt == nil {
-		return nil, errors.Errorf("Device no function 0 found")
-	}
-	ret = append(ret, masterDevOpt)
-	return ret, nil
-}
-
-func (dev *sGeneralPCIDevice) GetHotUnplugOptions(isolatedDev *desc.SGuestIsolatedDevice) ([]*HotUnplugOption, error) {
-	if len(isolatedDev.VfioDevs) == 0 {
-		return nil, errors.Errorf("device %s no pci ids", isolatedDev.Id)
-	}
-
-	return []*HotUnplugOption{
-		{
-			Id: isolatedDev.VfioDevs[0].Id,
-		},
-	}, nil
-}
-
 func newGeneralPCIDevice(dev *PCIDevice, devType string) *sGeneralPCIDevice {
 	return &sGeneralPCIDevice{
-		sBaseDevice: newBaseDevice(dev, devType),
+		SBaseDevice: NewBaseDevice(dev, devType),
 	}
 }
 
-func getPassthroughPCIDevs(devModel IsolatedDeviceModel) ([]*sGeneralPCIDevice, error) {
+func getPassthroughPCIDevs(devModel IsolatedDeviceModel, filteredCodes []string) ([]*sGeneralPCIDevice, error) {
 	ret, err := bashOutput(fmt.Sprintf("lspci -d %s:%s -nnmm", devModel.VendorId, devModel.DeviceId))
 	if err != nil {
 		return nil, err
@@ -102,12 +58,20 @@ func getPassthroughPCIDevs(devModel IsolatedDeviceModel) ([]*sGeneralPCIDevice, 
 	}
 
 	devs := []*sGeneralPCIDevice{}
+	errs := make([]error, 0)
 	for _, line := range lines {
 		dev := NewPCIDevice2(line)
 		if dev.ModelName == "" {
 			dev.ModelName = devModel.Model
 		}
+		if utils.IsInStringArray(dev.ClassCode, filteredCodes) {
+			continue
+		}
+		if err := dev.checkSameIOMMUGroupDevice(); err != nil {
+			errs = append(errs, errors.Wrapf(err, "get dev %s iommu group devices by model: %s", dev.Addr, jsonutils.Marshal(devModel)))
+			continue
+		}
 		devs = append(devs, newGeneralPCIDevice(dev, devModel.DevType))
 	}
-	return devs, nil
+	return devs, errors.NewAggregate(errs)
 }

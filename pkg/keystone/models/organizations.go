@@ -39,8 +39,13 @@ import (
 	"yunion.io/x/onecloud/pkg/util/tagutils"
 )
 
+var _ db.IModelManager = (*SOrganizationManager)(nil)
+var _ db.IModel = (*SOrganization)(nil)
+
 type SOrganizationManager struct {
-	db.SEnabledStatusInfrasResourceBaseManager
+	SEnabledIdentityBaseResourceManager
+	db.SSharableBaseResourceManager
+	db.SStatusResourceBaseManager
 
 	cache *db.SCacheManager[SOrganization]
 }
@@ -49,7 +54,7 @@ var OrganizationManager *SOrganizationManager
 
 func init() {
 	OrganizationManager = &SOrganizationManager{
-		SEnabledStatusInfrasResourceBaseManager: db.NewEnabledStatusInfrasResourceBaseManager(
+		SEnabledIdentityBaseResourceManager: NewEnabledIdentityBaseResourceManager(
 			SOrganization{},
 			"organizations_tbl",
 			"organization",
@@ -61,7 +66,9 @@ func init() {
 }
 
 type SOrganization struct {
-	db.SEnabledStatusInfrasResourceBase
+	SEnabledIdentityBaseResource
+	db.SSharableBaseResource
+	db.SStatusResourceBase
 
 	Type api.TOrgType `width:"32" charset:"ascii" list:"user" create:"admin_required"`
 
@@ -96,9 +103,17 @@ func (manager *SOrganizationManager) ListItemFilter(
 ) (*sqlchemy.SQuery, error) {
 	var err error
 
-	q, err = manager.SEnabledStatusInfrasResourceBaseManager.ListItemFilter(ctx, q, userCred, query.EnabledStatusInfrasResourceBaseListInput)
+	q, err = manager.SEnabledIdentityBaseResourceManager.ListItemFilter(ctx, q, userCred, query.EnabledIdentityBaseResourceListInput)
 	if err != nil {
-		return nil, errors.Wrap(err, "SEnabledStatusInfrasResourceBaseManager.ListItemFilter")
+		return nil, errors.Wrap(err, "SEnabledIdentityBaseResourceManager.ListItemFilter")
+	}
+	q, err = manager.SSharableBaseResourceManager.ListItemFilter(ctx, q, userCred, query.SharableResourceBaseListInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "SSharableBaseResourceManager.ListItemFilter")
+	}
+	q, err = manager.SStatusResourceBaseManager.ListItemFilter(ctx, q, userCred, query.StatusResourceBaseListInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "SStatusResourceBaseManager.ListItemFilter")
 	}
 
 	if len(query.Type) > 0 {
@@ -129,9 +144,13 @@ func (manager *SOrganizationManager) OrderByExtraFields(
 ) (*sqlchemy.SQuery, error) {
 	var err error
 
-	q, err = manager.SEnabledStatusInfrasResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.EnabledStatusInfrasResourceBaseListInput)
+	q, err = manager.SEnabledIdentityBaseResourceManager.OrderByExtraFields(ctx, q, userCred, query.EnabledIdentityBaseResourceListInput)
 	if err != nil {
-		return nil, errors.Wrap(err, "SEnabledStatusInfrasResourceBaseManager.OrderByExtraFields")
+		return nil, errors.Wrap(err, "SEnabledIdentityBaseResourceManager.OrderByExtraFields")
+	}
+	q, err = manager.SStatusResourceBaseManager.OrderByExtraFields(ctx, q, userCred, query.StatusResourceBaseListInput)
+	if err != nil {
+		return nil, errors.Wrap(err, "SStatusResourceBaseManager.ListItemFilter")
 	}
 
 	return q, nil
@@ -140,18 +159,12 @@ func (manager *SOrganizationManager) OrderByExtraFields(
 func (manager *SOrganizationManager) QueryDistinctExtraField(q *sqlchemy.SQuery, field string) (*sqlchemy.SQuery, error) {
 	var err error
 
-	q, err = manager.SEnabledStatusInfrasResourceBaseManager.QueryDistinctExtraField(q, field)
+	q, err = manager.SEnabledIdentityBaseResourceManager.QueryDistinctExtraField(q, field)
 	if err == nil {
 		return q, nil
 	}
 
 	return q, httperrors.ErrNotFound
-}
-
-type SOrganizationDetails struct {
-	apis.EnabledStatusInfrasResourceBaseDetails
-
-	SOrganization
 }
 
 func (manager *SOrganizationManager) FetchCustomizeColumns(
@@ -161,13 +174,15 @@ func (manager *SOrganizationManager) FetchCustomizeColumns(
 	objs []interface{},
 	fields stringutils2.SSortedStrings,
 	isList bool,
-) []SOrganizationDetails {
-	rows := make([]SOrganizationDetails, len(objs))
-	infRows := manager.SEnabledStatusInfrasResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+) []api.SOrganizationDetails {
+	rows := make([]api.SOrganizationDetails, len(objs))
+	infRows := manager.SEnabledIdentityBaseResourceManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+	sharedRows := manager.SSharableBaseResourceManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	for i := range rows {
 		// org := objs[i].(*SOrganization)
-		rows[i] = SOrganizationDetails{
-			EnabledStatusInfrasResourceBaseDetails: infRows[i],
+		rows[i] = api.SOrganizationDetails{
+			EnabledIdentityBaseResourceDetails: infRows[i],
+			SharableResourceBaseInfo:           sharedRows[i],
 		}
 	}
 	return rows
@@ -223,7 +238,7 @@ func (org *SOrganization) ValidateDeleteCondition(ctx context.Context, info *api
 	if org.GetEnabled() {
 		return errors.Wrap(httperrors.ErrInvalidStatus, "organization enabled")
 	}
-	return org.SInfrasResourceBase.ValidateDeleteCondition(ctx, nil)
+	return org.SEnabledIdentityBaseResource.ValidateDeleteCondition(ctx, nil)
 }
 
 func (org *SOrganization) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
@@ -231,11 +246,12 @@ func (org *SOrganization) Delete(ctx context.Context, userCred mcclient.TokenCre
 	if err != nil {
 		return errors.Wrap(err, "removeAll")
 	}
-	err = org.SEnabledStatusInfrasResourceBase.Delete(ctx, userCred)
-	if err != nil {
-		return errors.Wrap(err, "SResourceBase.Delete")
-	}
 	OrganizationManager.cache.Delete(org)
+	// pending delete
+	err = org.SEnabledIdentityBaseResource.Delete(ctx, userCred)
+	if err != nil {
+		return errors.Wrap(err, "SEnabledIdentityBaseResource.Delete")
+	}
 	return nil
 }
 
@@ -248,9 +264,13 @@ func (manager *SOrganizationManager) ValidateCreateData(
 ) (api.OrganizationCreateInput, error) {
 	var err error
 
-	input.EnabledStatusInfrasResourceBaseCreateInput, err = manager.SEnabledStatusInfrasResourceBaseManager.ValidateCreateData(ctx, userCred, ownerId, query, input.EnabledStatusInfrasResourceBaseCreateInput)
+	input.EnabledIdentityBaseResourceCreateInput, err = manager.SEnabledIdentityBaseResourceManager.ValidateCreateData(ctx, userCred, ownerId, query, input.EnabledIdentityBaseResourceCreateInput)
 	if err != nil {
-		return input, errors.Wrap(err, "SEnableStatusInfrasResourceBaseManager.ValidateCreateData")
+		return input, errors.Wrap(err, "SEnabledIdentityBaseResourceManager.ValidateCreateData")
+	}
+	input.SharableResourceBaseCreateInput, err = db.SharableManagerValidateCreateData(manager, ctx, userCred, ownerId, query, input.SharableResourceBaseCreateInput)
+	if err != nil {
+		return input, errors.Wrap(err, "SharableManagerValidateCreateData")
 	}
 
 	if !api.IsValidOrgType(input.Type) {
@@ -287,7 +307,7 @@ func (org *SOrganization) CustomizeCreate(
 	org.SetShare(rbacscope.ScopeSystem)
 	org.Enabled = tristate.False
 	org.Status = api.OrganizationStatusReady
-	return org.SEnabledStatusInfrasResourceBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
+	return org.SEnabledIdentityBaseResource.CustomizeCreate(ctx, userCred, ownerId, query, data)
 }
 
 func (org *SOrganization) PostCreate(
@@ -297,7 +317,7 @@ func (org *SOrganization) PostCreate(
 	query jsonutils.JSONObject,
 	data jsonutils.JSONObject,
 ) {
-	org.SEnabledStatusInfrasResourceBase.PostCreate(ctx, userCred, ownerId, query, data)
+	org.SEnabledIdentityBaseResource.PostCreate(ctx, userCred, ownerId, query, data)
 	OrganizationManager.cache.Update(org)
 }
 
@@ -316,7 +336,7 @@ func (org *SOrganization) PostUpdate(
 	query jsonutils.JSONObject,
 	data jsonutils.JSONObject,
 ) {
-	org.SEnabledStatusInfrasResourceBase.PostUpdate(ctx, userCred, query, data)
+	org.SEnabledIdentityBaseResource.PostUpdate(ctx, userCred, query, data)
 	OrganizationManager.cache.Update(org)
 }
 
@@ -375,7 +395,8 @@ func (org *SOrganization) PerformAddLevel(
 }
 
 func (org *SOrganization) GetShortDesc(ctx context.Context) *jsonutils.JSONDict {
-	desc := org.SEnabledStatusInfrasResourceBase.GetShortDesc(ctx)
+	desc := org.SEnabledIdentityBaseResource.GetShortDesc(ctx)
+	desc.Set("status", jsonutils.NewString(org.Status))
 	desc.Set("keys", jsonutils.NewString(org.Keys))
 	desc.Set("level", jsonutils.NewInt(int64(org.Level)))
 	return desc
@@ -408,7 +429,7 @@ func (org *SOrganization) PerformAddNode(
 			weight = &input.Weight
 			desc = input.Description
 		}
-		_, err := OrganizationNodeManager.ensureNode(ctx, org.Id, labels[i], api.JoinLabels(labels[0:i+1]...), i+1, weight, desc)
+		_, err := OrganizationNodeManager.ensureNode(ctx, org.Id, api.JoinLabels(labels[0:i+1]...), weight, desc)
 		if err != nil {
 			return nil, errors.Wrapf(err, "fail to insert node %s", api.JoinLabels(labels[i:i]...))
 		}
@@ -450,12 +471,16 @@ func (org *SOrganization) removeAll(ctx context.Context, userCred mcclient.Token
 	return nil
 }
 
+func (org *SOrganization) SetStatus(ctx context.Context, userCred mcclient.TokenCredential, status string, reason string) error {
+	return db.StatusBaseSetStatus(ctx, org, userCred, status, reason)
+}
+
 func (org *SOrganization) startOrganizationSyncTask(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
 	resourceType string,
 ) error {
-	org.SetStatus(userCred, api.OrganizationStatusSync, "start sync task")
+	org.SetStatus(ctx, userCred, api.OrganizationStatusSync, "start sync task")
 	params := jsonutils.NewDict()
 	if len(resourceType) > 0 {
 		params.Add(jsonutils.NewString(resourceType), "resource_type")
@@ -497,7 +522,7 @@ func (org *SOrganization) syncIModelManagerTags(ctx context.Context, userCred mc
 		orgKeys[i] = fmt.Sprintf("%s%s", db.ORGANIZATION_TAG_PREFIX, keys[i])
 	}
 	{
-		tagValMaps, err := db.GetTagValueCountMap(manager, manager.Keyword(), "id", userKeys, ctx, userCred, query)
+		tagValMaps, err := db.GetTagValueCountMap(manager, manager.Keyword(), "id", "", userKeys, ctx, userCred, query)
 		if err != nil {
 			return errors.Wrap(err, "GetTagValueCountMap")
 		}
@@ -513,7 +538,7 @@ func (org *SOrganization) syncIModelManagerTags(ctx context.Context, userCred mc
 		}
 	}
 	{
-		tagValMaps, err := db.GetTagValueCountMap(manager, manager.Keyword(), "id", orgKeys, ctx, userCred, query)
+		tagValMaps, err := db.GetTagValueCountMap(manager, manager.Keyword(), "id", "", orgKeys, ctx, userCred, query)
 		if err != nil {
 			return errors.Wrap(err, "GetTagValueCountMap")
 		}
@@ -543,7 +568,7 @@ func (org *SOrganization) syncTagValueMap(ctx context.Context, tagVal map[string
 		if val, ok := tagVal[key]; ok && val != tagutils.NoValue {
 			labels = append(labels, val)
 			log.Debugf("%d %s %s %s", i, key, val, strings.Join(labels, "/"))
-			_, err := OrganizationNodeManager.ensureNode(ctx, org.Id, val, api.JoinLabels(labels...), i+1, nil, "")
+			_, err := OrganizationNodeManager.ensureNode(ctx, org.Id, api.JoinLabels(labels...), nil, "")
 			if err != nil {
 				return nil, errors.Wrapf(err, "fail to insert node %s", api.JoinLabels(labels...))
 			}
@@ -561,7 +586,7 @@ func (org *SOrganization) PerformEnable(
 	input apis.PerformEnableInput,
 ) (jsonutils.JSONObject, error) {
 	if !org.GetEnabled() {
-		_, err := org.SEnabledStatusInfrasResourceBase.PerformEnable(ctx, userCred, query, input)
+		_, err := org.SEnabledIdentityBaseResource.PerformEnable(ctx, userCred, query, input)
 		if err != nil {
 			return nil, errors.Wrap(err, "SEnabledStatusInfrasResourceBase.PerformEnable")
 		}
@@ -593,7 +618,7 @@ func (org *SOrganization) PerformDisable(
 	input apis.PerformDisableInput,
 ) (jsonutils.JSONObject, error) {
 	if org.GetEnabled() {
-		_, err := org.SEnabledStatusInfrasResourceBase.PerformDisable(ctx, userCred, query, input)
+		_, err := org.SEnabledIdentityBaseResource.PerformDisable(ctx, userCred, query, input)
 		if err != nil {
 			return nil, errors.Wrap(err, "SEnabledStatusInfrasResourceBase.PerformDisable")
 		}
@@ -628,4 +653,17 @@ func (org *SOrganization) getProjectOrganization(tags map[string]string) (*api.S
 		}
 	}
 	return &ret, nil
+}
+
+func (org *SOrganization) PerformClean(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	input api.OrganizationPerformCleanInput,
+) (jsonutils.JSONObject, error) {
+	err := org.removeAll(ctx, userCred)
+	if err != nil {
+		return nil, errors.Wrap(err, "removeAll")
+	}
+	return nil, nil
 }

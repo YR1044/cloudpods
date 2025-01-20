@@ -56,6 +56,7 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/monitor/qga"
 	"yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/hostman/storageman"
+	"yunion.io/x/onecloud/pkg/hostman/storageman/lvmutils"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
@@ -65,7 +66,6 @@ import (
 	"yunion.io/x/onecloud/pkg/util/cgrouputils/cpuset"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/fuseutils"
-	"yunion.io/x/onecloud/pkg/util/netutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemuimg"
 	"yunion.io/x/onecloud/pkg/util/regutils2"
@@ -76,6 +76,7 @@ import (
 const (
 	STATE_FILE_PREFIX             = "STATEFILE"
 	MONITOR_PORT_BASE             = 55900
+	QMP_MONITOR_PORT_BASE         = 56100
 	LIVE_MIGRATE_PORT_BASE        = 4396
 	BUILT_IN_NBD_SERVER_PORT_BASE = 7777
 	MAX_TRY                       = 3
@@ -107,18 +108,12 @@ type SKVMInstanceRuntime struct {
 
 type SKVMGuestInstance struct {
 	SKVMInstanceRuntime
+	*sBaseGuestInstance
 
-	Id         string
 	Monitor    monitor.Monitor
-	manager    *SGuestManager
 	guestAgent *qga.QemuGuestAgent
 
 	archMan arch.Arch
-
-	// runtime description, generate from source desc
-	Desc *desc.SGuestDesc
-	// source description, input from region
-	SourceDesc *desc.SGuestDesc
 }
 
 func NewKVMGuestInstance(id string, manager *SGuestManager) *SKVMGuestInstance {
@@ -130,9 +125,8 @@ func NewKVMGuestInstance(id string, manager *SGuestManager) *SKVMGuestInstance {
 		SKVMInstanceRuntime: SKVMInstanceRuntime{
 			blockJobTigger: make(map[string]chan struct{}),
 		},
-		Id:      id,
-		manager: manager,
-		archMan: arch.NewArch(qemuArch),
+		sBaseGuestInstance: newBaseGuestInstance(id, manager, api.HYPERVISOR_KVM),
+		archMan:            arch.NewArch(qemuArch),
 	}
 }
 
@@ -155,7 +149,175 @@ func (s *SKVMGuestInstance) updateGuestDesc() error {
 		return err
 	}
 
-	return s.SaveLiveDesc(s.Desc)
+	return SaveLiveDesc(s, s.Desc)
+}
+
+// release allocated numa mems and realloc numa mems
+func (s *SKVMGuestInstance) reallocateNumaNodes(isMigrate bool) error {
+	s.manager.cpuSet.Lock.Lock()
+	defer s.manager.cpuSet.Lock.Unlock()
+
+	ReleaseCpuNumaPin(s.manager, s.Desc.CpuNumaPin)
+	s.Desc.CpuNumaPin = nil
+
+	if isMigrate {
+		if err := s.reallocateMigrateNumaNodes(); err != nil {
+			return errors.Wrap(err, "reallocateMigrateNumaNodes")
+		}
+	} else {
+		if err := s.allocGuestNumaCpuset(); err != nil {
+			return errors.Wrap(err, "allocGuestNumaCpuset")
+		}
+		if err := s.initMemDesc(s.Desc.Mem); err != nil {
+			return errors.Wrap(err, "fixNumaAllocate")
+		}
+	}
+
+	return SaveLiveDesc(s, s.Desc)
+}
+
+func (s *SKVMGuestInstance) reallocateMigrateNumaNodes() error {
+	nodeNumaCpus, err := s.manager.cpuSet.AllocCpusetWithNodeCount(int(s.Desc.Cpu), s.Desc.Mem*1024, len(s.Desc.MemDesc.Mem.Mems)+1, s.GetId())
+	if err != nil {
+		return errors.Wrap(err, "AllocCpusetWithNodeCount")
+	}
+	var cpuNumaPin = make([]*desc.SCpuNumaPin, 0)
+	if len(nodeNumaCpus) > 0 {
+		for nodeId, numaCpus := range nodeNumaCpus {
+			unodeId := uint16(nodeId)
+			vcpuPin := make([]desc.SVCpuPin, len(numaCpus.Cpuset))
+			for i := range numaCpus.Cpuset {
+				vcpuPin[i].Pcpu = numaCpus.Cpuset[i]
+			}
+			memPin := &desc.SCpuNumaPin{
+				SizeMB:    numaCpus.MemSizeKB / 1024, // MB
+				NodeId:    &unodeId,
+				VcpuPin:   vcpuPin,
+				Unregular: numaCpus.Unregular,
+			}
+			cpuNumaPin = append(cpuNumaPin, memPin)
+		}
+	}
+
+	if len(cpuNumaPin) > 0 {
+		s.Desc.CpuNumaPin = cpuNumaPin
+		s.Desc.MemDesc.Mem.SMemDesc.SetHostNodes(int(*cpuNumaPin[0].NodeId))
+		for i := range s.Desc.MemDesc.Mem.Mems {
+			s.Desc.MemDesc.Mem.Mems[i].SetHostNodes(int(*cpuNumaPin[i+1].NodeId))
+		}
+	} else {
+		s.Desc.MemDesc.Mem.SMemDesc.SetHostNodes(-1)
+		for i := range s.Desc.MemDesc.Mem.Mems {
+			s.Desc.MemDesc.Mem.Mems[i].SetHostNodes(-1)
+		}
+	}
+
+	return nil
+}
+
+func (s *SKVMGuestInstance) validateNumaAllocated(keywords string, isMigrate, isHotPlug bool, vcpuOrder [][]int) error {
+	if len(s.Desc.CpuNumaPin) > 0 {
+		if isMigrate {
+			for i := range s.Desc.CpuNumaPin {
+				for j := range s.Desc.CpuNumaPin[i].VcpuPin {
+					s.Desc.CpuNumaPin[i].VcpuPin[j].Vcpu = vcpuOrder[i][j]
+				}
+			}
+			return SaveLiveDesc(s, s.Desc)
+		}
+		if !isHotPlug {
+			return SaveLiveDesc(s, s.Desc)
+		}
+	}
+
+	guestPid := s.GetPid()
+	if guestPid <= 0 {
+		return errors.Errorf("guest not running? pid %d", guestPid)
+	}
+	numaMapPath := fmt.Sprintf("/proc/%d/numa_maps", guestPid)
+	for {
+		if !fileutils2.Exists(numaMapPath) {
+			return errors.Errorf("guest not running? pid %d", guestPid)
+		}
+		// wait hugepage mem allocate
+		if s.Monitor != nil && s.Monitor.IsConnected() {
+			break
+		}
+		time.Sleep(time.Millisecond * 300)
+	}
+
+	content, err := fileutils2.FileGetContents(numaMapPath)
+	if err != nil {
+		return errors.Wrap(err, "read numa_maps")
+	}
+
+	readNodeAllocateMap := map[int]int{}
+	numaNodeRegex := regexp.MustCompile(`^N[0-9]+=[0-9]+$`)
+	for _, line := range strings.Split(content, "\n") {
+		if idx := strings.Index(line, "hugepages"); idx < 0 {
+			continue
+		}
+		if idx := strings.Index(line, keywords); idx < 0 {
+			continue
+		}
+
+		// ... huge dirty=15 N0=3 N1=5 N2=5 N3=2 kernelpagesize_kB=1048576
+		segs := strings.Split(line, " ")
+		for _, seg := range segs {
+			if !numaNodeRegex.MatchString(seg) {
+				continue
+			}
+			log.Infof("hugepages segs %v", seg)
+			nodeAllocate := strings.Split(seg[1:], "=")
+			if len(nodeAllocate) != 2 {
+				continue
+			}
+			node, _ := strconv.Atoi(nodeAllocate[0])
+			size, _ := strconv.Atoi(nodeAllocate[1])
+			if _, ok := readNodeAllocateMap[node]; !ok {
+				readNodeAllocateMap[node] = 0
+			}
+			readNodeAllocateMap[node] += size * 1024
+		}
+	}
+	log.Infof("read node allocate map %v", readNodeAllocateMap)
+
+	s.manager.cpuSet.Lock.Lock()
+	defer s.manager.cpuSet.Lock.Unlock()
+	nodeNumaCpus := s.manager.cpuSet.setNumaNodes(readNodeAllocateMap, s.Desc.Cpu)
+
+	var cpuNumaPin = make([]*desc.SCpuNumaPin, 0)
+	for nodeId, numaCpus := range nodeNumaCpus {
+		unodeId := uint16(nodeId)
+		vcpuPin := make([]desc.SVCpuPin, len(numaCpus.Cpuset))
+		for i := range numaCpus.Cpuset {
+			vcpuPin[i].Pcpu = numaCpus.Cpuset[i]
+		}
+
+		memPin := &desc.SCpuNumaPin{
+			SizeMB:    numaCpus.MemSizeKB / 1024, // MB
+			NodeId:    &unodeId,
+			VcpuPin:   vcpuPin,
+			Unregular: numaCpus.Unregular,
+		}
+		cpuNumaPin = append(cpuNumaPin, memPin)
+	}
+
+	if len(s.Desc.CpuNumaPin) > 0 { // hotplug mems
+		s.Desc.CpuNumaPin = append(s.Desc.CpuNumaPin, cpuNumaPin...)
+		return SaveLiveDesc(s, s.Desc)
+	}
+
+	if len(vcpuOrder) > 0 {
+		for i := range cpuNumaPin {
+			for j := range cpuNumaPin[i].VcpuPin {
+				cpuNumaPin[i].VcpuPin[j].Vcpu = vcpuOrder[i][j]
+			}
+		}
+	}
+
+	s.Desc.CpuNumaPin = cpuNumaPin
+	return SaveLiveDesc(s, s.Desc)
 }
 
 func (s *SKVMGuestInstance) initLiveDescFromSourceGuest(srcDesc *desc.SGuestDesc) error {
@@ -172,7 +334,9 @@ func (s *SKVMGuestInstance) initLiveDescFromSourceGuest(srcDesc *desc.SGuestDesc
 	for i := 0; i < len(srcDesc.Disks); i++ {
 		for j := 0; j < len(s.SourceDesc.Disks); j++ {
 			if srcDesc.Disks[i].Index == s.SourceDesc.Disks[j].Index {
+				numQueues := srcDesc.Disks[i].NumQueues
 				srcDesc.Disks[i].GuestdiskJsonDesc = s.SourceDesc.Disks[j].GuestdiskJsonDesc
+				srcDesc.Disks[i].NumQueues = numQueues
 			}
 		}
 	}
@@ -201,28 +365,98 @@ func (s *SKVMGuestInstance) initLiveDescFromSourceGuest(srcDesc *desc.SGuestDesc
 		srcDesc.Nics[i].DownscriptPath = s.getNicDownScriptPath(srcDesc.Nics[i])
 	}
 
+	var cpuNumaPin []*desc.SCpuNumaPin
+	if len(s.Desc.CpuNumaPin) > 0 {
+		// cpu numa pin allocated by controller
+		cpuNumaPin = s.Desc.CpuNumaPin
+	} else {
+		// allocate cpu numa pin local
+		nodeNumaCpus, err := s.manager.cpuSet.AllocCpusetWithNodeCount(int(srcDesc.Cpu), srcDesc.Mem*1024, len(srcDesc.MemDesc.Mem.Mems)+1, s.GetId())
+		if err != nil {
+			return errors.Wrap(err, "AllocCpusetWithNodeCount")
+		}
+
+		var cpus = make([]int, 0)
+		cpuNumaPin = make([]*desc.SCpuNumaPin, 0)
+		for nodeId, numaCpus := range nodeNumaCpus {
+			if s.manager.numaAllocate {
+				unodeId := uint16(nodeId)
+				vcpuPin := make([]desc.SVCpuPin, len(numaCpus.Cpuset))
+				for i := range numaCpus.Cpuset {
+					vcpuPin[i].Pcpu = numaCpus.Cpuset[i]
+				}
+
+				memPin := &desc.SCpuNumaPin{
+					SizeMB:    numaCpus.MemSizeKB / 1024, // MB
+					NodeId:    &unodeId,
+					VcpuPin:   vcpuPin,
+					Unregular: numaCpus.Unregular,
+				}
+				cpuNumaPin = append(cpuNumaPin, memPin)
+			}
+			cpus = append(cpus, numaCpus.Cpuset...)
+		}
+
+		if s.manager.numaAllocate {
+			// reset origin cpu numa pin
+			srcDesc.VcpuPin = nil
+			srcDesc.CpuNumaPin = nil
+		} else {
+			// if host not enable cpu numa pin
+			if scpuset, ok := srcDesc.Metadata[api.VM_METADATA_CGROUP_CPUSET]; ok {
+				s.manager.cpuSet.Lock.Lock()
+				s.manager.cpuSet.ReleaseCpus(cpus, int(srcDesc.Cpu))
+				s.manager.cpuSet.Lock.Unlock()
+
+				cpusetJson, err := jsonutils.ParseString(scpuset)
+				if err != nil {
+					log.Errorf("failed parse server %s cpuset %s: %s", s.Id, scpuset, err)
+					return errors.Errorf("failed parse server %s cpuset %s: %s", s.Id, scpuset, err)
+				}
+				input := new(api.ServerCPUSetInput)
+				err = cpusetJson.Unmarshal(input)
+				if err != nil {
+					log.Errorf("failed unmarshal server %s cpuset %s", s.Id, err)
+					return errors.Errorf("failed unmarshal server %s cpuset %s", s.Id, err)
+				}
+				cpus = input.CPUS
+			}
+
+			srcDesc.VcpuPin = []desc.SCpuPin{
+				{
+					Vcpus: fmt.Sprintf("0-%d", srcDesc.Cpu-1),
+					Pcpus: cpuset.NewCPUSet(cpus...).String(),
+				},
+			}
+			for i := range srcDesc.CpuNumaPin {
+				srcDesc.CpuNumaPin[i].Unregular = true
+			}
+		}
+	}
+
+	if len(cpuNumaPin) > 0 {
+		srcDesc.MemDesc.Mem.SMemDesc.SetHostNodes(int(*cpuNumaPin[0].NodeId))
+		for i := range srcDesc.MemDesc.Mem.Mems {
+			srcDesc.MemDesc.Mem.Mems[i].SetHostNodes(int(*cpuNumaPin[i+1].NodeId))
+		}
+		srcDesc.CpuNumaPin = cpuNumaPin
+	} else {
+		srcDesc.MemDesc.Mem.SMemDesc.SetHostNodes(-1)
+		for i := range srcDesc.MemDesc.Mem.Mems {
+			srcDesc.MemDesc.Mem.Mems[i].SetHostNodes(-1)
+		}
+	}
+
 	s.Desc = srcDesc
 	err := s.loadGuestPciAddresses()
 	if err != nil {
 		return errors.Wrap(err, "initLiveDescFromSourceGuest")
 	}
-	return s.SaveLiveDesc(srcDesc)
+	return SaveLiveDesc(s, srcDesc)
 }
 
 func (s *SKVMGuestInstance) IsStopping() bool {
 	return s.stopping
-}
-
-func (s *SKVMGuestInstance) IsValid() bool {
-	return s.Desc != nil && s.Desc.Uuid != ""
-}
-
-func (s *SKVMGuestInstance) GetId() string {
-	return s.Desc.Uuid
-}
-
-func (s *SKVMGuestInstance) GetName() string {
-	return fmt.Sprintf("%s(%s)", s.Desc.Name, s.Desc.Uuid)
 }
 
 func (s *SKVMGuestInstance) getStateFilePathRootPrefix() string {
@@ -241,20 +475,8 @@ func (s *SKVMGuestInstance) getQemuLogPath() string {
 	return path.Join(s.HomeDir(), "qemu.log")
 }
 
-func (s *SKVMGuestInstance) IsLoaded() bool {
-	return s.Desc != nil
-}
-
-func (s *SKVMGuestInstance) HomeDir() string {
-	return path.Join(s.manager.ServersPath, s.Id)
-}
-
-func (s *SKVMGuestInstance) PrepareDir() error {
-	output, err := procutils.NewCommand("mkdir", "-p", s.HomeDir()).Output()
-	if err != nil {
-		return errors.Wrapf(err, "mkdir %s failed: %s", s.HomeDir(), output)
-	}
-	return nil
+func (s *SKVMGuestInstance) RecycleDir() string {
+	return path.Join(s.manager.ServersPath, "recycle")
 }
 
 func (s *SKVMGuestInstance) GetPidFilePath() string {
@@ -379,65 +601,30 @@ func (s *SKVMGuestInstance) isSelfCmdline(cmdline, uuid string) bool {
 		strings.Index(cmdline, uuid) >= 0
 }
 
-func (s *SKVMGuestInstance) GetDescFilePath() string {
-	return path.Join(s.HomeDir(), "desc")
-}
-
-func (s *SKVMGuestInstance) GetSourceDescFilePath() string {
-	return path.Join(s.HomeDir(), "source-desc")
+func (s *SKVMGuestInstance) GetRescueDirPath() string {
+	if s.manager.host.IsAarch64() {
+		return path.Join("/opt/cloud/host-deployer/yunionos/aarch64")
+	} else {
+		return path.Join("/opt/cloud/host-deployer/yunionos/x86_64")
+	}
 }
 
 func (s *SKVMGuestInstance) LoadDesc() error {
-	descPath := s.GetDescFilePath()
-	descStr, err := ioutil.ReadFile(descPath)
-	if err != nil {
-		return errors.Wrap(err, "read desc")
+	if err := LoadDesc(s); err != nil {
+		return errors.Wrap(err, "LoadDesc")
 	}
-
-	var (
-		srcDescStr  []byte
-		srcDescPath = s.GetSourceDescFilePath()
-	)
-	if !fileutils2.Exists(srcDescPath) {
-		err = fileutils2.FilePutContents(srcDescPath, string(descStr), false)
-		if err != nil {
-			return errors.Wrap(err, "save source desc")
-		}
-		srcDescStr = descStr
-	} else {
-		srcDescStr, err = ioutil.ReadFile(srcDescPath)
-		if err != nil {
-			return errors.Wrap(err, "read source desc")
-		}
-	}
-
-	// parse source desc
-	srcGuestDesc := new(desc.SGuestDesc)
-	jsonSrcDesc, err := jsonutils.Parse(srcDescStr)
-	if err != nil {
-		return errors.Wrap(err, "json parse source desc")
-	}
-	err = jsonSrcDesc.Unmarshal(srcGuestDesc)
-	if err != nil {
-		return errors.Wrap(err, "unmarshal source desc")
-	}
-	s.SourceDesc = srcGuestDesc
-
-	// parse desc
-	guestDesc := new(desc.SGuestDesc)
-	jsonDesc, err := jsonutils.Parse(descStr)
-	if err != nil {
-		return errors.Wrap(err, "json parse desc")
-	}
-	err = jsonDesc.Unmarshal(guestDesc)
-	if err != nil {
-		return errors.Wrap(err, "unmarshal desc")
-	}
-	s.Desc = guestDesc
 
 	if s.IsRunning() {
 		if len(s.Desc.PCIControllers) > 0 {
-			return s.loadGuestPciAddresses()
+			if err := s.loadGuestPciAddresses(); err != nil {
+				log.Errorf("failed load guest %s pci addresses %s", s.GetName(), err)
+				if len(s.Desc.AnonymousPCIDevs) > 0 {
+					s.Desc = s.SourceDesc
+					s.pciUninitialized = true
+				} else {
+					return err
+				}
+			}
 		} else {
 			s.pciUninitialized = true
 		}
@@ -446,12 +633,15 @@ func (s *SKVMGuestInstance) LoadDesc() error {
 	return nil
 }
 
-func (s *SKVMGuestInstance) IsDirtyShotdown() bool {
-	return s.GetPid() == -2
+func (s *SKVMGuestInstance) PostLoad(m *SGuestManager) error {
+	if s.needSyncStreamDisks {
+		go s.sendStreamDisksComplete(context.Background())
+	}
+	return LoadGuestCpuset(m, s)
 }
 
-func (s *SKVMGuestInstance) IsDaemon() bool {
-	return s.Desc.IsDaemon
+func (s *SKVMGuestInstance) IsDirtyShotdown() bool {
+	return s.GetPid() == -2
 }
 
 func (s *SKVMGuestInstance) DirtyServerRequestStart() {
@@ -511,24 +701,35 @@ func (s *SKVMGuestInstance) asyncScriptStart(ctx context.Context, params interfa
 		return nil, errors.Wrap(err, "fuse mount")
 	}
 
-	// init live migrate listen port
-	if jsonutils.QueryBoolean(data, "need_migrate", false) || s.Desc.IsSlave {
-		migratePort := s.manager.GetLiveMigrateFreePort()
-		defer s.manager.unsetPort(migratePort)
-		migratePortInt64 := int64(migratePort)
-		s.LiveMigrateDestPort = &migratePortInt64
-	}
-
-	if jsonutils.QueryBoolean(data, "need_migrate", false) {
+	var vcpuOrder = make([][]int, 0)
+	isMigrate := jsonutils.QueryBoolean(data, "need_migrate", false)
+	if isMigrate {
 		var sourceDesc = new(desc.SGuestDesc)
 		err = data.Unmarshal(sourceDesc, "src_desc")
 		if err != nil {
 			return nil, errors.Wrap(err, "unmarshal src desc")
 		}
+		for i := range sourceDesc.CpuNumaPin {
+			vcpus := make([]int, 0)
+			for j := range sourceDesc.CpuNumaPin[i].VcpuPin {
+				vcpus = append(vcpus, sourceDesc.CpuNumaPin[i].VcpuPin[j].Vcpu)
+			}
+			vcpuOrder = append(vcpuOrder, vcpus)
+		}
 		err = s.initLiveDescFromSourceGuest(sourceDesc)
 	} else {
 		err = s.updateGuestDesc()
 	}
+
+	// init live migrate listen port
+	if isMigrate || s.Desc.IsSlave {
+		migratePort := s.manager.GetLiveMigrateFreePort()
+		defer s.manager.unsetPort(migratePort)
+		migratePortInt64 := int64(migratePort)
+		s.LiveMigrateDestPort = &migratePortInt64
+		log.Infof("backup guest alloc dest port %v", s.LiveMigrateDestPort)
+	}
+
 	if err != nil {
 		if ctx != nil && len(appctx.AppContextTaskId(ctx)) >= 0 {
 			hostutils.TaskFailed(ctx, fmt.Sprintf("Async start server failed: %s", err))
@@ -552,6 +753,13 @@ func (s *SKVMGuestInstance) asyncScriptStart(ctx context.Context, params interfa
 			data.Set("vnc_port", jsonutils.NewInt(int64(vncPort)))
 		}
 
+		if tried > 1 && s.manager.numaAllocate {
+			if err = s.reallocateNumaNodes(isMigrate); err != nil {
+				log.Errorf("failed fix numa allocated mems %s", err)
+				goto finally
+			}
+		}
+
 		err = s.saveScripts(data)
 		if err != nil {
 			goto finally
@@ -570,6 +778,14 @@ func (s *SKVMGuestInstance) asyncScriptStart(ctx context.Context, params interfa
 			log.Errorf("Start VM failed %s: %s", s.GetName(), err)
 			time.Sleep(time.Duration(1<<uint(tried-1)) * time.Second)
 		} else {
+			if s.manager.numaAllocate {
+				if err = s.validateNumaAllocated(s.Desc.Uuid, isMigrate, false, vcpuOrder); err != nil {
+					log.Errorf("VM %s validateNumaAllocated: %s", s.GetName(), err)
+					isStarted = false
+					s.scriptStop()
+					continue
+				}
+			}
 			log.Infof("VM started %s ...", s.GetName())
 		}
 	}
@@ -580,15 +796,17 @@ func (s *SKVMGuestInstance) asyncScriptStart(ctx context.Context, params interfa
 		s.syncMeta = s.CleanImportMetadata()
 		return nil, nil
 	}
+	// release guest acquired cpu mems on guest start failed
+	ReleaseGuestCpuset(s.manager, s)
 	log.Errorf("Async start server %s failed: %s!!!", s.GetName(), err)
 	if ctx != nil && len(appctx.AppContextTaskId(ctx)) >= 0 {
 		hostutils.TaskFailed(ctx, fmt.Sprintf("Async start server failed: %s", err))
 	}
-	needMigrate := jsonutils.QueryBoolean(data, "need_migrate", false)
-	// do not syncstatus if need_migrate
-	if !needMigrate {
-		s.SyncStatus("")
-	}
+	//needMigrate := jsonutils.QueryBoolean(data, "need_migrate", false)
+	//// do not syncstatus if need_migrate
+	//if !needMigrate {
+	//	s.SyncStatus("")
+	//}
 	return nil, err
 }
 
@@ -633,7 +851,7 @@ func (s *SKVMGuestInstance) ImportServer(pendingDelete bool) {
 	if s.Desc.HostId != hostinfo.Instance().HostId {
 		// fix host_id
 		s.Desc.HostId = hostinfo.Instance().HostId
-		s.SaveLiveDesc(s.Desc)
+		SaveLiveDesc(s, s.Desc)
 	}
 
 	s.manager.SaveServer(s.Id, s)
@@ -642,18 +860,21 @@ func (s *SKVMGuestInstance) ImportServer(pendingDelete bool) {
 	if s.IsDirtyShotdown() && !pendingDelete {
 		log.Infof("Server dirty shutdown or a daemon %s", s.GetName())
 
-		if s.Desc.IsMaster || s.Desc.IsSlave ||
-			len(s.GetNeedMergeBackingFileDiskIndexs()) > 0 {
+		if len(s.GetNeedMergeBackingFileDiskIndexs()) > 0 {
+			go s.DirtyServerRequestStart()
+		} else if s.Desc.IsMaster {
+			go s.SyncStatus("Server dirty shutdown")
+		} else if s.Desc.IsSlave {
 			go s.DirtyServerRequestStart()
 		} else {
-			s.StartGuest(context.Background(), nil, jsonutils.NewDict())
+			s.StartGuest(context.Background(), auth.AdminCredential(), jsonutils.NewDict())
 		}
 		return
 	}
 	if s.IsRunning() {
 		log.Infof("%s is running, pending_delete=%t", s.GetName(), pendingDelete)
 		if !pendingDelete {
-			s.StartMonitor(context.Background(), nil)
+			s.StartMonitor(context.Background(), nil, false)
 		}
 	} else if s.IsDaemon() {
 		s.StartGuest(context.Background(), nil, jsonutils.NewDict())
@@ -730,8 +951,8 @@ func (s *SKVMGuestInstance) onImportGuestMonitorConnected(ctx context.Context) {
 		log.Infof("Guest %s qemu version %s", s.Id, version)
 		s.QemuVersion = version
 		meta := jsonutils.NewDict()
-		meta.Set("hotplug_cpu_mem", jsonutils.NewString("disable"))
-		meta.Set("hot_remove_nic", jsonutils.NewString("disable"))
+		meta.Set(api.VM_METADATA_HOTPLUG_CPU_MEM, jsonutils.NewString("disable"))
+		meta.Set(api.VM_METADATA_HOT_REMOVE_NIC, jsonutils.NewString("disable"))
 		meta.Set("__qemu_version", jsonutils.NewString(s.GetQemuVersionStr()))
 		s.SyncMetadata(meta)
 		s.SyncStatus("")
@@ -758,13 +979,22 @@ func (s *SKVMGuestInstance) StartMonitorWithImportGuestSocketFile(ctx context.Co
 		}, // on monitor connected
 		s.onReceiveQMPEvent, // on reveive qmp event
 	)
-	return mon.ConnectWithSocket(socketFile)
+	return mon.ConnectWithSocket(socketFile, 0)
 }
 
-func (s *SKVMGuestInstance) StartMonitor(ctx context.Context, cb func()) error {
+func (s *SKVMGuestInstance) StartMonitor(ctx context.Context, cb func(), isScriptStart bool) error {
 	if s.GetQmpMonitorPort(-1) > 0 {
 		var mon monitor.Monitor
-		var onMonitorTimeout = func(err error) { s.onMonitorTimeout(ctx, err) }
+		var onMonitorTimeout = func(err error) {
+			if isScriptStart {
+				if ctx != nil && len(appctx.AppContextTaskId(ctx)) >= 0 {
+					hostutils.TaskFailed(ctx, fmt.Sprintf("Async start server failed: %s", err))
+				}
+				s.forceScriptStop()
+			} else {
+				s.onMonitorTimeout(ctx, err)
+			}
+		}
 		var onMonitorConnected = func() {
 			s.Monitor = mon
 			s.onMonitorConnected(ctx)
@@ -789,7 +1019,7 @@ func (s *SKVMGuestInstance) StartMonitor(ctx context.Context, cb func()) error {
 	} else if monitorPath := s.GetMonitorPath(); len(monitorPath) > 0 {
 		return s.StartMonitorWithImportGuestSocketFile(ctx, monitorPath, cb)
 	} else {
-		log.Errorf("Guest %s start monitor failed, can't get qmp monitor port or monitor path", s.Id)
+		log.Warningf("Guest %s start monitor failed, can't get qmp monitor port or monitor path", s.Id)
 		return errors.Errorf("Guest %s start monitor failed, can't get qmp monitor port or monitor path", s.Id)
 	}
 }
@@ -1035,7 +1265,7 @@ func (s *SKVMGuestInstance) migrateStartNbdServer(nbdServerPort int) error {
 	var err = make(chan error)
 	onNbdServerStarted := func(res string) {
 		if len(res) > 0 {
-			err <- errors.Errorf("failed enable multifd %s", res)
+			err <- errors.Errorf("failed start nbd server %s", res)
 		} else {
 			err <- nil
 		}
@@ -1063,7 +1293,7 @@ func (s *SKVMGuestInstance) syncStatusUnsync(reason string) {
 	statusInput := &apis.PerformStatusInput{
 		Status:      api.VM_UNSYNC,
 		Reason:      reason,
-		PowerStates: s.GetPowerStates(),
+		PowerStates: GetPowerStates(s),
 	}
 	if _, err := hostutils.UpdateServerStatus(context.Background(), s.Id, statusInput); err != nil {
 		log.Errorf("failed update guest status %s", err)
@@ -1092,15 +1322,50 @@ func (s *SKVMGuestInstance) collectGuestDescription() error {
 	if err != nil {
 		return errors.Wrap(err, "query mem devs")
 	}
-	scsiNumQueues := s.getScsiNumQueues()
-	err = s.initGuestDescFromExistingGuest(cpuList, pciInfoList, memoryDevicesInfoList, memDevs, scsiNumQueues)
+
+	if s.Desc.Machine == "" {
+		s.Desc.Machine = s.getMachine()
+	}
+	qtree := s.infoQtree()
+	scsiNumQueues := s.getScsiNumQueues(qtree)
+	for i := range s.Desc.Disks {
+		// fix virtio disk driver num-queues
+		if s.Desc.Disks[i].Driver == "virtio" {
+			diskDriver := fmt.Sprintf("drive_%d", s.Desc.Disks[i].Index)
+			numQueues := s.getDiskDriverNumQueues(qtree, diskDriver)
+			log.Infof("disk driver %s num queues %d", diskDriver, numQueues)
+			if numQueues > 0 {
+				s.Desc.Disks[i].NumQueues = uint8(numQueues)
+			}
+		}
+	}
+
+	err = s.initGuestDescFromExistingGuest(
+		cpuList, pciInfoList, memoryDevicesInfoList, memDevs, scsiNumQueues, qtree)
 	if err != nil {
 		return errors.Wrap(err, "failed init guest devices")
 	}
-	if err := s.SaveLiveDesc(s.Desc); err != nil {
+
+	if err := SaveLiveDesc(s, s.Desc); err != nil {
 		return errors.Wrap(err, "failed save live desc")
 	}
 	return nil
+}
+
+func (s *SKVMGuestInstance) syncVirtioDiskNumQueues() error {
+	qtree := s.infoQtree()
+	for i := range s.Desc.Disks {
+		// fix virtio disk driver num-queues
+		if s.Desc.Disks[i].Driver == "virtio" {
+			diskDriver := fmt.Sprintf("drive_%d", s.Desc.Disks[i].Index)
+			numQueues := s.getDiskDriverNumQueues(qtree, diskDriver)
+			log.Infof("disk driver %s num queues %d", diskDriver, numQueues)
+			if numQueues > 0 {
+				s.Desc.Disks[i].NumQueues = uint8(numQueues)
+			}
+		}
+	}
+	return SaveLiveDesc(s, s.Desc)
 }
 
 func (s *SKVMGuestInstance) getHotpluggableCPUList() ([]monitor.HotpluggableCPU, error) {
@@ -1119,13 +1384,90 @@ func (s *SKVMGuestInstance) getHotpluggableCPUList() ([]monitor.HotpluggableCPU,
 	return res, err
 }
 
-func (s *SKVMGuestInstance) getScsiNumQueues() int64 {
-	var numQueueChan = make(chan int64)
-	cb := func(numQueues int64) {
-		numQueueChan <- numQueues
+func (s *SKVMGuestInstance) infoQtree() string {
+	var qtreeChan = make(chan string)
+	cb := func(qtree string) {
+		qtreeChan <- qtree
 	}
-	s.Monitor.GetScsiNumQueues(cb)
-	return <-numQueueChan
+	s.Monitor.InfoQtree(cb)
+	return <-qtreeChan
+}
+
+func getScsiNumQueuesQmp(output string) int64 {
+	// if output is response from hmp, sep should use \r\n
+	var lines = strings.Split(strings.TrimSuffix(output, "\r\n"), "\\r\\n")
+	for i, line := range lines {
+		line := strings.TrimSpace(line)
+		if strings.HasPrefix(line, "dev: virtio-scsi-device") {
+			if len(lines) <= i+1 {
+				log.Errorf("failed parse num queues")
+				return -1
+			}
+			line = strings.TrimSpace(lines[i+1])
+			segs := strings.Split(line, " ")
+			numQueue, err := strconv.ParseInt(segs[2], 10, 0)
+			if err != nil {
+				log.Errorf("failed parse num queue %s: %s", line, err)
+				return -1
+			} else {
+				return numQueue
+			}
+		}
+	}
+	return -1
+}
+
+func (s *SKVMGuestInstance) getScsiNumQueues(qtree string) int64 {
+	return getScsiNumQueuesQmp(qtree)
+}
+
+func (s *SKVMGuestInstance) getDiskDriverNumQueues(qtree, driver string) int64 {
+	var lines = strings.Split(strings.TrimSuffix(qtree, "\r\n"), "\\r\\n")
+	var currentIndentLevel = -1
+	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine == "" {
+			continue
+		}
+
+		if currentIndentLevel > 0 {
+			// disk has been found
+			newIndentLevel := len(line) - len(trimmedLine)
+			if newIndentLevel <= currentIndentLevel { // run out disk driver block
+				break
+			}
+			if strings.HasPrefix(trimmedLine, "num-queues =") {
+				segs := strings.Split(trimmedLine, " ")
+				numQueue, err := strconv.ParseInt(segs[2], 10, 0)
+				if err != nil {
+					log.Errorf("failed parse num queue %s: %s", trimmedLine, err)
+					return -1
+				} else {
+					return numQueue
+				}
+			} else {
+				continue
+			}
+		}
+
+		if strings.HasPrefix(trimmedLine, "dev: virtio-blk-pci") && strings.Contains(line, driver) {
+			currentIndentLevel = len(line) - len(trimmedLine)
+		} else {
+			continue
+		}
+	}
+	return -1
+}
+
+func (s *SKVMGuestInstance) hasHpet(qtree string) bool {
+	var lines = strings.Split(strings.TrimSuffix(qtree, "\r\n"), "\\r\\n")
+	for _, line := range lines {
+		line := strings.TrimSpace(line)
+		if strings.HasPrefix(line, "dev: hpet") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *SKVMGuestInstance) getPciDevices() ([]monitor.PCIInfo, error) {
@@ -1176,6 +1518,15 @@ func (s *SKVMGuestInstance) getMemoryDevices() ([]monitor.MemoryDeviceInfo, erro
 	return res, err
 }
 
+func (s *SKVMGuestInstance) hasVirtioBlkDriver() bool {
+	for i := range s.Desc.Disks {
+		if s.Desc.Disks[i].Driver == "virtio" {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *SKVMGuestInstance) guestRun(ctx context.Context) {
 	if s.LiveMigrateDestPort != nil && ctx != nil && !s.IsSlave() {
 		// dest migrate guest
@@ -1186,14 +1537,26 @@ func (s *SKVMGuestInstance) guestRun(ctx context.Context) {
 			hostutils.TaskFailed(ctx, err.Error())
 			return
 		}
-		nbdServerPort := s.manager.GetNBDServerFreePort()
-		defer s.manager.unsetPort(nbdServerPort)
-		err = s.migrateStartNbdServer(nbdServerPort)
+
+		err = s.setupGuest()
 		if err != nil {
 			hostutils.TaskFailed(ctx, err.Error())
 			return
 		}
-		body.Set("nbd_server_port", jsonutils.NewInt(int64(nbdServerPort)))
+
+		if s.hasVirtioBlkDriver() {
+			// virtio driver bind iothread, need migrate use driver mirror
+			nbdServerPort := s.manager.GetNBDServerFreePort()
+			defer s.manager.unsetPort(nbdServerPort)
+			err = s.migrateStartNbdServer(nbdServerPort)
+			if err != nil {
+				hostutils.TaskFailed(ctx, err.Error())
+				return
+			}
+			body.Set("nbd_server_port", jsonutils.NewInt(int64(nbdServerPort)))
+		} else {
+			body.Set("nbd_server_disabled", jsonutils.JSONTrue)
+		}
 
 		if s.LiveMigrateUseTls {
 			s.setDestMigrateTLS(ctx, body)
@@ -1293,32 +1656,15 @@ func (s *SKVMGuestInstance) SlaveDisksBlockStream() error {
 	return nil
 }
 
-func (s *SKVMGuestInstance) releaseGuestCpuset() {
-	for _, vcpuPin := range s.Desc.VcpuPin {
-		pcpuSet, err := cpuset.Parse(vcpuPin.Pcpus)
-		if err != nil {
-			log.Errorf("failed parse %s pcpus: %s", s.GetName(), vcpuPin.Pcpus)
-			continue
-		}
-		vcpuSet, err := cpuset.Parse(vcpuPin.Vcpus)
-		if err != nil {
-			log.Errorf("failed parse %s vcpus: %s", s.GetName(), vcpuPin.Vcpus)
-			continue
-		}
-		s.manager.cpuSet.ReleaseCpus(pcpuSet.ToSlice(), vcpuSet.Size())
-	}
-	s.Desc.VcpuPin = nil
-	s.SaveLiveDesc(s.Desc)
-}
-
 func (s *SKVMGuestInstance) clearCgroup(pid int) {
-	s.releaseGuestCpuset()
+	ReleaseGuestCpuset(s.manager, s)
 	if pid == 0 && s.cgroupPid > 0 {
 		pid = s.cgroupPid
 	}
 	cgrupName := s.GetCgroupName()
 	log.Infof("cgroup destroy %d %s", pid, cgrupName)
 	if pid > 0 && !options.HostOptions.DisableSetCgroup {
+		s.CleanupCpuset()
 		cgrouputils.CgroupDestroy(strconv.Itoa(pid), cgrupName)
 	}
 }
@@ -1393,7 +1739,7 @@ func (s *SKVMGuestInstance) GetQmpMonitorPort(vncPort int) int {
 		vncPort = s.GetVncPort()
 	}
 	if vncPort > 0 {
-		return vncPort + MONITOR_PORT_BASE + 200
+		return vncPort + QMP_MONITOR_PORT_BASE
 	} else {
 		return -1
 	}
@@ -1437,20 +1783,12 @@ func (s *SKVMGuestInstance) SyncStatus(reason string) {
 	statusInput := &apis.PerformStatusInput{
 		Status:      status,
 		Reason:      reason,
-		PowerStates: s.GetPowerStates(),
+		PowerStates: GetPowerStates(s),
 		HostId:      hostinfo.Instance().HostId,
 	}
 
 	if _, err := hostutils.UpdateServerStatus(context.Background(), s.Id, statusInput); err != nil {
 		log.Errorf("failed update guest status %s", err)
-	}
-}
-
-func (s *SKVMGuestInstance) GetPowerStates() string {
-	if s.IsRunning() {
-		return api.VM_POWER_STATES_ON
-	} else {
-		return api.VM_POWER_STATES_OFF
 	}
 }
 
@@ -1464,7 +1802,7 @@ func (s *SKVMGuestInstance) CheckBlockOrRunning(jobs int) {
 	var statusInput = &apis.PerformStatusInput{
 		Status:         status,
 		BlockJobsCount: jobs,
-		PowerStates:    s.GetPowerStates(),
+		PowerStates:    GetPowerStates(s),
 		HostId:         hostinfo.Instance().HostId,
 	}
 	_, err := hostutils.UpdateServerStatus(context.Background(), s.Id, statusInput)
@@ -1473,53 +1811,29 @@ func (s *SKVMGuestInstance) CheckBlockOrRunning(jobs int) {
 	}
 }
 
-func (s *SKVMGuestInstance) SaveLiveDesc(guestDesc *desc.SGuestDesc) error {
-	s.Desc = guestDesc
-
-	// fill in ovn vpc nic bridge field
-	for _, nic := range s.Desc.Nics {
-		if nic.Bridge == "" {
-			nic.Bridge = getNicBridge(nic)
-		}
-	}
-
-	if err := fileutils2.FilePutContents(
-		s.GetDescFilePath(), jsonutils.Marshal(s.Desc).String(), false,
-	); err != nil {
-		log.Errorf("save desc failed %s", err)
-		return errors.Wrap(err, "save desc")
-	}
-	return nil
-}
-
-func (s *SKVMGuestInstance) SaveSourceDesc(guestDesc *desc.SGuestDesc) error {
-	s.SourceDesc = guestDesc
-	// fill in ovn vpc nic bridge field
-	for _, nic := range s.SourceDesc.Nics {
-		if nic.Bridge == "" {
-			nic.Bridge = getNicBridge(nic)
-		}
-	}
-
-	if err := fileutils2.FilePutContents(
-		s.GetSourceDescFilePath(), jsonutils.Marshal(s.SourceDesc).String(), false,
-	); err != nil {
-		log.Errorf("save source desc failed %s", err)
-		return errors.Wrap(err, "source save desc")
-	}
-	return nil
-}
-
-func (s *SKVMGuestInstance) GetVpcNIC() *desc.SGuestNetwork {
-	for _, nic := range s.Desc.Nics {
-		if nic.Vpc.Provider == api.VPC_PROVIDER_OVN {
-			if nic.Ip != "" {
-				return nic
-			}
-		}
-	}
-	return nil
-}
+//func (s *SKVMGuestInstance) GetRescueDesc() error {
+//	if !s.SourceDesc.LightMode {
+//		return errors.Errorf("guest %s not in rescue mode", s.Id)
+//	}
+//
+//	s.SourceDesc.RescueInitrdPath = path.Join(s.GetRescueDirPath(), api.GUEST_RESCUE_INITRAMFS)
+//	s.SourceDesc.RescueKernelPath = path.Join(s.GetRescueDirPath(), api.GUEST_RESCUE_KERNEL)
+//	s.SourceDesc.RescueDiskPath = path.Join(s.GetRescueDirPath(), api.GUEST_RESCUE_SYS_DISK_NAME)
+//	if s.manager.GetHost().IsAarch64() {
+//		s.SourceDesc.RescueInitrdPath = path.Join(s.GetRescueDirPath(), api.GUEST_RESCUE_INITRAMFS_ARM64)
+//		s.SourceDesc.RescueKernelPath = path.Join(s.GetRescueDirPath(), api.GUEST_RESCUE_KERNEL_ARM64)
+//	}
+//
+//	// Address
+//	bus, slot, found := s.findUnusedSlotForController(desc.CONTROLLER_TYPE_PCI_ROOT, 0)
+//	if !found {
+//		return errors.Errorf("no valid pci address found ?")
+//	}
+//	s.SourceDesc.RescueDiskDeviceBus = uint(bus)
+//	s.SourceDesc.RescueDiskDeviceSlot = uint(slot)
+//
+//	return nil
+//}
 
 type guestStartTask struct {
 	s *SKVMGuestInstance
@@ -1554,6 +1868,32 @@ func (s *SKVMGuestInstance) prepareEncryptKeyForStart(ctx context.Context, userC
 	return params, nil
 }
 
+func (s *SKVMGuestInstance) HandleGuestStart(ctx context.Context, userCred mcclient.TokenCredential, body jsonutils.JSONObject) (jsonutils.JSONObject, error) {
+	if s.IsStopped() {
+		data, err := body.Get("params")
+		if err != nil {
+			data = jsonutils.NewDict()
+		}
+		err = s.StartGuest(ctx, userCred, data.(*jsonutils.JSONDict))
+		if err != nil {
+			return nil, errors.Wrap(err, "StartGuest")
+		}
+		res := jsonutils.NewDict()
+		res.Set("vnc_port", jsonutils.NewInt(0))
+		return res, nil
+	} else {
+		vncPort := s.GetVncPort()
+		if vncPort > 0 {
+			res := jsonutils.NewDict()
+			res.Set("vnc_port", jsonutils.NewInt(int64(vncPort)))
+			res.Set("is_running", jsonutils.JSONTrue)
+			return res, nil
+		} else {
+			return nil, httperrors.NewBadRequestError("Seems started, but no VNC info")
+		}
+	}
+}
+
 func (s *SKVMGuestInstance) StartGuest(ctx context.Context, userCred mcclient.TokenCredential, params *jsonutils.JSONDict) error {
 	var err error
 	params, err = s.prepareEncryptKeyForStart(ctx, userCred, params)
@@ -1569,7 +1909,15 @@ func (s *SKVMGuestInstance) StartGuest(ctx context.Context, userCred mcclient.To
 	return nil
 }
 
+func (s *SKVMGuestInstance) HandleStop(ctx context.Context, timeout int64) error {
+	hostutils.DelayTaskWithoutReqctx(ctx, s.ExecStopTask, timeout)
+	return nil
+}
+
 func (s *SKVMGuestInstance) DeployFs(ctx context.Context, userCred mcclient.TokenCredential, deployInfo *deployapi.DeployInfo) (jsonutils.JSONObject, error) {
+	if len(s.Desc.Disks) == 0 {
+		return nil, fmt.Errorf("Guest dosen't have disk ??")
+	}
 	diskInfo := deployapi.DiskInfo{}
 	if s.isEncrypted() {
 		ekey, err := s.getEncryptKey(ctx, userCred)
@@ -1580,18 +1928,37 @@ func (s *SKVMGuestInstance) DeployFs(ctx context.Context, userCred mcclient.Toke
 		diskInfo.EncryptPassword = ekey.Key
 		diskInfo.EncryptAlg = string(ekey.Alg)
 	}
+	var sysDisk storageman.IDisk
 	disks := s.Desc.Disks
-	if len(disks) > 0 {
-		diskPath := disks[0].Path
+	for i := range disks {
+		diskPath := disks[i].Path
+		// GetDiskByPath will probe disks
 		disk, err := storageman.GetManager().GetDiskByPath(diskPath)
 		if err != nil {
 			return nil, errors.Wrapf(err, "GetDiskByPath(%s)", diskPath)
 		}
-		diskInfo.Path = disk.GetPath()
-		return disk.DeployGuestFs(&diskInfo, s.Desc, deployInfo)
-	} else {
-		return nil, fmt.Errorf("Guest dosen't have disk ??")
+		if i == 0 {
+			// sys disk
+			diskInfo.Path = disk.GetPath()
+			sysDisk = disk
+		}
 	}
+
+	ret, err := sysDisk.DeployGuestFs(&diskInfo, s.Desc, deployInfo)
+	for i := range disks {
+		diskPath := disks[i].Path
+		disk, e := storageman.GetManager().GetDiskByPath(diskPath)
+		if e != nil {
+			log.Errorf("failed get disk bypath %s %s", diskPath, e)
+		}
+		if utils.IsInStringArray(disk.GetType(), []string{api.STORAGE_SLVM, api.STORAGE_CLVM}) {
+			if errDeactive := lvmutils.LVDeactivate(diskPath); err != nil {
+				log.Errorf("failed deactive disk %s: %s", diskPath, errDeactive)
+			}
+		}
+	}
+
+	return ret, err
 }
 
 // Delay process
@@ -1606,12 +1973,20 @@ func (s *SKVMGuestInstance) CleanGuest(ctx context.Context, params interface{}) 
 	return nil, nil
 }
 
+func (s *SKVMGuestInstance) CleanDirtyGuest(ctx context.Context) error {
+	for s.IsRunning() {
+		s.ForceStop()
+		time.Sleep(time.Second * 1)
+	}
+	return s.Delete(ctx, false, true)
+}
+
 func (s *SKVMGuestInstance) StartDelete(ctx context.Context, migrated bool) error {
 	for s.IsRunning() {
 		s.ForceStop()
 		time.Sleep(time.Second * 1)
 	}
-	return s.Delete(ctx, migrated)
+	return s.Delete(ctx, migrated, false)
 }
 
 func (s *SKVMGuestInstance) ForceStop() bool {
@@ -1647,9 +2022,27 @@ func (s *SKVMGuestInstance) ExitCleanup(clear bool) {
 		s.Monitor.Disconnect()
 		s.Monitor = nil
 	}
+	s.LiveMigrateDestPort = nil
 }
 
 func (s *SKVMGuestInstance) CleanupCpuset() {
+	cgPath := path.Join(cgrouputils.RootTaskPath("cpuset"), s.GetCgroupName())
+	cgName := s.GetCgroupName()
+	cgFiles, err := ioutil.ReadDir(cgPath)
+	if err != nil {
+		log.Warningf("failed read dir %s: %s", cgPath, err)
+	}
+	for _, fi := range cgFiles {
+		if !fi.IsDir() {
+			continue
+		}
+		subCgName := path.Join(cgName, fi.Name())
+		task := cgrouputils.NewCGroupCPUSetTask(strconv.Itoa(s.GetPid()), subCgName, 0, "")
+		if !task.RemoveTask() {
+			log.Warningf("remove cpuset cgroup error: %s, pid: %d", s.Id, s.GetPid())
+		}
+	}
+
 	task := cgrouputils.NewCGroupCPUSetTask(strconv.Itoa(s.GetPid()), s.GetCgroupName(), 0, "")
 	if !task.RemoveTask() {
 		log.Warningf("remove cpuset cgroup error: %s, pid: %d", s.Id, s.GetPid())
@@ -1678,6 +2071,13 @@ func (s *SKVMGuestInstance) delTmpDisks(ctx context.Context, migrated bool) erro
 				}
 			}
 			if migrated {
+				if d != nil && utils.IsInStringArray(d.GetType(), []string{api.STORAGE_SLVM, api.STORAGE_CLVM}) {
+					if err := lvmutils.LVDeactivate(d.GetPath()); err != nil {
+						log.Errorf("lv %s deactive failed %s", d.GetPath(), err)
+						return err
+					}
+				}
+
 				// remove memory snapshot files
 				dir := GetMemorySnapshotPath(s.GetId(), "")
 				if err := procutils.NewRemoteCommandAsFarAsPossible("rm", "-rf", dir).Run(); err != nil {
@@ -1706,13 +2106,24 @@ func (s *SKVMGuestInstance) delFlatFiles(ctx context.Context) error {
 	return nil
 }
 
-func (s *SKVMGuestInstance) Delete(ctx context.Context, migrated bool) error {
+func (s *SKVMGuestInstance) Delete(ctx context.Context, migrated, recycle bool) error {
 	if err := s.delTmpDisks(ctx, migrated); err != nil {
 		return errors.Wrap(err, "delTmpDisks")
 	}
-	output, err := procutils.NewCommand("rm", "-rf", s.HomeDir()).Output()
-	if err != nil {
-		return errors.Wrapf(err, "rm %s failed: %s", s.HomeDir(), output)
+
+	if recycle {
+		if !fileutils2.Exists(s.RecycleDir()) {
+			output, err := procutils.NewCommand("mkdir", "-p", s.RecycleDir()).Output()
+			if err != nil {
+				return errors.Wrapf(err, "mkdir %s failed: %s", s.RecycleDir(), output)
+			}
+		}
+		output, err := procutils.NewCommand("mv", "-f", s.HomeDir(), s.RecycleDir()).Output()
+		if err != nil {
+			return errors.Wrapf(err, "mv %s to %s failed: %s", s.HomeDir(), s.RecycleDir(), output)
+		}
+	} else {
+		return DeleteHomeDir(s)
 	}
 	return nil
 }
@@ -1774,10 +2185,12 @@ func (s *SKVMGuestInstance) scriptStart(ctx context.Context) error {
 			log.Errorf("Guest %s check qemu(%d) process failed: %s", s.Id, pid, err)
 			return errors.Errorf(s.readQemuLogFileEnd(64))
 		}
-		if err = s.StartMonitor(ctx, nil); err == nil {
+		if err = s.StartMonitor(ctx, nil, true); err == nil {
 			return nil
+		} else {
+			log.Warningf("Guest %s waiting monitor connect", s.GetName())
 		}
-		time.Sleep(time.Millisecond * 10)
+		time.Sleep(time.Millisecond * 100)
 	}
 }
 
@@ -1810,22 +2223,6 @@ func (s *SKVMGuestInstance) ExecStopTask(ctx context.Context, params interface{}
 
 func (s *SKVMGuestInstance) ExecSuspendTask(ctx context.Context) {
 	NewGuestSuspendTask(s, ctx, nil).Start()
-}
-
-func (s *SKVMGuestInstance) GetNicDescMatch(mac, ip, port, bridge string) *desc.SGuestNetwork {
-	nics := s.Desc.Nics
-	for _, nic := range nics {
-		if bridge == "" && nic.Bridge != "" && nic.Bridge == options.HostOptions.OvnIntegrationBridge {
-			continue
-		}
-		if (len(mac) == 0 || netutils2.MacEqual(nic.Mac, mac)) &&
-			(len(ip) == 0 || nic.Ip == ip) &&
-			(len(port) == 0 || nic.Ifname == port) &&
-			(len(bridge) == 0 || nic.Bridge == bridge) {
-			return nic
-		}
-	}
-	return nil
 }
 
 func pathEqual(disk, ndisk *desc.SGuestDisk) bool {
@@ -1963,7 +2360,7 @@ func (s *SKVMGuestInstance) compareDescNetworks(newDesc *desc.SGuestDesc,
 		return net.Driver == "virtio" || net.Driver == "vfio-pci"
 	}
 	var isChangeNetworkValid = func(net *desc.SGuestNetwork) bool {
-		return net.Driver == "virtio"
+		return net.Driver == "virtio" || net.Driver == "vfio-pci"
 	}
 
 	var findNet = func(nets []*desc.SGuestNetwork, net *desc.SGuestNetwork) int {
@@ -2020,9 +2417,18 @@ func getNicBridge(nic *desc.SGuestNetwork) string {
 	}
 }
 
-func onNicChange(oldNic, newNic *desc.SGuestNetwork) error {
+func (s *SKVMGuestInstance) onNicChange(oldNic, newNic *desc.SGuestNetwork) error {
+	log.Infof("nic changed old: %s new: %s", jsonutils.Marshal(oldNic), jsonutils.Marshal(newNic))
 	// override network base desc
 	oldNic.GuestnetworkBaseDesc = newNic.GuestnetworkBaseDesc
+
+	if oldNic.Driver == "vfio-pci" {
+		err := s.reconfigureVfioNicsBandwidth(oldNic)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
 
 	oldbr := getNicBridge(oldNic)
 	oldifname := oldNic.Ifname
@@ -2083,7 +2489,7 @@ func (s *SKVMGuestInstance) SyncConfig(
 	var cdroms []*desc.SGuestCdrom
 	var floppys []*desc.SGuestFloppy
 
-	if err := s.SaveSourceDesc(guestDesc); err != nil {
+	if err := SaveDesc(s, guestDesc); err != nil {
 		return nil, err
 	}
 
@@ -2098,7 +2504,7 @@ func (s *SKVMGuestInstance) SyncConfig(
 	if len(changedNetworks) > 0 && s.IsRunning() {
 		// process changed networks
 		for i := range changedNetworks {
-			err := onNicChange(changedNetworks[i][0], changedNetworks[i][1])
+			err := s.onNicChange(changedNetworks[i][0], changedNetworks[i][1])
 			if err != nil {
 				return nil, errors.Wrap(err, "onNicChange")
 			}
@@ -2111,12 +2517,9 @@ func (s *SKVMGuestInstance) SyncConfig(
 
 	// update guest live desc, don't be here update cpu and mem
 	// cpu and memory should update from SGuestHotplugCpuMemTask
-	s.Desc.SGuestControlDesc = guestDesc.SGuestControlDesc
-	s.Desc.SGuestProjectDesc = guestDesc.SGuestProjectDesc
-	s.Desc.SGuestRegionDesc = guestDesc.SGuestRegionDesc
-	s.Desc.SGuestMetaDesc = guestDesc.SGuestMetaDesc
+	s.UpdateLiveDesc(guestDesc)
 
-	s.SaveLiveDesc(s.Desc)
+	SaveLiveDesc(s, s.Desc)
 
 	if fwOnly {
 		res := jsonutils.NewDict()
@@ -2147,7 +2550,7 @@ func (s *SKVMGuestInstance) SyncConfig(
 
 	lenTasks := len(tasks)
 	var callBack = func(errs []error) {
-		s.SaveLiveDesc(s.Desc)
+		SaveLiveDesc(s, s.Desc)
 		if lenTasks > 0 { // devices updated, regenerate start script
 			vncPort := s.GetVncPort()
 			data := jsonutils.NewDict()
@@ -2199,18 +2602,16 @@ func (s *SKVMGuestInstance) GetCgroupName() string {
 		return ""
 	}
 
-	if val, _ := s.Desc.Metadata["__enable_cgroup_cpuset"]; val == "true" {
-		return fmt.Sprintf("%s/server_%s_%d", hostconsts.HOST_CGROUP, s.Id, s.cgroupPid)
-	}
-
-	return ""
+	return fmt.Sprintf("%s/server_%s_%d", hostconsts.HOST_CGROUP, s.Id, s.cgroupPid)
 }
 
 func (s *SKVMGuestInstance) GuestPrelaunchSetCgroup() {
 	s.cgroupPid = s.GetPid()
 	s.setCgroupIo()
 	s.setCgroupCpu()
-	s.setCgroupCPUSet()
+	if err := s.setCgroupCPUSet(); err != nil {
+		log.Errorf("Guest %s failed set cgroup cpuset: %s", s.GetName(), err)
+	}
 }
 
 func (s *SKVMGuestInstance) setCgroupPid() {
@@ -2245,54 +2646,164 @@ func (s *SKVMGuestInstance) setCgroupCpu() {
 	cgrouputils.CgroupSet(strconv.Itoa(s.cgroupPid), s.GetCgroupName(), int(cpu)*cpuWeight)
 }
 
-func (s *SKVMGuestInstance) setCgroupCPUSet() {
-	var cpus []int
-	if cpuset, ok := s.Desc.Metadata[api.VM_METADATA_CGROUP_CPUSET]; ok {
-		cpusetJson, err := jsonutils.ParseString(cpuset)
+func (s *SKVMGuestInstance) setCgroupCPUSet() error {
+	if !s.IsRunning() {
+		return nil
+	}
+	cgName := s.GetCgroupName()
+	if cgName == "" {
+		return errors.Errorf("failed get cgroup name")
+	}
+
+	var cpusetStr string
+	if len(s.Desc.CpuNumaPin) == 0 {
+		cpus := []string{}
+		for _, vcpuPin := range s.Desc.VcpuPin {
+			cpus = append(cpus, vcpuPin.Pcpus)
+		}
+		cpusetStr = strings.Join(cpus, ",")
+	} else {
+		pcpuSetBuilder := cpuset.NewBuilder()
+		for i := range s.Desc.CpuNumaPin {
+			for j := range s.Desc.CpuNumaPin[i].VcpuPin {
+				pcpuSetBuilder.Add(s.Desc.CpuNumaPin[i].VcpuPin[j].Pcpu)
+			}
+		}
+		cpusetStr = pcpuSetBuilder.Result().String()
+	}
+
+	guestPid := strconv.Itoa(s.GetPid())
+	// guest root cpuset group
+	task := cgrouputils.NewCGroupCPUSetTask(guestPid, cgName, 0, cpusetStr)
+	if !task.SetTask() {
+		return errors.Errorf("Cgroup cpuset task failed")
+	}
+
+	vcpuThreads, err := s.getVcpuThreadIdMap(s.GetPid())
+	if err != nil {
+		return err
+	}
+
+	if len(s.Desc.CpuNumaPin) > 0 {
+		for i := range s.Desc.CpuNumaPin {
+			if s.Desc.CpuNumaPin[i].Unregular || s.Desc.CpuNumaPin[i].VcpuPin == nil {
+				continue
+			}
+
+			for j := range s.Desc.CpuNumaPin[i].VcpuPin {
+				vcpuThreadId, ok := vcpuThreads[s.Desc.CpuNumaPin[i].VcpuPin[j].Vcpu]
+				if !ok {
+					return errors.Errorf("failed get vcpu %d thread id from %v", s.Desc.CpuNumaPin[i].VcpuPin[j].Vcpu, vcpuThreads)
+				}
+				pcpu := s.Desc.CpuNumaPin[i].VcpuPin[j].Pcpu
+				vcpuCgname := path.Join(cgName, vcpuThreadId)
+				taskVcpu := cgrouputils.NewCGroupSubCPUSetTask(guestPid, vcpuCgname, 0, strconv.Itoa(pcpu), []string{vcpuThreadId})
+				if !taskVcpu.SetTask() {
+					return errors.Errorf("Vcpu set cgroup cpuset task failed")
+				}
+			}
+		}
+	} else if len(s.Desc.VcpuPin) > 1 {
+		// for guest manual set cpuset
+		for i := range s.Desc.VcpuPin {
+			vcpu, err := strconv.Atoi(s.Desc.VcpuPin[i].Vcpus)
+			if err != nil {
+				return errors.Wrapf(err, "failed parse vcpupin %s", s.Desc.VcpuPin[i].Vcpus)
+			}
+			vcpuThreadId, ok := vcpuThreads[vcpu]
+			if !ok {
+				return errors.Errorf("failed get vcpu %s thread id from %v", s.Desc.VcpuPin[i].Vcpus, vcpuThreads)
+			}
+			pcpu := s.Desc.VcpuPin[i].Pcpus
+			vcpuCgname := path.Join(cgName, vcpuThreadId)
+			taskVcpu := cgrouputils.NewCGroupSubCPUSetTask(guestPid, vcpuCgname, 0, pcpu, []string{vcpuThreadId})
+			if !taskVcpu.SetTask() {
+				return errors.Errorf("Vcpu set cgroup cpuset task failed")
+			}
+		}
+	}
+
+	return nil
+}
+
+func (s *SKVMGuestInstance) allocGuestNumaCpuset() error {
+	var cpus = make([]int, 0)
+	var cpuNumaPin = make([]*desc.SCpuNumaPin, 0)
+	var preferNumaNodes = make([]int8, 0)
+	for i := range s.Desc.IsolatedDevices {
+		if s.Desc.IsolatedDevices[i].NumaNode >= 0 {
+			preferNumaNodes = append(preferNumaNodes, s.Desc.IsolatedDevices[i].NumaNode)
+			break
+		}
+	}
+
+	if scpuset, ok := s.Desc.Metadata[api.VM_METADATA_CGROUP_CPUSET]; ok {
+		cpusetJson, err := jsonutils.ParseString(scpuset)
 		if err != nil {
-			log.Errorf("failed parse server %s cpuset %s: %s", s.Id, cpuset, err)
-			return
+			log.Errorf("failed parse server %s cpuset %s: %s", s.Id, scpuset, err)
+			return errors.Errorf("failed parse server %s cpuset %s: %s", s.Id, scpuset, err)
 		}
 		input := new(api.ServerCPUSetInput)
 		err = cpusetJson.Unmarshal(input)
 		if err != nil {
 			log.Errorf("failed unmarshal server %s cpuset %s", s.Id, err)
-			return
+			return errors.Errorf("failed unmarshal server %s cpuset %s", s.Id, err)
 		}
 		cpus = input.CPUS
-	} else {
-		cpus = s.allocGuestCpuset()
+		if len(cpus) == int(s.Desc.Cpu) {
+			s.Desc.VcpuPin = make([]desc.SCpuPin, len(cpus))
+			for i := 0; i < int(s.Desc.Cpu); i++ {
+				s.Desc.VcpuPin[i] = desc.SCpuPin{
+					Vcpus: strconv.Itoa(i),
+					Pcpus: strconv.Itoa(cpus[i]),
+				}
+			}
+		} else {
+			s.Desc.VcpuPin = []desc.SCpuPin{
+				{
+					Vcpus: fmt.Sprintf("0-%d", s.Desc.Cpu-1),
+					Pcpus: cpuset.NewCPUSet(cpus...).String(),
+				},
+			}
+		}
+		return nil
 	}
-	if _, err := s.CPUSet(context.Background(), cpus); err != nil {
-		log.Errorf("Do CPUSet error: %v", err)
-		return
-	}
-	s.Desc.VcpuPin = []desc.CpuPin{
-		{
-			Vcpus: fmt.Sprintf("0-%d", s.Desc.Cpu-1),
-			Pcpus: cpuset.NewCPUSet(cpus...).String(),
-		},
-	}
-	s.SaveLiveDesc(s.Desc)
-}
 
-func (s *SKVMGuestInstance) allocGuestCpuset() []int {
-	var cpuset = []int{}
-	numaCpus := s.manager.cpuSet.AllocCpuset(int(s.Desc.Cpu))
-	for _, cpus := range numaCpus {
-		cpuset = append(cpuset, cpus...)
+	nodeNumaCpus, err := s.manager.cpuSet.AllocCpuset(int(s.Desc.Cpu), s.Desc.Mem*1024, preferNumaNodes, s.GetId())
+	if err != nil {
+		return err
 	}
-	return cpuset
-}
+	log.Infof("alloc numa cpus %v", nodeNumaCpus)
+	for nodeId, numaCpus := range nodeNumaCpus {
+		if s.manager.numaAllocate {
+			unodeId := uint16(nodeId)
+			vcpuPin := make([]desc.SVCpuPin, len(numaCpus.Cpuset))
+			for i := range numaCpus.Cpuset {
+				vcpuPin[i].Pcpu = numaCpus.Cpuset[i]
+			}
 
-func (s *SKVMGuestInstance) CreateFromDesc(desc *desc.SGuestDesc) error {
-	if err := s.PrepareDir(); err != nil {
-		return fmt.Errorf("Failed to create server dir %s", desc.Uuid)
+			memPin := &desc.SCpuNumaPin{
+				SizeMB:    numaCpus.MemSizeKB / 1024, // MB
+				NodeId:    &unodeId,
+				VcpuPin:   vcpuPin,
+				Unregular: numaCpus.Unregular,
+			}
+			cpuNumaPin = append(cpuNumaPin, memPin)
+		}
+
+		cpus = append(cpus, numaCpus.Cpuset...)
 	}
-	if err := s.SaveSourceDesc(desc); err != nil {
-		return fmt.Errorf("Failed save source desc %s", err)
+	if len(cpuNumaPin) > 0 {
+		s.Desc.CpuNumaPin = cpuNumaPin
+	} else if !s.manager.numaAllocate {
+		s.Desc.VcpuPin = []desc.SCpuPin{
+			{
+				Vcpus: fmt.Sprintf("0-%d", s.Desc.Cpu-1),
+				Pcpus: cpuset.NewCPUSet(cpus...).String(),
+			},
+		}
 	}
-	return s.SaveLiveDesc(desc)
+	return nil
 }
 
 func (s *SKVMGuestInstance) GetNeedMergeBackingFileDiskIndexs() []int {
@@ -2318,7 +2829,7 @@ func (s *SKVMGuestInstance) streamDisksComplete(ctx context.Context) {
 			s.needSyncStreamDisks = true
 		}
 	}
-	if err := s.SaveLiveDesc(s.Desc); err != nil {
+	if err := SaveLiveDesc(s, s.Desc); err != nil {
 		log.Errorf("save guest desc failed %s", err)
 	}
 	if err := s.delFlatFiles(ctx); err != nil {
@@ -2341,9 +2852,11 @@ func (s *SKVMGuestInstance) sendStreamDisksComplete(ctx context.Context) {
 	}
 
 	s.needSyncStreamDisks = false
-	if err := s.SaveLiveDesc(s.Desc); err != nil {
+	if err := SaveLiveDesc(s, s.Desc); err != nil {
 		log.Errorf("save guest desc failed %s", err)
 	}
+
+	s.SyncStatus("")
 }
 
 func (s *SKVMGuestInstance) GetQemuVersionStr() string {
@@ -2359,10 +2872,10 @@ func (s *SKVMGuestInstance) optimizeOom() error {
 }
 
 func (s *SKVMGuestInstance) SyncMetadata(meta *jsonutils.JSONDict) error {
-	metaMap, _ := meta.GetMap()
-	for k, v := range metaMap {
-		s.Desc.Metadata[k] = v.String()
+	if s.Desc.Metadata == nil {
+		s.Desc.Metadata = make(map[string]string)
 	}
+	meta.Unmarshal(&s.Desc.Metadata)
 	_, err := modules.Servers.SetMetadata(hostutils.GetComputeSession(context.Background()),
 		s.Id, meta)
 	if err != nil {
@@ -2375,7 +2888,7 @@ func (s *SKVMGuestInstance) SyncMetadata(meta *jsonutils.JSONDict) error {
 func (s *SKVMGuestInstance) updateChildIndex() error {
 	idx := s.getQuorumChildIndex() + 1
 	s.Desc.Metadata[api.QUORUM_CHILD_INDEX] = strconv.Itoa(int(idx))
-	s.SaveLiveDesc(s.Desc)
+	SaveLiveDesc(s, s.Desc)
 	meta := jsonutils.NewDict()
 	meta.Set(api.QUORUM_CHILD_INDEX, jsonutils.NewInt(idx))
 	return s.SyncMetadata(meta)
@@ -2398,8 +2911,8 @@ func (s *SKVMGuestInstance) OnResumeSyncMetadataInfo() {
 	meta.Set("__qemu_version", jsonutils.NewString(s.GetQemuVersionStr()))
 	meta.Set("__vnc_port", jsonutils.NewInt(int64(s.GetVncPort())))
 	meta.Set("__enable_cgroup_cpuset", jsonutils.JSONTrue)
-	meta.Set("hotplug_cpu_mem", jsonutils.NewString("enable"))
-	meta.Set("hot_remove_nic", jsonutils.NewString("enable"))
+	meta.Set(api.VM_METADATA_HOTPLUG_CPU_MEM, jsonutils.NewString("enable"))
+	meta.Set(api.VM_METADATA_HOT_REMOVE_NIC, jsonutils.NewString("enable"))
 	if len(s.VncPassword) > 0 {
 		meta.Set("__vnc_password", jsonutils.NewString(s.VncPassword))
 	}
@@ -2436,28 +2949,74 @@ func (s *SKVMGuestInstance) SyncQemuCmdline(cmdline string) {
 func (s *SKVMGuestInstance) doBlockIoThrottle() {
 	disks := s.Desc.Disks
 	if len(disks) > 0 {
-		bps := disks[0].Bps
-		iops := disks[0].Iops
-		if bps > 0 || iops > 0 {
-			s.BlockIoThrottle(context.Background(), int64(bps), int64(iops))
-		}
+		s.BlockIoThrottle(context.Background())
 	}
 }
 
-func (s *SKVMGuestInstance) onGuestPrelaunch() error {
-	s.LiveMigrateDestPort = nil
-	if options.HostOptions.SetVncPassword {
-		s.SetVncPassword()
-	}
-	if s.isMemcleanEnabled() {
-		if err := s.startMemCleaner(); err != nil {
+func (s *SKVMGuestInstance) startHotPlugVcpus(vcpuSet []int) error {
+	var c = make(chan error)
+
+	for i := range vcpuSet {
+		if vcpuSet[i] == 0 {
+			// skip vcpu 0, added on qemu cmdline -smp 1
+			continue
+		}
+
+		s.Monitor.AddCpu(vcpuSet[i], func(res string) {
+			var e error = nil
+			if len(res) > 0 {
+				e = errors.Errorf("failed add cpu %d: %s", vcpuSet[i], res)
+			}
+			c <- e
+		})
+		if err, _ := <-c; err != nil {
 			return err
 		}
 	}
-	s.OnResumeSyncMetadataInfo()
+	return nil
+}
+
+func (s *SKVMGuestInstance) hotPlugCpus() error {
+	var vcpuSet = make([]int, 0)
+	if len(s.Desc.MemDesc.Mem.Mems) > 0 {
+		for i := range s.Desc.CpuNumaPin {
+			for j := range s.Desc.CpuNumaPin[i].VcpuPin {
+				vcpuSet = append(vcpuSet, s.Desc.CpuNumaPin[i].VcpuPin[j].Vcpu)
+			}
+		}
+	}
+	return s.startHotPlugVcpus(vcpuSet)
+}
+
+func (s *SKVMGuestInstance) onGuestPrelaunch() error {
+	if s.LiveMigrateDestPort == nil && !s.Desc.IsSlave {
+		if err := s.setupGuest(); err != nil {
+			return err
+		}
+	}
+
+	if !s.Desc.IsSlave {
+		if options.HostOptions.SetVncPassword {
+			s.SetVncPassword()
+		}
+		if s.isMemcleanEnabled() {
+			if err := s.startMemCleaner(); err != nil {
+				return err
+			}
+		}
+		s.OnResumeSyncMetadataInfo()
+		s.doBlockIoThrottle()
+	}
+	s.LiveMigrateDestPort = nil
+	return nil
+}
+
+func (s *SKVMGuestInstance) setupGuest() error {
+	if err := s.hotPlugCpus(); err != nil {
+		return err
+	}
 	s.GuestPrelaunchSetCgroup()
 	s.optimizeOom()
-	s.doBlockIoThrottle()
 	return nil
 }
 
@@ -2474,7 +3033,7 @@ func (s *SKVMGuestInstance) CleanImportMetadata() *jsonutils.JSONDict {
 
 	if meta.Length() > 0 {
 		// update local metadata record, after monitor started updata region record
-		s.SaveLiveDesc(s.Desc)
+		SaveLiveDesc(s, s.Desc)
 		return meta
 	}
 	return nil
@@ -2518,9 +3077,9 @@ func (s *SKVMGuestInstance) GetFuseTmpPath() string {
 	return path.Join(s.HomeDir(), "tmp")
 }
 
-func (s *SKVMGuestInstance) StreamDisks(ctx context.Context, callback func(), disksIdx []int) {
+func (s *SKVMGuestInstance) StreamDisks(ctx context.Context, callback func(), disksIdx []int, totalCnt, completedCnt int) {
 	log.Infof("Start guest block stream task %s ...", s.GetName())
-	task := NewGuestStreamDisksTask(ctx, s, callback, disksIdx)
+	task := NewGuestStreamDisksTask(ctx, s, callback, disksIdx, totalCnt, completedCnt)
 	task.Start()
 }
 
@@ -2545,6 +3104,10 @@ func (s *SKVMGuestInstance) ExecReloadDiskTask(ctx context.Context, disk storage
 		res.Set("reopen", jsonutils.JSONTrue)
 		return res, nil
 	}
+}
+
+func (s *SKVMGuestInstance) DoSnapshot(ctx context.Context, snapshotParams *SDiskSnapshot) (jsonutils.JSONObject, error) {
+	return s.ExecDiskSnapshotTask(ctx, snapshotParams.UserCred, snapshotParams.Disk, snapshotParams.SnapshotId)
 }
 
 func (s *SKVMGuestInstance) ExecDiskSnapshotTask(
@@ -2594,30 +3157,40 @@ func (s *SKVMGuestInstance) StaticSaveSnapshot(
 	return res, nil
 }
 
+func (s *SKVMGuestInstance) DeleteSnapshot(ctx context.Context, delParams *SDeleteDiskSnapshot) (jsonutils.JSONObject, error) {
+	if len(delParams.ConvertSnapshot) > 0 || delParams.BlockStream {
+		return s.ExecDeleteSnapshotTask(ctx, delParams.Disk, delParams.DeleteSnapshot,
+			delParams.ConvertSnapshot, delParams.BlockStream, delParams.EncryptInfo,
+			delParams.TotalDeleteSnapshotCount, delParams.DeletedSnapshotCount)
+	} else {
+		res := jsonutils.NewDict()
+		res.Set("deleted", jsonutils.JSONTrue)
+		return res, delParams.Disk.DeleteSnapshot(delParams.DeleteSnapshot, "", false, delParams.EncryptInfo)
+	}
+}
+
 func (s *SKVMGuestInstance) ExecDeleteSnapshotTask(
 	ctx context.Context, disk storageman.IDisk,
-	deleteSnapshot string, convertSnapshot string, pendingDelete bool,
+	deleteSnapshot string, convertSnapshot string, blockStream bool, encryptInfo apis.SEncryptInfo,
+	totalDeleteSnapshotCount, deletedSnapshotCount int,
 ) (jsonutils.JSONObject, error) {
 	if s.IsRunning() {
 		if s.isLiveSnapshotEnabled() {
-			task := NewGuestSnapshotDeleteTask(ctx, s, disk,
-				deleteSnapshot, convertSnapshot, pendingDelete)
-			task.Start()
+			task := NewGuestSnapshotDeleteTask(ctx, s, disk, deleteSnapshot, convertSnapshot, blockStream, encryptInfo)
+			task.Start(totalDeleteSnapshotCount, deletedSnapshotCount)
 			return nil, nil
 		} else {
 			return nil, fmt.Errorf("Guest dosen't support live snapshot delete")
 		}
 	} else {
-		return s.deleteStaticSnapshotFile(ctx, disk, deleteSnapshot,
-			convertSnapshot, pendingDelete)
+		return s.deleteStaticSnapshotFile(ctx, disk, deleteSnapshot, convertSnapshot, blockStream, encryptInfo)
 	}
 }
 
 func (s *SKVMGuestInstance) deleteStaticSnapshotFile(
-	ctx context.Context, disk storageman.IDisk,
-	deleteSnapshot string, convertSnapshot string, pendingDelete bool,
+	ctx context.Context, disk storageman.IDisk, deleteSnapshot, convertSnapshot string, blockStream bool, encryptInfo apis.SEncryptInfo,
 ) (jsonutils.JSONObject, error) {
-	if err := disk.DeleteSnapshot(deleteSnapshot, convertSnapshot, pendingDelete); err != nil {
+	if err := disk.DeleteSnapshot(deleteSnapshot, convertSnapshot, blockStream, encryptInfo); err != nil {
 		log.Errorln(err)
 		return nil, err
 	}
@@ -2704,7 +3277,7 @@ func (s *SKVMGuestInstance) ExecMemorySnapshotResetTask(ctx context.Context, inp
 	return nil, nil
 }
 
-func (s *SKVMGuestInstance) PrepareDisksMigrate(liveMigrage bool) (*jsonutils.JSONDict, *jsonutils.JSONDict, bool, error) {
+func (s *SKVMGuestInstance) PrepareDisksMigrate(liveMigrate bool) (*jsonutils.JSONDict, *jsonutils.JSONDict, bool, error) {
 	disksBackFile := jsonutils.NewDict()
 	diskSnapsChain := jsonutils.NewDict()
 	sysDiskHasTemplate := false
@@ -2714,8 +3287,8 @@ func (s *SKVMGuestInstance) PrepareDisksMigrate(liveMigrage bool) (*jsonutils.JS
 			if err != nil {
 				return nil, nil, false, errors.Wrapf(err, "GetDiskByPath(%s)", disk.Path)
 			}
-			if d.GetType() == api.STORAGE_LOCAL {
-				snaps, back, hasTemplate, err := d.PrepareMigrate(liveMigrage)
+			if d.GetType() == api.STORAGE_LOCAL || d.GetType() == api.STORAGE_LVM {
+				snaps, back, hasTemplate, err := d.PrepareMigrate(liveMigrate)
 				if err != nil {
 					return nil, nil, false, err
 				}
@@ -2727,6 +3300,12 @@ func (s *SKVMGuestInstance) PrepareDisksMigrate(liveMigrage bool) (*jsonutils.JS
 				}
 				if hasTemplate {
 					sysDiskHasTemplate = hasTemplate
+				}
+			} else if d.GetType() == api.STORAGE_SLVM {
+				if d.GetStorage().Lvmlockd() {
+					if err := lvmutils.LVActive(d.GetPath(), d.GetStorage().Lvmlockd(), false); err != nil {
+						return nil, nil, false, errors.Wrap(err, "lvm active with share")
+					}
 				}
 			}
 		}
@@ -2748,14 +3327,14 @@ func (s *SKVMGuestInstance) prepareNicsForVolatileGuestResume() error {
 	return nil
 }
 
-func (s *SKVMGuestInstance) onlineResizeDisk(ctx context.Context, diskId string, sizeMB int64) {
-	task := NewGuestOnlineResizeDiskTask(ctx, s, diskId, sizeMB)
+func (s *SKVMGuestInstance) OnlineResizeDisk(ctx context.Context, disk storageman.IDisk, sizeMB int64) {
+	task := NewGuestOnlineResizeDiskTask(ctx, s, disk, sizeMB)
 	task.Start()
 }
 
-func (s *SKVMGuestInstance) BlockIoThrottle(ctx context.Context, bps, iops int64) error {
-	task := SGuestBlockIoThrottleTask{s, ctx, bps, iops}
-	return task.Start()
+func (s *SKVMGuestInstance) BlockIoThrottle(ctx context.Context) {
+	task := SGuestBlockIoThrottleTask{s, ctx}
+	task.Start()
 }
 
 func (s *SKVMGuestInstance) IsSharedStorage() bool {
@@ -2774,6 +3353,7 @@ func (s *SKVMGuestInstance) IsSharedStorage() bool {
 }
 
 func (s *SKVMGuestInstance) generateDiskSetupScripts(disks []*desc.SGuestDisk) (string, error) {
+	slvmImages := map[string]string{}
 	cmd := " "
 	for i := range disks {
 		diskPath := disks[i].Path
@@ -2781,16 +3361,25 @@ func (s *SKVMGuestInstance) generateDiskSetupScripts(disks []*desc.SGuestDisk) (
 		if err != nil {
 			return "", errors.Wrapf(err, "GetDiskByPath(%s)", diskPath)
 		}
+		if d.GetType() == api.STORAGE_SLVM && disks[i].TemplateId != "" {
+			slvmImages[disks[i].StorageId] = disks[i].TemplateId
+		}
 		if len(disks[i].StorageType) == 0 {
 			disks[i].StorageType = d.GetType()
 		}
 		diskIndex := disks[i].Index
 		cmd += d.GetDiskSetupScripts(int(diskIndex))
 	}
+
+	for storageId, imageId := range slvmImages {
+		storage := storageman.GetManager().GetStorage(storageId)
+		imageCacheManager := storageman.GetManager().GetStoragecacheById(storage.GetStoragecacheId())
+		imageCacheManager.LoadImageCache(imageId)
+	}
 	return cmd, nil
 }
 
-func (s *SKVMGuestInstance) GetSriovDeviceByNetworkIndex(networkIndex int8) (isolated_device.IDevice, error) {
+func (s *SKVMGuestInstance) GetSriovDeviceByNetworkIndex(networkIndex int) (isolated_device.IDevice, error) {
 	manager := s.manager.GetHost().GetIsolatedDeviceManager()
 	for i := 0; i < len(s.Desc.IsolatedDevices); i++ {
 		if s.Desc.IsolatedDevices[i].DevType == api.NIC_TYPE &&
@@ -2826,22 +3415,19 @@ func getVfVlan(vlan int) int {
 	return vlan
 }
 
-func (s *SKVMGuestInstance) sriovNicAttachInitScript(networkIndex int8, dev isolated_device.IDevice) (string, error) {
+func getIbNodeMac(mac string) string {
+	return "00:01:" + mac
+}
+
+func getIbPortMac(mac string) string {
+	return "00:10:" + mac
+}
+
+func (s *SKVMGuestInstance) sriovNicAttachInitScript(networkIndex int, dev isolated_device.IDevice) (string, error) {
 	for i := range s.Desc.Nics {
 		if s.Desc.Nics[i].Driver == "vfio-pci" && s.Desc.Nics[i].Index == networkIndex {
-			if dev.GetOvsOffloadInterfaceName() != "" {
-				cmd := fmt.Sprintf("ip link set dev %s vf %d mac %s\n",
-					dev.GetPfName(), dev.GetVirtfn(), s.Desc.Nics[i].Mac)
-				cmd += s.getNicUpScriptPath(s.Desc.Nics[i]) + "\n"
-				return cmd, nil
-			} else {
-				cmd := fmt.Sprintf(
-					"sriov_vf_init %s %d %s %d %s %d\n",
-					dev.GetPfName(), dev.GetVirtfn(), s.Desc.Nics[i].Mac,
-					getVfVlan(s.Desc.Nics[i].Vlan), srcMacCheckFunc(s.Desc.SrcMacCheck), s.Desc.Nics[i].Bw,
-				)
-				return sriovInitFunc + " && " + cmd, nil
-			}
+			cmd := s.generateSriovInitCmd(i, dev)
+			return sriovInitFunc + " && " + cmd, nil
 		}
 	}
 	return "", errors.Errorf("no nic found for index %d", networkIndex)
@@ -2856,24 +3442,49 @@ func (s *SKVMGuestInstance) generateSRIOVInitScripts() (string, error) {
 			if err != nil {
 				return "", err
 			}
-			if dev.GetOvsOffloadInterfaceName() != "" {
-				cmd += fmt.Sprintf("ip link set dev %s vf %d mac %s\n",
-					dev.GetPfName(), dev.GetVirtfn(), s.Desc.Nics[i].Mac)
-				cmd += s.getNicUpScriptPath(s.Desc.Nics[i]) + "\n"
-			} else {
-				cmd += fmt.Sprintf(
-					"sriov_vf_init %s %d %s %d %s %d\n",
-					dev.GetPfName(), dev.GetVirtfn(), s.Desc.Nics[i].Mac,
-					getVfVlan(s.Desc.Nics[i].Vlan), srcMacCheckFunc(s.Desc.SrcMacCheck), s.Desc.Nics[i].Bw,
-				)
-			}
+			cmd += s.generateSriovInitCmd(i, dev)
 		}
 	}
 	if len(cmd) > 0 {
 		cmd = sriovInitFunc + "\n" + cmd
 	}
-
 	return cmd, nil
+}
+
+func (s *SKVMGuestInstance) generateSriovInitCmd(i int, dev isolated_device.IDevice) string {
+	var cmd = ""
+	if dev.GetOvsOffloadInterfaceName() != "" {
+		cmd += fmt.Sprintf("ip link set dev %s vf %d mac %s max_tx_rate %d\n",
+			dev.GetPfName(), dev.GetVirtfn(), s.Desc.Nics[i].Mac, s.Desc.Nics[i].Bw)
+		cmd += s.getNicUpScriptPath(s.Desc.Nics[i]) + "\n"
+	} else if dev.IsInfinibandNic() {
+		sriovPath := path.Join("/sys/class/net", dev.GetPfName(), "device/sriov", strconv.Itoa(dev.GetVirtfn()))
+		cmd = fmt.Sprintf("echo Follow > %s/policy\n", sriovPath)
+		cmd += fmt.Sprintf("echo %s > %s/node\n", getIbNodeMac(s.Desc.Nics[i].Mac), sriovPath)
+		cmd += fmt.Sprintf("echo %s > %s/port\n", getIbPortMac(s.Desc.Nics[i].Mac), sriovPath)
+	} else {
+		cmd += fmt.Sprintf(
+			"sriov_vf_init %s %d %s %d %s %d\n",
+			dev.GetPfName(), dev.GetVirtfn(), s.Desc.Nics[i].Mac,
+			getVfVlan(s.Desc.Nics[i].Vlan), srcMacCheckFunc(s.Desc.SrcMacCheck), s.Desc.Nics[i].Bw,
+		)
+	}
+	return cmd
+}
+
+func (s *SKVMGuestInstance) reconfigureVfioNicsBandwidth(nicDesc *desc.SGuestNetwork) error {
+	if nicDesc.Driver == "vfio-pci" {
+		dev, err := s.GetSriovDeviceByNetworkIndex(nicDesc.Index)
+		if err != nil {
+			return errors.Wrap(err, "reconfigureVfioNicsBandwidth")
+		}
+		out, err := procutils.NewRemoteCommandAsFarAsPossible("ip", "link", "set", "dev", dev.GetPfName(),
+			"vf", strconv.Itoa(dev.GetVirtfn()), "max_tx_rate", strconv.Itoa(nicDesc.Bw)).Output()
+		if err != nil {
+			return errors.Wrapf(err, "reconfigureVfioNicsBandwidth set max_tx_rate %s", out)
+		}
+	}
+	return nil
 }
 
 func (s *SKVMGuestInstance) getQemuCmdline() (string, error) {
@@ -2916,9 +3527,45 @@ func (s *SKVMGuestInstance) CPUSet(ctx context.Context, input []int) (*api.Serve
 	return new(api.ServerCPUSetResp), nil
 }
 
+func (s *SKVMGuestInstance) getVcpuThreadIdMap(guestPid int) (map[int]string, error) {
+	tasksDir := fmt.Sprintf("/proc/%d/task", guestPid)
+	taskFiles, err := ioutil.ReadDir(tasksDir)
+	if err != nil {
+		return nil, errors.Wrapf(err, "read dir %s", tasksDir)
+	}
+
+	var vcpuThreads = map[int]string{}
+	for i := range taskFiles {
+		if !taskFiles[i].IsDir() {
+			log.Warningf("task %s/%s is not dir?", tasksDir, taskFiles[i].Name())
+			continue
+		}
+		_, err := strconv.Atoi(taskFiles[i].Name())
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed parse thread id %s", taskFiles[i].Name())
+		}
+
+		// vcpu thread comm eg: CPU 0/KVM
+		taskComm := path.Join(tasksDir, taskFiles[i].Name(), "comm")
+		if cmd, err := fileutils2.FileGetContents(taskComm); err != nil {
+			return nil, errors.Wrapf(err, "failed get task %s command", taskComm)
+		} else {
+			cmd = strings.TrimSpace(cmd)
+			if strings.HasPrefix(cmd, "CPU ") && strings.HasSuffix(cmd, "/KVM") {
+				vcpuId, err := strconv.Atoi(cmd[4 : len(cmd)-4])
+				if err != nil {
+					return nil, errors.Wrapf(err, "failed parse %s to int", cmd)
+				}
+				vcpuThreads[vcpuId] = taskFiles[i].Name()
+			}
+		}
+	}
+	return vcpuThreads, nil
+}
+
 func (s *SKVMGuestInstance) CPUSetRemove(ctx context.Context) error {
 	delete(s.Desc.Metadata, api.VM_METADATA_CGROUP_CPUSET)
-	if err := s.SaveLiveDesc(s.Desc); err != nil {
+	if err := SaveLiveDesc(s, s.Desc); err != nil {
 		return errors.Wrap(err, "save desc after update metadata")
 	}
 	if !s.IsRunning() {
@@ -2931,4 +3578,34 @@ func (s *SKVMGuestInstance) CPUSetRemove(ctx context.Context) error {
 		return errors.Errorf("Remove task error happened, please lookup host log")
 	}
 	return nil
+}
+
+func (s *SKVMGuestInstance) HandleGuestStatus(ctx context.Context, status string, body *jsonutils.JSONDict) (jsonutils.JSONObject, error) {
+	if status == GUEST_RUNNING && s.pciUninitialized {
+		status = api.VM_UNSYNC
+	} else if status == GUEST_RUNNING {
+		var runCb = func() {
+			body := jsonutils.NewDict()
+			blockJobsCount := s.BlockJobsCount()
+			if blockJobsCount > 0 {
+				status = GUEST_BLOCK_STREAM
+			}
+			body.Set("block_jobs_count", jsonutils.NewInt(int64(blockJobsCount)))
+			body.Set("status", jsonutils.NewString(status))
+			hostutils.TaskComplete(ctx, body)
+		}
+		if s.Monitor == nil && !s.IsStopping() {
+			if err := s.StartMonitor(context.Background(), runCb, false); err != nil {
+				log.Errorf("guest %s failed start monitor %s", s.GetName(), err)
+				body.Set("status", jsonutils.NewString(status))
+				hostutils.TaskComplete(ctx, body)
+			}
+		} else {
+			runCb()
+		}
+		return nil, nil
+	}
+	body.Set("status", jsonutils.NewString(status))
+	hostutils.TaskComplete(ctx, body)
+	return nil, nil
 }

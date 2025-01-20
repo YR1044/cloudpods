@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"yunion.io/x/jsonutils"
@@ -33,13 +34,11 @@ import (
 	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/deployclient"
 	"yunion.io/x/onecloud/pkg/hostman/hostutils"
 	"yunion.io/x/onecloud/pkg/hostman/options"
-	"yunion.io/x/onecloud/pkg/hostman/storageman/backupstorage"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/mcclient/modules/image"
 	"yunion.io/x/onecloud/pkg/util/cephutils"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 	"yunion.io/x/onecloud/pkg/util/qemuimg"
-	"yunion.io/x/onecloud/pkg/util/qemutils"
 )
 
 const (
@@ -48,9 +47,13 @@ const (
 )
 
 type sStorageConf struct {
-	MonHost            string
-	Key                string
-	Pool               string
+	MonHost string
+	Key     string
+	Pool    string
+	// https://docs.ceph.com/en/latest/rados/configuration/msgr2/
+	// The messenger v2 protocol, or msgr2, is the second major
+	// revision on Ceph’s on-wire protocol.
+	EnableMessengerV2  bool
 	RadosMonOpTimeout  int64
 	RadosOsdOpTimeout  int64
 	ClientMountTimeout int64
@@ -95,16 +98,24 @@ func (s *SRbdStorage) GetSnapshotPathByIds(diskId, snapshotId string) string {
 	return ""
 }
 
-func (s *SRbdStorage) GetClient() (*cephutils.CephClient, error) {
-	return cephutils.NewClient(s.MonHost, s.Key, s.Pool)
+func (s *SRbdStorage) getCephClient(pool string) (*cephutils.CephClient, error) {
+	if pool == "" {
+		pool = s.Pool
+	}
+	return cephutils.NewClient(s.MonHost, s.Key, pool, s.EnableMessengerV2)
+}
+
+func (s *SRbdStorage) getClient() (*cephutils.CephClient, error) {
+	return s.getCephClient("")
 }
 
 func (s *SRbdStorage) IsSnapshotExist(diskId, snapshotId string) (bool, error) {
-	client, err := s.GetClient()
+	client, err := s.getClient()
 	if err != nil {
 		return false, errors.Wrapf(err, "GetClient")
 	}
 	defer client.Close()
+
 	img, err := client.GetImage(diskId)
 	if err != nil {
 		return false, errors.Wrapf(err, "GetImage")
@@ -149,18 +160,17 @@ func (s *SRbdStorage) getStorageConfString() string {
 	return ":" + strings.Join(conf, ":")
 }
 
-func (s *SRbdStorage) listImages(pool string) ([]string, error) {
-	client, err := s.GetClient()
+func (s *SRbdStorage) listImages() ([]string, error) {
+	client, err := s.getClient()
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetClient")
 	}
-	client.SetPool(pool)
 	defer client.Close()
 	return client.ListImages()
 }
 
 func (s *SRbdStorage) IsImageExist(name string) (bool, error) {
-	images, err := s.listImages(s.Pool)
+	images, err := s.listImages()
 	if err != nil {
 		return false, errors.Wrapf(err, "listImages")
 	}
@@ -170,13 +180,13 @@ func (s *SRbdStorage) IsImageExist(name string) (bool, error) {
 	return false, nil
 }
 
-func (s *SRbdStorage) getImageSizeMb(pool string, name string) (uint64, error) {
-	client, err := s.GetClient()
+func (s *SRbdStorage) getImageSizeMb(name string) (uint64, error) {
+	client, err := s.getClient()
 	if err != nil {
 		return 0, errors.Wrapf(err, "GetClient")
 	}
 	defer client.Close()
-	client.SetPool(pool)
+
 	img, err := client.GetImage(name)
 	if err != nil {
 		return 0, errors.Wrapf(err, "GetImage")
@@ -188,13 +198,13 @@ func (s *SRbdStorage) getImageSizeMb(pool string, name string) (uint64, error) {
 	return uint64(info.SizeByte) / 1024 / 1024, nil
 }
 
-func (s *SRbdStorage) resizeImage(pool string, name string, sizeMb uint64) error {
-	client, err := s.GetClient()
+func (s *SRbdStorage) resizeImage(name string, sizeMb uint64) error {
+	client, err := s.getClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
 	}
 	defer client.Close()
-	client.SetPool(pool)
+
 	img, err := client.GetImage(name)
 	if err != nil {
 		return errors.Wrapf(err, "GetImage")
@@ -209,13 +219,13 @@ func (s *SRbdStorage) resizeImage(pool string, name string, sizeMb uint64) error
 	return img.Resize(int64(sizeMb))
 }
 
-func (s *SRbdStorage) deleteImage(pool string, name string, skipRecycle bool) error {
-	client, err := s.GetClient()
+func (s *SRbdStorage) deleteImage(name string, skipRecycle bool) error {
+	client, err := s.getClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
 	}
 	defer client.Close()
-	client.SetPool(pool)
+
 	img, err := client.GetImage(name)
 	if err != nil {
 		if errors.Cause(err) == errors.ErrNotFound {
@@ -226,29 +236,35 @@ func (s *SRbdStorage) deleteImage(pool string, name string, skipRecycle bool) er
 	return img.Delete()
 }
 
-// 速度快
 func (s *SRbdStorage) cloneImage(ctx context.Context, srcPool string, srcImage string, destPool string, destImage string) error {
-	client, err := s.GetClient()
+	cli, err := s.getClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
 	}
-	defer client.Close()
-	client.SetPool(srcPool)
-	img, err := client.GetImage(srcImage)
+	defer cli.Close()
+	srcCli := cli.Child(srcPool)
+
+	img, err := srcCli.GetImage(srcImage)
 	if err != nil {
 		return errors.Wrapf(err, "GetImage")
 	}
-	return img.Clone(ctx, destPool, destImage)
+	_, err = img.Clone(ctx, destPool, destImage)
+	if err != nil {
+		return errors.Wrap(err, "Clone")
+	}
+	return nil
 }
 
 func (s *SRbdStorage) cloneFromSnapshot(srcImage, srcPool, srcSnapshot, newImage, pool string) error {
-	client, err := s.GetClient()
+	cli, err := s.getClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
 	}
-	defer client.Close()
-	client.SetPool(srcPool)
-	img, err := client.GetImage(srcImage)
+	defer cli.Close()
+
+	srcCli := cli.Child(srcPool)
+
+	img, err := srcCli.GetImage(srcImage)
 	if err != nil {
 		return errors.Wrapf(err, "GetImage(%s/%s)", srcPool, srcImage)
 	}
@@ -256,41 +272,46 @@ func (s *SRbdStorage) cloneFromSnapshot(srcImage, srcPool, srcSnapshot, newImage
 	if err != nil {
 		return errors.Wrapf(err, "GetSnapshot(%s)", srcSnapshot)
 	}
-	return snap.Clone(pool, newImage)
+	_, err = snap.Clone(pool, newImage, true)
+	if err != nil {
+		return errors.Wrap(err, "Clone")
+	}
+	return nil
 }
 
-func (s *SRbdStorage) createImage(pool string, name string, sizeMb uint64) error {
-	client, err := s.GetClient()
+func (s *SRbdStorage) createImage(name string, sizeMb uint64) error {
+	client, err := s.getClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
 	}
 	defer client.Close()
-	client.SetPool(pool)
+
 	_, err = client.CreateImage(name, int64(sizeMb))
 	return err
 }
 
 func (s *SRbdStorage) renameImage(pool string, src string, dest string) error {
-	client, err := s.GetClient()
+	cli, err := s.getClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
 	}
-	defer client.Close()
-	client.SetPool(pool)
-	img, err := client.GetImage(src)
+	defer cli.Close()
+
+	srcCli := cli.Child(pool)
+	img, err := srcCli.GetImage(src)
 	if err != nil {
 		return errors.Wrapf(err, "GetImage")
 	}
 	return img.Rename(dest)
 }
 
-func (s *SRbdStorage) resetDisk(pool string, diskId string, snapshotId string) error {
-	client, err := s.GetClient()
+func (s *SRbdStorage) resetDisk(diskId string, snapshotId string) error {
+	client, err := s.getClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
 	}
-	client.SetPool(pool)
 	defer client.Close()
+
 	img, err := client.GetImage(diskId)
 	if err != nil {
 		return errors.Wrapf(err, "GetImage")
@@ -302,51 +323,44 @@ func (s *SRbdStorage) resetDisk(pool string, diskId string, snapshotId string) e
 	return snap.Rollback()
 }
 
-func (s *SRbdStorage) createBackup(pool string, diskId string, snapshotId string, backupId string, backupStorageId string, backupStorageAccessInfo *jsonutils.JSONDict) (int, error) {
-	client, err := s.GetClient()
+func (s *SRbdStorage) createBackup(ctx context.Context, diskId string, diskBackup *SDiskBackup) (int, error) {
+	client, err := s.getClient()
 	if err != nil {
 		return 0, errors.Wrapf(err, "GetClient")
 	}
-	client.SetPool(pool)
 	defer client.Close()
+
 	img, err := client.GetImage(diskId)
 	if err != nil {
 		return 0, errors.Wrapf(err, "GetImage")
 	}
-	snap, err := img.GetSnapshot(snapshotId)
+	snap, err := img.GetSnapshot(diskBackup.SnapshotId)
 	if err != nil {
-		return 0, errors.Wrapf(err, "unable to GetSnapshot %s of Image %s", snapshotId, diskId)
+		return 0, errors.Wrapf(err, "unable to GetSnapshot %s of Image %s", diskBackup.SnapshotId, diskId)
 	}
-	backupName := fmt.Sprintf("backup_%s", backupId)
-	err = snap.Clone(pool, backupName)
+	backupName := fmt.Sprintf("backup_%s", diskBackup.BackupId)
+	// no need to flattern, as image will be delete right after backup
+	backupImg, err := snap.Clone(s.sStorageConf.Pool, backupName, false)
 	if err != nil {
-		return 0, errors.Wrapf(err, "unable to Clone snap %s", fmt.Sprintf("%s@%s", diskId, snapshotId))
-	}
-	backupImg, err := client.GetImage(backupName)
-	if err != nil {
-		return 0, errors.Wrapf(err, "GetImage")
+		return 0, errors.Wrapf(err, "unable to Clone snap %s", fmt.Sprintf("%s@%s", diskId, diskBackup.SnapshotId))
 	}
 	defer backupImg.Delete()
-	// convert backupStorage
-	backupStorage, err := backupstorage.GetBackupStorage(backupStorageId, backupStorageAccessInfo)
+
+	srcPath := fmt.Sprintf("rbd:%s%s", backupImg.GetName(), s.getStorageConfString())
+
+	size, err := doBackupDisk(ctx, srcPath, diskBackup)
 	if err != nil {
-		return 0, errors.Wrap(err, "unable to GetBackupStorage")
+		return 0, errors.Wrap(err, "doBackupDisk")
 	}
-	srcPath := fmt.Sprintf("rbd:%s/%s%s", pool, backupName, s.getStorageConfString())
-	// convert
-	sizeMb, err := backupStorage.ConvertFrom(srcPath, qemuimgfmt.RAW, backupId)
-	if err != nil {
-		return 0, errors.Wrapf(err, "unable to ConvertFrom with srcPath %s and format %s", srcPath, qemuimgfmt.RAW.String())
-	}
-	return sizeMb, nil
+
+	return size, nil
 }
 
-func (s *SRbdStorage) createSnapshot(pool string, diskId string, snapshotId string) error {
-	client, err := s.GetClient()
+func (s *SRbdStorage) createSnapshot(diskId string, snapshotId string) error {
+	client, err := s.getClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
 	}
-	client.SetPool(pool)
 	defer client.Close()
 	img, err := client.GetImage(diskId)
 	if err != nil {
@@ -356,12 +370,11 @@ func (s *SRbdStorage) createSnapshot(pool string, diskId string, snapshotId stri
 	return err
 }
 
-func (s *SRbdStorage) deleteSnapshot(pool string, diskId string, snapshotId string) error {
-	client, err := s.GetClient()
+func (s *SRbdStorage) deleteSnapshot(diskId string, snapshotId string) error {
+	client, err := s.getClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
 	}
-	client.SetPool(pool)
 	defer client.Close()
 	img, err := client.GetImage(diskId)
 	if err != nil {
@@ -379,7 +392,7 @@ func (s *SRbdStorage) SyncStorageSize() (api.SHostStorageStat, error) {
 		StorageId: s.StorageId,
 	}
 
-	client, err := s.GetClient()
+	client, err := s.getClient()
 	if err != nil {
 		return stat, errors.Wrapf(err, "GetClient")
 	}
@@ -393,16 +406,31 @@ func (s *SRbdStorage) SyncStorageSize() (api.SHostStorageStat, error) {
 	return stat, nil
 }
 
+func (s *SRbdStorage) GetCapacityMb() int {
+	capa, err := s.getRbdCapacity()
+	if err != nil {
+		return -1
+	}
+	return int(capa.CapacitySizeKb) / 1024
+}
+
+func (s *SRbdStorage) getRbdCapacity() (*cephutils.SCapacity, error) {
+	client, err := s.getClient()
+	if err != nil {
+		return nil, errors.Wrap(err, "getClient")
+	}
+	defer client.Close()
+	capacity, err := client.GetCapacity()
+	if err != nil {
+		return nil, errors.Wrap(err, "GetCapacity")
+	}
+	return capacity, nil
+}
+
 func (s *SRbdStorage) SyncStorageInfo() (jsonutils.JSONObject, error) {
 	content := map[string]interface{}{}
 	if len(s.StorageId) > 0 {
-		client, err := s.GetClient()
-		if err != nil {
-			reason := jsonutils.Marshal(map[string]string{"reason": errors.Wrapf(err, "GetClient").Error()})
-			return modules.Storages.PerformAction(hostutils.GetComputeSession(context.Background()), s.StorageId, api.STORAGE_OFFLINE, reason)
-		}
-		defer client.Close()
-		capacity, err := client.GetCapacity()
+		capacity, err := s.getRbdCapacity()
 		if err != nil {
 			reason := jsonutils.Marshal(map[string]string{"reason": errors.Wrapf(err, "GetCapacity").Error()})
 			return modules.Storages.PerformAction(hostutils.GetComputeSession(context.Background()), s.StorageId, api.STORAGE_OFFLINE, reason)
@@ -449,7 +477,7 @@ func (s *SRbdStorage) CreateDisk(diskId string) IDisk {
 }
 
 func (s *SRbdStorage) Accessible() error {
-	client, err := s.GetClient()
+	client, err := s.getClient()
 	if err != nil {
 		return errors.Wrapf(err, "GetClient")
 	}
@@ -508,15 +536,39 @@ func (s *SRbdStorage) saveToGlance(ctx context.Context, imageId, imagePath strin
 		return err
 	}
 
-	tmpImageFile := fmt.Sprintf("/tmp/%s.img", imageId)
+	tmpPath := "/opt/cloud/tmp"
+	err = os.MkdirAll(tmpPath, 0755)
+	if err != nil {
+		log.Errorf("failed mkdir %s", tmpPath)
+		return errors.Wrap(err, "os.MkdirAll")
+	}
+
+	tmpFileDir, err := os.MkdirTemp(tmpPath, "ceph_save_images")
+	if err != nil {
+		log.Errorf("fail to obtain tempFile for ceph save glance image: %s", err)
+		return errors.Wrap(err, "os.MkdirTemp")
+	}
+	defer func() {
+		log.Debugf("clean up temp dir for glance image save %s", tmpFileDir)
+		output, err := procutils.NewRemoteCommandAsFarAsPossible("rm", "-fr", tmpFileDir).Output()
+		if err != nil {
+			log.Errorf("rm %s fail %s %s", tmpFileDir, output, err)
+		}
+	}()
+
+	tmpImageFile := filepath.Join(tmpFileDir, imageId)
+
 	if len(format) == 0 {
 		format = options.HostOptions.DefaultImageSaveFormat
 	}
 
-	err = procutils.NewRemoteCommandAsFarAsPossible(qemutils.GetQemuImg(),
-		"convert", "-f", "raw", "-O", format, imagePath, tmpImageFile).Run()
+	img, err := qemuimg.NewQemuImage(imagePath)
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "NewQemuImage %s", imagePath)
+	}
+	_, err = img.Clone(tmpImageFile, qemuimgfmt.String2ImageFormat(format), compress)
+	if err != nil {
+		return errors.Wrapf(err, "Clone %s", tmpImageFile)
 	}
 
 	f, err := os.Open(tmpImageFile)
@@ -551,8 +603,7 @@ func (s *SRbdStorage) saveToGlance(ctx context.Context, imageId, imagePath strin
 	}
 	params.Set("image_id", jsonutils.NewString(imageId))
 
-	_, err = image.Images.Upload(hostutils.GetImageSession(ctx),
-		params, f, size)
+	_, err = image.Images.Upload(hostutils.GetImageSession(ctx), params, f, size)
 	return err
 }
 
@@ -564,9 +615,17 @@ func (s *SRbdStorage) DeleteSnapshots(ctx context.Context, params interface{}) (
 	return nil, fmt.Errorf("Not support delete snapshots")
 }
 
-func (s *SRbdStorage) CreateDiskFromSnapshot(ctx context.Context, disk IDisk, input *SDiskCreateByDiskinfo) error {
+func (s *SRbdStorage) DeleteSnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
+	return nil, fmt.Errorf("Not support delete snapshot")
+}
+
+func (s *SRbdStorage) CreateDiskFromSnapshot(ctx context.Context, disk IDisk, input *SDiskCreateByDiskinfo) (jsonutils.JSONObject, error) {
 	info := input.DiskInfo
-	return disk.CreateFromRbdSnapshot(ctx, info.SnapshotUrl, info.SrcDiskId, info.SrcPool)
+	err := disk.CreateFromRbdSnapshot(ctx, info.SnapshotUrl, info.SrcDiskId, info.SrcPool)
+	if err != nil {
+		return nil, err
+	}
+	return disk.GetDiskDesc(), nil
 }
 
 func (s *SRbdStorage) GetBackupDir() string {
@@ -578,9 +637,13 @@ func (s *SRbdStorage) CreateDiskFromExistingPath(context.Context, IDisk, *SDiskC
 }
 
 func (s *SRbdStorage) CreateDiskFromBackup(ctx context.Context, disk IDisk, input *SDiskCreateByDiskinfo) error {
-	backup := input.DiskInfo.Backup
 	pool, _ := s.StorageConf.GetString("pool")
 	destPath := fmt.Sprintf("rbd:%s/%s%s", pool, disk.GetId(), s.getStorageConfString())
+	err := doRestoreDisk(ctx, s, input, disk, destPath)
+	if err != nil {
+		return errors.Wrap(err, "doRestore")
+	}
+	/*backup := input.DiskInfo.Backup
 	backupStorage, err := backupstorage.GetBackupStorage(backup.BackupStorageId, backup.BackupStorageAccessInfo)
 	if err != nil {
 		return errors.Wrap(err, "unable to GetBackupStorage")
@@ -588,7 +651,7 @@ func (s *SRbdStorage) CreateDiskFromBackup(ctx context.Context, disk IDisk, inpu
 	err = backupStorage.ConvertTo(destPath, qemuimgfmt.RAW, backup.BackupId)
 	if err != nil {
 		return errors.Wrapf(err, "unable to Convert to with destPath %s and format %s", destPath, qemuimgfmt.RAW.String())
-	}
+	}*/
 	return nil
 }
 
@@ -621,7 +684,7 @@ func (s *SRbdStorage) CloneDiskFromStorage(
 			return nil, errors.Wrap(err, "Clone source disk to target rbd storage")
 		}
 	} else {
-		err = s.createImage(s.Pool, targetDiskId, uint64(srcImg.GetSizeMB()))
+		err = s.createImage(targetDiskId, uint64(srcImg.GetSizeMB()))
 		if err != nil {
 			return nil, errors.Wrap(err, "Create rbd image")
 		}
@@ -653,4 +716,8 @@ func (s *SRbdStorage) SetStorageInfo(storageId, storageName string, conf jsonuti
 		s.ClientMountTimeout = api.RBD_DEFAULT_MOUNT_TIMEOUT
 	}
 	return nil
+}
+
+func (s *SRbdStorage) CleanRecycleDiskfiles(ctx context.Context) {
+	log.Infof("SRbdStorage CleanRecycleDiskfiles do nothing!")
 }

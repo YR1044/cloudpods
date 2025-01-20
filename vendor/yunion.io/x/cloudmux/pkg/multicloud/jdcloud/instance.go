@@ -305,10 +305,6 @@ func (in *SInstance) GetVmemSizeMB() int {
 	return in.instanceType.GetMemoryMB()
 }
 
-func (in *SInstance) AssignSecurityGroup(id string) error {
-	return cloudprovider.ErrNotImplemented
-}
-
 func (in *SInstance) SetSecurityGroups(ids []string) error {
 	return cloudprovider.ErrNotImplemented
 }
@@ -329,7 +325,7 @@ func (in *SInstance) DeleteVM(ctx context.Context) error {
 	return cloudprovider.ErrNotImplemented
 }
 
-func (in *SInstance) UpdateVM(ctx context.Context, name string) error {
+func (in *SInstance) UpdateVM(ctx context.Context, input cloudprovider.SInstanceUpdateOptions) error {
 	return cloudprovider.ErrNotSupported
 }
 
@@ -341,7 +337,7 @@ func (self *SInstance) RebuildRoot(ctx context.Context, config *cloudprovider.SM
 	return "", cloudprovider.ErrNotImplemented
 }
 
-func (self *SInstance) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
+func (self *SInstance) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
 	return cloudprovider.ErrNotImplemented
 }
 

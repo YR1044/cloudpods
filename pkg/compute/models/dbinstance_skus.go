@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
@@ -32,12 +33,15 @@ import (
 	api "yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 	"yunion.io/x/onecloud/pkg/util/yunionmeta"
 )
 
+// +onecloud:swagger-gen-model-singular=dbinstance_sku
+// +onecloud:swagger-gen-model-plural=dbinstance_skus
 type SDBInstanceSkuManager struct {
 	db.SEnabledStatusStandaloneResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -117,7 +121,7 @@ func (manager *SDBInstanceSkuManager) ListItemFilter(
 	}
 
 	if domainStr := query.ProjectDomainId; len(domainStr) > 0 {
-		domain, err := db.TenantCacheManager.FetchDomainByIdOrName(context.Background(), domainStr)
+		domain, err := db.TenantCacheManager.FetchDomainByIdOrName(ctx, domainStr)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2("domains", domainStr)
@@ -129,7 +133,7 @@ func (manager *SDBInstanceSkuManager) ListItemFilter(
 
 	q = listItemDomainFilter(q, query.Providers, query.ProjectDomainId)
 
-	q, err = managedResourceFilterByRegion(q, query.RegionalFilterListInput, "", nil)
+	q, err = managedResourceFilterByRegion(ctx, q, query.RegionalFilterListInput, "", nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "managedResourceFilterByRegion")
 	}
@@ -160,7 +164,7 @@ func (manager *SDBInstanceSkuManager) ListItemFilter(
 	for k, zoneIds := range map[string][]string{"zone1": query.Zone1, "zone2": query.Zone2, "zone3": query.Zone3} {
 		ids := []string{}
 		for _, zoneId := range zoneIds {
-			zone, err := ZoneManager.FetchByIdOrName(userCred, zoneId)
+			zone, err := ZoneManager.FetchByIdOrName(ctx, userCred, zoneId)
 			if err != nil {
 				if errors.Cause(err) == sql.ErrNoRows {
 					return nil, httperrors.NewResourceNotFoundError2("zone", zoneId)
@@ -470,6 +474,11 @@ func (manager *SDBInstanceSkuManager) GetInstanceTypes(provider, cloudregionId, 
 	return manager.GetDBStringArray(q)
 }
 
+func (manager *SDBInstanceSkuManager) GetSkuCountByRegion(regionId string) (int, error) {
+	q := manager.Query().Equals("cloudregion_id", regionId)
+	return q.CountWithError()
+}
+
 func (manager *SDBInstanceSkuManager) GetDBInstanceSkus(provider, cloudregionId, engine, version, category, storageType string) ([]SDBInstanceSku, error) {
 	skus := []SDBInstanceSku{}
 	q := manager.Query("name").Equals("provider", provider).Equals("cloudregion_id", cloudregionId).Equals("engine", engine).Equals("engine_version", version).Distinct()
@@ -523,7 +532,7 @@ func (manager *SDBInstanceSkuManager) SyncDBInstanceSkus(
 	}
 
 	for i := 0; i < len(removed); i += 1 {
-		err = removed[i].Delete(ctx, userCred)
+		err = db.RealDeleteModel(ctx, userCred, &removed[i])
 		if err != nil {
 			result.DeleteError(err)
 		} else {
@@ -580,7 +589,7 @@ func (self *SCloudregion) newDBInstanceSkuFromCloudSku(ctx context.Context, user
 	sku := &SDBInstanceSku{}
 	sku.SetModelManager(DBInstanceSkuManager, sku)
 
-	skuUrl := fmt.Sprintf("%s/%s/%s.json", meta.DBInstanceBase, self.ExternalId, externalId)
+	skuUrl := self.getMetaUrl(meta.DBInstanceBase, externalId)
 	err = meta.Get(skuUrl, sku)
 	if err != nil {
 		return errors.Wrapf(err, "Get")
@@ -642,6 +651,9 @@ func SyncRegionDBInstanceSkus(ctx context.Context, userCred mcclient.TokenCreden
 	err := db.FetchModelObjects(CloudregionManager, q, &cloudregions)
 	if err != nil {
 		log.Errorf("failed to fetch cloudregions: %v", err)
+		return
+	}
+	if len(cloudregions) == 0 {
 		return
 	}
 
@@ -784,14 +796,26 @@ func (self *SCloudregion) SyncDBInstanceSkus(
 		}
 		result.Delete()
 	}
+	ch := make(chan struct{}, options.Options.SkuBatchSync)
+	defer close(ch)
+	var wg sync.WaitGroup
 	for i := 0; i < len(added); i += 1 {
-		err = self.newFromCloudSku(ctx, userCred, added[i])
-		if err != nil {
-			result.AddError(err)
-			continue
-		}
-		result.Add()
+		ch <- struct{}{}
+		wg.Add(1)
+		go func(sku cloudprovider.ICloudDBInstanceSku) {
+			defer func() {
+				wg.Done()
+				<-ch
+			}()
+			err = self.newFromCloudSku(ctx, userCred, sku)
+			if err != nil {
+				result.AddError(err)
+				return
+			}
+			result.Add()
+		}(added[i])
 	}
+	wg.Wait()
 	return result
 }
 

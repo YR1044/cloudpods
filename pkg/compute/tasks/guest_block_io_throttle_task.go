@@ -42,31 +42,18 @@ func (self *GuestBlockIoThrottleTask) OnInit(ctx context.Context, obj db.IStanda
 	host, _ := guest.GetHost()
 	self.SetStage("OnIoThrottle", nil)
 
-	params := jsonutils.NewDict()
-	iops, _ := self.Params.Get("iops")
-	bps, _ := self.Params.Get("bps")
-	params.Set("iops", iops)
-	params.Set("bps", bps)
-	_, err := host.Request(ctx, self.UserCred, "POST", url, headers, params)
+	input := new(api.ServerSetDiskIoThrottleInput)
+	if err := self.Params.Unmarshal(input); err != nil {
+		self.OnIoThrottleFailed(ctx, guest, jsonutils.NewString(err.Error()))
+		return
+	}
+	_, err := host.Request(ctx, self.UserCred, "POST", url, headers, jsonutils.Marshal(input))
 	if err != nil {
 		self.OnIoThrottleFailed(ctx, guest, jsonutils.NewString(err.Error()))
 	}
 }
 
 func (self *GuestBlockIoThrottleTask) OnIoThrottle(ctx context.Context, guest *models.SGuest, data jsonutils.JSONObject) {
-	iops, _ := self.Params.Int("iops")
-	bps, _ := self.Params.Int("bps")
-
-	gds, _ := guest.GetGuestDisks()
-	for i := 0; i < len(gds); i++ {
-		db.Update(&gds[i], func() error {
-			gds[i].Iops = int(iops)
-			gds[i].Bps = int(bps)
-			return nil
-		})
-	}
-	guest.SetMetadata(ctx, "iops", iops, self.UserCred)
-	guest.SetMetadata(ctx, "bps", bps, self.UserCred)
 	db.OpsLog.LogEvent(guest, db.ACT_VM_IO_THROTTLE, "", self.UserCred)
 	logclient.AddActionLogWithContext(ctx, guest, logclient.ACT_VM_IO_THROTTLE, "", self.UserCred, true)
 	self.SetStage("OnGuestSync", nil)
@@ -76,7 +63,7 @@ func (self *GuestBlockIoThrottleTask) OnIoThrottle(ctx context.Context, guest *m
 func (self *GuestBlockIoThrottleTask) OnGuestSync(ctx context.Context, guest *models.SGuest, data jsonutils.JSONObject) {
 	oldStatus, _ := self.Params.GetString("old_status")
 	if len(oldStatus) > 0 {
-		guest.SetStatus(self.UserCred, oldStatus, "on io throttle")
+		guest.SetStatus(ctx, self.UserCred, oldStatus, "on io throttle")
 	}
 	self.SetStageComplete(ctx, nil)
 }
@@ -88,6 +75,6 @@ func (self *GuestBlockIoThrottleTask) OnGuestSyncFailed(ctx context.Context, gue
 func (self *GuestBlockIoThrottleTask) OnIoThrottleFailed(ctx context.Context, guest *models.SGuest, data jsonutils.JSONObject) {
 	db.OpsLog.LogEvent(guest, db.ACT_VM_IO_THROTTLE_FAIL, data, self.UserCred)
 	logclient.AddActionLogWithContext(ctx, guest, logclient.ACT_VM_IO_THROTTLE, data, self.UserCred, false)
-	guest.SetStatus(self.UserCred, api.VM_IO_THROTTLE_FAIL, data.String())
+	guest.SetStatus(ctx, self.UserCred, api.VM_IO_THROTTLE_FAIL, data.String())
 	self.SetStageFailed(ctx, data)
 }

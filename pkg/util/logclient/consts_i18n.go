@@ -268,6 +268,10 @@ func init() {
 		EN("Migrate").
 		CN("迁移"),
 	)
+	t.Set(ACT_MIGRATING, i18n.NewTableEntry().
+		EN("Migrating").
+		CN("迁移中"),
+	)
 	t.Set(ACT_EIP_ASSOCIATE, i18n.NewTableEntry().
 		EN("Eip Associate").
 		CN("绑定弹性IP"),
@@ -446,6 +450,10 @@ func init() {
 	t.Set(ACT_HOST_MAINTAINING, i18n.NewTableEntry().
 		EN("Host Maintaining").
 		CN("宿主机进入维护模式"),
+	)
+	t.Set(ACT_HOST_UNMAINTENANCE, i18n.NewTableEntry().
+		EN("Host Unmaintenance").
+		CN("宿主机退出维护模式"),
 	)
 
 	t.Set(ACT_MKDIR, i18n.NewTableEntry().
@@ -642,13 +650,13 @@ func init() {
 		CN("发送验证消息"),
 	)
 
-	t.Set(ACT_SYNC_VPCS, i18n.NewTableEntry().
-		EN("Sync Vpcs").
-		CN("同步VPC"),
+	t.Set(ACT_ADD_VPCS, i18n.NewTableEntry().
+		EN("Add Vpcs").
+		CN("添加VPC"),
 	)
-	t.Set(ACT_SYNC_RECORD_SETS, i18n.NewTableEntry().
-		EN("Sync Record Sets").
-		CN("同步解析列表"),
+	t.Set(ACT_REMOVE_VPCS, i18n.NewTableEntry().
+		EN("Remove Vpcs").
+		CN("移除VPC"),
 	)
 
 	t.Set(ACT_FREEZE, i18n.NewTableEntry().
@@ -688,6 +696,13 @@ func init() {
 		EN("Set Alert").
 		CN("配置报警"),
 	)
+	t.Set(ACT_CONFIGURE, i18n.NewTableEntry().EN("Configure").CN("配置"))
+	t.Set(ACT_ACTIVATE, i18n.NewTableEntry().EN("Activate").CN("启用"))
+	t.Set(ACT_SUSPEND, i18n.NewTableEntry().EN("Suspend").CN("暂停"))
+	t.Set(ACT_APPROVED, i18n.NewTableEntry().EN("Approved").CN("批准"))
+	t.Set(ACT_REJECTED, i18n.NewTableEntry().EN("Rejected").CN("驳回"))
+	t.Set(ACT_TRANSFERRED, i18n.NewTableEntry().EN("Transferred").CN("转交"))
+	t.Set(ACT_TRANSFERRED_REJECTED, i18n.NewTableEntry().EN("Transferred Rejected").CN("驳回"))
 
 	s.Set(apis.SERVICE_TYPE_MONITOR, i18n.NewTableEntry().
 		EN("Monitor").
@@ -734,6 +749,9 @@ func init() {
 		EN("Kubernetes").
 		CN("容器服务"),
 	)
+	s.Set("itsm", i18n.NewTableEntry().
+		EN("ITSM").
+		CN("工单服务"))
 
 	o.Set("domain", i18n.NewTableEntry().
 		EN("Domain").
@@ -1311,6 +1329,13 @@ func init() {
 		EN("Server Sku").
 		CN("虚拟机套餐"),
 	)
+	o.Set("offline_export", i18n.NewTableEntry().
+		EN("Offline Export").
+		CN("离线导出"),
+	)
+	o.Set("process_definition", i18n.NewTableEntry().EN("Process Definition").CN("工单定义"))
+	o.Set("process_instance", i18n.NewTableEntry().EN("Process Instance").CN("工单"))
+	o.Set("process_task", i18n.NewTableEntry().EN("Process Task").CN("工单任务"))
 
 	o.Set(ACT_UPDATE_MONITOR_RESOURCE_JOINT, i18n.NewTableEntry().
 		EN("Update Monitor Resource joint").
@@ -1350,6 +1375,16 @@ func init() {
 	o.Set(ACT_WEBSSH, i18n.NewTableEntry().
 		EN("WebSSH").
 		CN("WebSSH"),
+	)
+
+	o.Set(ACT_TRYSSHABLE, i18n.NewTableEntry().
+		EN("Try Sshable").
+		CN("探测免密登录"),
+	)
+
+	o.Set(ACT_MAKESSHABLE, i18n.NewTableEntry().
+		EN("Make Sshable").
+		CN("设置免密登录"),
 	)
 
 	o.Set(ACT_CLOUDACCOUNT_SYNC_NETWORK, i18n.NewTableEntry().
@@ -1395,5 +1430,107 @@ func init() {
 	o.Set(ACT_PROGRESS, i18n.NewTableEntry().
 		EN("Progress").
 		CN("进展"),
+	)
+
+	o.Set(ACT_ADD_BASTION_SERVER, i18n.NewTableEntry().
+		EN("Add Bastionhost Server").
+		CN("添加实例到堡垒机"),
+	)
+
+	o.Set(ACT_SET_USER_PASSWORD, i18n.NewTableEntry().
+		EN("Set Password For User").
+		CN("设置用户密码"),
+	)
+
+	o.Set(ACT_DISK_CHANGE_STORAGE, i18n.NewTableEntry().
+		EN("Disk Change Storage").
+		CN("磁盘更换存储"),
+	)
+
+	o.Set(ACT_SYNC_TRAFFIC_LIMIT, i18n.NewTableEntry().
+		EN("Sync Nic Traffic Limit").
+		CN("同步网卡流量限制"),
+	)
+
+	o.Set(ACT_GENERATE_REPORT, i18n.NewTableEntry().
+		EN("Generate Report").
+		CN("生成报表"),
+	)
+
+	o.Set(ACT_REPORT_COLLECT_DATA, i18n.NewTableEntry().
+		EN("Collect Report Data").
+		CN("采集报表数据"),
+	)
+
+	o.Set(ACT_REPORT_SEND, i18n.NewTableEntry().
+		EN("Send Report").
+		CN("发送报表"),
+	)
+
+	o.Set(ACT_REPORT_TEMPLATE, i18n.NewTableEntry().
+		EN("Report Template").
+		CN("报表模板"),
+	)
+
+	o.Set(ACT_SAVE_IMAGE, i18n.NewTableEntry().
+		EN("Save Image").
+		CN("保存镜像"),
+	)
+
+	o.Set(ACT_CLOUD_SYNC, i18n.NewTableEntry().
+		EN("Sync Cloud Resource").
+		CN("同步云资源"),
+	)
+
+	o.Set(ACT_COLLECT_METRICS, i18n.NewTableEntry().
+		EN("Collect monitoring metrics").
+		CN("采集监控指标"),
+	)
+
+	o.Set(ACT_ADD_RATE, i18n.NewTableEntry().
+		EN("Add Rate").
+		CN("添加费率"),
+	)
+
+	o.Set(ACT_REMOVE_RATE, i18n.NewTableEntry().
+		EN("Remove Rate").
+		CN("删除费率"),
+	)
+
+	o.Set(ACT_JOIN_PROJECT, i18n.NewTableEntry().
+		EN("Join Project").
+		CN("加入项目"),
+	)
+	o.Set(ACT_LEAVE_PROJECT, i18n.NewTableEntry().
+		EN("Leave Project").
+		CN("移除项目"),
+	)
+	o.Set(ACT_RESET_CREDENTIAL, i18n.NewTableEntry().
+		EN("Reset Credential").
+		CN("重置账号密码"),
+	)
+	o.Set(ACT_SET_SCHED_TAG, i18n.NewTableEntry().
+		EN("Set Scheduler Tag").
+		CN("设置调度标签"),
+	)
+	o.Set(ACT_AUTO_MIGRATE_ON_HOST_DOWN, i18n.NewTableEntry().
+		EN("Auto Migrate On Host Down").
+		CN("宕机自动迁移"),
+	)
+	o.Set(ACT_SET_RESERVE_RESOURCE_FOR_ISOLATED_DEVICES, i18n.NewTableEntry().
+		EN("Set Reserve Resource For Isolated Devices").
+		CN("透传设备设置预留资源"),
+	)
+	o.Set(ACT_UNCONVERT_START, i18n.NewTableEntry().
+		EN("Start Unconvert hypervisor").
+		CN("开始回收为物理机"),
+	)
+	o.Set(ACT_UNCONVERT_COMPLETE, i18n.NewTableEntry().
+		EN("Unconvert Hypervisor Complete").
+		CN("回收为物理机"),
+	)
+	o.Set(ACT_SET_COMMIT_BOUND, i18n.NewTableEntry().
+		EN("Set Commit Bound").
+		CN("设置超售比"),
 	)
 }

@@ -36,7 +36,7 @@ type SImageOptions struct {
 
 	EnableTorrentService bool `help:"Enable torrent service" default:"false"`
 
-	TargetImageFormats []string `help:"target image formats that the system will automatically convert to" default:"qcow2,vmdk"`
+	TargetImageFormats []string `help:"target image formats that the system will automatically convert to" default:"qcow2"`
 
 	TorrentClientPath string `help:"path to torrent executable" default:"/opt/yunion/bin/torrent"`
 
@@ -51,6 +51,8 @@ type SImageOptions struct {
 	S3BucketName       string `help:"s3 bucket name" default:"onecloud-images"`
 	S3MountPoint       string `help:"s3fs mount point" default:"/opt/cloud/workspace/data/glance/s3images"`
 	S3CheckImageStatus bool   `help:"Enable s3 check image status"`
+
+	ImageStreamWorkerCount int `help:"Image stream worker count" default:"10"`
 }
 
 var (

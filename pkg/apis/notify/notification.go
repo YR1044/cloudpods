@@ -45,7 +45,7 @@ type NotificationCreateInput struct {
 	Topic string `json:"topic"`
 	// description: notification priority
 	// required: false
-	// enum: fatal,important,nomal
+	// enum: ["fatal","important","nomal"]
 	// example: normal
 	Priority string `json:"priority"`
 	// description: message content or jsonobject
@@ -108,7 +108,7 @@ type NotificationManagerEventNotifyInput struct {
 	ContactTypes []string `json:"contact_type"`
 	// description: notification priority
 	// required: false
-	// enum: fatal,important,nomal
+	// enum: ["fatal","important","nomal"]
 	// example: normal
 	Priority string `json:"priority"`
 	// description: resource details
@@ -146,4 +146,25 @@ type NotificationManagerEventNotifyOutput struct {
 type FailedElem struct {
 	ContactType string
 	Reason      string
+}
+
+type NotificationManagerContactNotifyInput struct {
+	// description: ids or names of receiver
+	// required: false
+	// example: {"adfb720ccdd34c638346ea4fa7a713a8"}
+	ReceiverIds []string `json:"receiver_ids"`
+	// description: contact types
+	// required: false
+	// example: email
+	ContactTypes []string `json:"contact_type"`
+	// description: resource details
+	// required: ture
+
+	// description: ids  of robot
+	// required: false
+	// example: {"adfb720ccdd34c638346ea4fa7a713a8"}
+	RobotIds []string `json:"robot_ids"`
+	RoleIds  []string `json:"role_ids"`
+	Subject  string
+	Body     string
 }

@@ -17,13 +17,13 @@ package compute
 import (
 	"yunion.io/x/onecloud/cmd/climc/shell"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
-	"yunion.io/x/onecloud/pkg/mcclient/options"
+	options "yunion.io/x/onecloud/pkg/mcclient/options/compute"
 )
 
 func init() {
 	cmd := shell.NewResourceCmd(&modules.NetworkAddresses).WithContextManager(&modules.Wires)
-	cmd.BatchCreate(&options.NetworkAddressCreateOptions{})
+	// cmd.BatchCreate(&options.NetworkAddressCreateOptions{})
 	cmd.List(&options.NetworkAddressListOptions{})
 	cmd.Show(&options.NetworkAddressIdOptions{})
-	cmd.Delete(&options.NetworkAddressIdOptions{})
+	cmd.BatchDelete(&options.NetworkAddressIdsOptions{})
 }

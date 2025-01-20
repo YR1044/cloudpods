@@ -67,6 +67,10 @@ message Nic {
   bool link_up = 24;
   int64 mtu = 25;
   string name = 26;
+  bool is_default = 27;
+  string ip6 = 28;
+  int32 masklen6 = 29;
+  string gateway6 = 30;
 }
 
 message VDDKConInfo {
@@ -88,6 +92,7 @@ message DeployInfo {
   bool enable_cloud_init = 8;
   string login_account = 9;
   Telegraf telegraf = 10;
+  string user_data = 11;
 }
 
 message Telegraf {
@@ -141,10 +146,19 @@ message ResizeFsParams {
   VDDKConInfo vddk_info = 3;
 }
 
+message FsExt4Features {
+  bool CaseInsensitive = 1;
+}
+
+message FsFeatures {
+  FsExt4Features ext4 = 1;
+}
+
 message FormatFsParams {
   DiskInfo disk_info = 1;
   string fs_format = 2;
   string uuid = 3;
+  FsFeatures fs_features = 4;
 }
 
 message ReleaseInfo {

@@ -115,8 +115,19 @@ func init() {
 	cmd.Perform("qga-set-password", &options.ServerQgaSetPassword{})
 	cmd.Perform("qga-command", &options.ServerQgaCommand{})
 	cmd.Perform("qga-ping", &options.ServerQgaPing{})
+	cmd.Perform("qga-guest-info-task", &options.ServerQgaGuestInfoTask{})
+	cmd.Perform("qga-get-network", &options.ServerQgaGetNetwork{})
 	cmd.Perform("set-password", &options.ServerSetPasswordOptions{})
 	cmd.Perform("set-boot-index", &options.ServerSetBootIndexOptions{})
+	cmd.Perform("reset-nic-traffic-limit", &options.ServerNicTrafficLimitOptions{})
+	cmd.Perform("set-nic-traffic-limit", &options.ServerNicTrafficLimitOptions{})
+	cmd.Perform("add-sub-ips", &options.ServerAddSubIpsOptions{})
+	cmd.Perform("update-sub-ips", &options.ServerUpdateSubIpsOptions{})
+	cmd.BatchPerform("set-os-info", &options.ServerSetOSInfoOptions{})
+	cmd.BatchPerform("start-rescue", &options.ServerStartOptions{})
+	cmd.BatchPerform("stop-rescue", &options.ServerStartOptions{})
+	cmd.BatchPerform("sync-os-info", &options.ServerIdsOptions{})
+	cmd.BatchPerform("set-root-disk-matcher", &options.ServerSetRootDiskMatcher{})
 
 	cmd.Get("vnc", new(options.ServerVncOptions))
 	cmd.Get("desc", new(options.ServerIdOptions))
@@ -130,6 +141,7 @@ func init() {
 	cmd.Get("cpuset-cores", new(options.ServerIdOptions))
 	cmd.Get("sshport", new(options.ServerIdOptions))
 	cmd.Get("qemu-info", new(options.ServerIdOptions))
+	cmd.Get("hardware-info", new(options.ServerIdOptions))
 
 	cmd.GetProperty(&options.ServerStatusStatisticsOptions{})
 	cmd.GetProperty(&options.ServerProjectStatisticsOptions{})
@@ -296,11 +308,6 @@ func init() {
 	})
 
 	R(&options.ServerLoginInfoOptions{}, "server-logininfo", "Get login info of a server", func(s *mcclient.ClientSession, opts *options.ServerLoginInfoOptions) error {
-		srvid, e := modules.Servers.GetId(s, opts.ID, nil)
-		if e != nil {
-			return e
-		}
-
 		params := jsonutils.NewDict()
 		if len(opts.Key) > 0 {
 			privateKey, e := ioutil.ReadFile(opts.Key)
@@ -310,7 +317,7 @@ func init() {
 			params.Add(jsonutils.NewString(string(privateKey)), "private_key")
 		}
 
-		i, e := modules.Servers.GetLoginInfo(s, srvid, params)
+		i, e := modules.Servers.PerformAction(s, opts.ID, "login-info", params)
 		if e != nil {
 			return e
 		}
@@ -396,10 +403,15 @@ func init() {
 	type ServerRemoveExtraOption struct {
 		ID  string `help:"ID or name of server"`
 		KEY string `help:"Option key"`
+
+		Value string `help:"Option value"`
 	}
 	R(&ServerRemoveExtraOption{}, "server-remove-extra-options", "Remove server extra options", func(s *mcclient.ClientSession, args *ServerRemoveExtraOption) error {
 		params := jsonutils.NewDict()
 		params.Add(jsonutils.NewString(args.KEY), "key")
+		if len(args.Value) > 0 {
+			params.Add(jsonutils.NewString(args.Value), "value")
+		}
 		result, err := modules.Servers.PerformAction(s, args.ID, "del-extra-option", params)
 		if err != nil {
 			return err
@@ -857,7 +869,7 @@ func init() {
 			privateKey = string(key)
 		}
 
-		i, e := modules.Servers.GetLoginInfo(s, srvid, params)
+		i, e := modules.Servers.PerformAction(s, srvid, "login-info", params)
 		if e != nil {
 			return e
 		}

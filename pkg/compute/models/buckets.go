@@ -151,7 +151,7 @@ func (manager *SBucketManager) syncBuckets(ctx context.Context, userCred mcclien
 	}
 	if !xor {
 		for i := 0; i < len(commondb); i += 1 {
-			err = commondb[i].syncWithCloudBucket(ctx, userCred, commonext[i], provider, false)
+			err = commondb[i].SyncWithCloudBucket(ctx, userCred, commonext[i], false)
 			if err != nil {
 				syncResult.UpdateError(err)
 			} else {
@@ -238,14 +238,14 @@ func (manager *SBucketManager) newFromCloudBucket(
 		return nil, err
 	}
 
-	SyncCloudProject(ctx, userCred, &bucket, provider.GetOwnerId(), extBucket, provider.Id)
+	SyncCloudProject(ctx, userCred, &bucket, provider.GetOwnerId(), extBucket, provider)
 	notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
 		Obj:    &bucket,
 		Action: notifyclient.ActionSyncCreate,
 	})
 	bucket.SyncShareState(ctx, userCred, provider.getAccountShareInfo())
 
-	syncVirtualResourceMetadata(ctx, userCred, &bucket, extBucket)
+	syncVirtualResourceMetadata(ctx, userCred, &bucket, extBucket, false)
 	db.OpsLog.LogEvent(&bucket, db.ACT_CREATE, bucket.GetShortDesc(ctx), userCred)
 
 	return &bucket, nil
@@ -274,11 +274,10 @@ func (bucket *SBucket) GetShortDesc(ctx context.Context) *jsonutils.JSONDict {
 	return desc
 }
 
-func (bucket *SBucket) syncWithCloudBucket(
+func (bucket *SBucket) SyncWithCloudBucket(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
 	extBucket cloudprovider.ICloudBucket,
-	provider *SCloudprovider,
 	statsOnly bool,
 ) error {
 	oStats := bucket.getStats()
@@ -291,6 +290,11 @@ func (bucket *SBucket) syncWithCloudBucket(
 		bucket.ObjectCnt = stats.ObjectCount
 		if bucket.ObjectCnt < 0 {
 			bucket.ObjectCnt = 0
+		}
+
+		created := extBucket.GetCreatedAt()
+		if !created.IsZero() {
+			bucket.CreatedAt = created
 		}
 
 		if !statsOnly {
@@ -318,7 +322,9 @@ func (bucket *SBucket) syncWithCloudBucket(
 		return errors.Wrap(err, "db.UpdateWithLock")
 	}
 
-	syncVirtualResourceMetadata(ctx, userCred, bucket, extBucket)
+	if account := bucket.GetCloudaccount(); account != nil {
+		syncVirtualResourceMetadata(ctx, userCred, bucket, extBucket, account.ReadOnly)
+	}
 
 	db.OpsLog.LogSyncUpdate(bucket, diff, userCred)
 	if len(diff) > 0 {
@@ -332,8 +338,9 @@ func (bucket *SBucket) syncWithCloudBucket(
 		db.OpsLog.LogEvent(bucket, api.BUCKET_OPS_STATS_CHANGE, bucket.GetShortDesc(ctx), userCred)
 	}
 
+	provider := bucket.GetCloudprovider()
 	if provider != nil {
-		SyncCloudProject(ctx, userCred, bucket, provider.GetOwnerId(), extBucket, provider.Id)
+		SyncCloudProject(ctx, userCred, bucket, provider.GetOwnerId(), extBucket, provider)
 		bucket.SyncShareState(ctx, userCred, provider.getAccountShareInfo())
 	}
 
@@ -397,7 +404,7 @@ func (bucket *SBucket) StartBucketDeleteTask(ctx context.Context, userCred mccli
 		log.Errorf("%s", err)
 		return err
 	}
-	bucket.SetStatus(userCred, api.CLOUD_PROVIDER_START_DELETE, "StartBucketDeleteTask")
+	bucket.SetStatus(ctx, userCred, api.CLOUD_PROVIDER_START_DELETE, "StartBucketDeleteTask")
 	task.ScheduleRun(nil)
 	return nil
 }
@@ -439,12 +446,12 @@ func (manager *SBucketManager) ValidateCreateData(
 ) (api.BucketCreateInput, error) {
 	var err error
 	var cloudRegionV *SCloudregion
-	cloudRegionV, input.CloudregionResourceInput, err = ValidateCloudregionResourceInput(userCred, input.CloudregionResourceInput)
+	cloudRegionV, input.CloudregionResourceInput, err = ValidateCloudregionResourceInput(ctx, userCred, input.CloudregionResourceInput)
 	if err != nil {
 		return input, errors.Wrap(err, "ValidateCloudregionResourceInput")
 	}
 	var managerV *SCloudprovider
-	managerV, input.CloudproviderResourceInput, err = ValidateCloudproviderResourceInput(userCred, input.CloudproviderResourceInput)
+	managerV, input.CloudproviderResourceInput, err = ValidateCloudproviderResourceInput(ctx, userCred, input.CloudproviderResourceInput)
 	if err != nil {
 		return input, errors.Wrap(err, "ValidateCloudproviderResourceInput")
 	}
@@ -514,10 +521,10 @@ func (bucket *SBucket) PostCreate(
 		}
 	}
 
-	bucket.SetStatus(userCred, api.BUCKET_STATUS_START_CREATE, "PostCreate")
+	bucket.SetStatus(ctx, userCred, api.BUCKET_STATUS_START_CREATE, "PostCreate")
 	task, err := taskman.TaskManager.NewTask(ctx, "BucketCreateTask", bucket, userCred, nil, "", "", nil)
 	if err != nil {
-		bucket.SetStatus(userCred, api.BUCKET_STATUS_CREATE_FAIL, errors.Wrapf(err, "NewTask").Error())
+		bucket.SetStatus(ctx, userCred, api.BUCKET_STATUS_CREATE_FAIL, errors.Wrapf(err, "NewTask").Error())
 		return
 	}
 	task.ScheduleRun(nil)
@@ -567,9 +574,9 @@ func (bucket *SBucket) RemoteCreate(ctx context.Context, userCred mcclient.Token
 			logclient.AddSimpleActionLog(bucket, logclient.ACT_UPDATE_TAGS, err, userCred, false)
 		}
 	}
-	err = bucket.syncWithCloudBucket(ctx, userCred, extBucket, nil, false)
+	err = bucket.SyncWithCloudBucket(ctx, userCred, extBucket, false)
 	if err != nil {
-		return errors.Wrap(err, "bucket.syncWithCloudBucket")
+		return errors.Wrap(err, "SyncWithCloudBucket")
 	}
 	return nil
 }
@@ -722,14 +729,6 @@ func (manager *SBucketManager) OrderByExtraFields(
 	return q, nil
 }
 
-func (bucket *SBucket) AllowGetDetailsObjects(
-	ctx context.Context,
-	userCred mcclient.TokenCredential,
-	input api.BucketGetObjectsInput,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
 // 获取bucket的对象列表
 //
 // 获取bucket的对象列表
@@ -763,7 +762,7 @@ func (bucket *SBucket) GetDetailsObjects(
 	}
 	objects, nextMarker, err := cloudprovider.GetPagedObjects(iBucket, prefix, isRecursive, marker, int(limit))
 	if err != nil {
-		return output, httperrors.NewInternalServerError("fail to get objects: %s", err)
+		return output, err
 	}
 	for i := range objects {
 		output.Data = append(output.Data, cloudprovider.ICloudObject2Struct(objects[i]))
@@ -776,16 +775,6 @@ func (bucket *SBucket) GetDetailsObjects(
 	return output, nil
 }
 
-func (bucket *SBucket) AllowPerformTempUrl(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.BucketPerformTempUrlInput,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
-// 获取访问对象的临时URL
-//
 // 获取访问对象的临时URL
 func (bucket *SBucket) PerformTempUrl(
 	ctx context.Context,
@@ -828,16 +817,6 @@ func (bucket *SBucket) PerformTempUrl(
 	return output, nil
 }
 
-func (bucket *SBucket) AllowPerformMakedir(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	data jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
-// 新建对象目录
-//
 // 新建对象目录
 func (bucket *SBucket) PerformMakedir(
 	ctx context.Context,
@@ -894,19 +873,11 @@ func (bucket *SBucket) PerformMakedir(
 	db.OpsLog.LogEvent(bucket, db.ACT_MKDIR, key, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_MKDIR, key, userCred, true)
 
-	bucket.syncWithCloudBucket(ctx, userCred, iBucket, nil, true)
+	bucket.SyncWithCloudBucket(ctx, userCred, iBucket, true)
 
 	quotas.CancelPendingUsage(ctx, userCred, &pendingUsage, &pendingUsage, true)
 
 	return nil, nil
-}
-
-func (bucket *SBucket) AllowPerformDelete(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	data jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 // 删除对象
@@ -948,17 +919,9 @@ func (bucket *SBucket) PerformDelete(
 	db.OpsLog.LogEvent(bucket, db.ACT_DELETE_OBJECT, keyStrs, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_DELETE_OBJECT, keyStrs, userCred, true)
 
-	bucket.syncWithCloudBucket(ctx, userCred, iBucket, nil, true)
+	bucket.SyncWithCloudBucket(ctx, userCred, iBucket, true)
 
 	return modulebase.SubmitResults2JSON(results), nil
-}
-
-func (bucket *SBucket) AllowPerformUpload(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	data jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 // 上传对象
@@ -1066,21 +1029,13 @@ func (bucket *SBucket) PerformUpload(
 	db.OpsLog.LogEvent(bucket, db.ACT_UPLOAD_OBJECT, key, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_UPLOAD_OBJECT, key, userCred, true)
 
-	bucket.syncWithCloudBucket(ctx, userCred, iBucket, nil, true)
+	bucket.SyncWithCloudBucket(ctx, userCred, iBucket, true)
 
 	if !pendingUsage.IsEmpty() {
 		quotas.CancelPendingUsage(ctx, userCred, &pendingUsage, &pendingUsage, true)
 	}
 
 	return nil, nil
-}
-
-func (bucket *SBucket) AllowPerformAcl(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.BucketAclInput,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 // 设置对象和bucket的ACL
@@ -1116,7 +1071,7 @@ func (bucket *SBucket) PerformAcl(
 			return nil, httperrors.NewInternalServerError("setAcl error %s", err)
 		}
 
-		err = bucket.syncWithCloudBucket(ctx, userCred, iBucket, nil, false)
+		err = bucket.SyncWithCloudBucket(ctx, userCred, iBucket, false)
 		if err != nil {
 			return nil, httperrors.NewInternalServerError("syncWithCloudBucket error %s", err)
 		}
@@ -1142,14 +1097,6 @@ func (bucket *SBucket) PerformAcl(
 	}
 }
 
-func (bucket *SBucket) AllowPerformSyncstatus(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	data jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
 // 同步存储桶状态
 //
 // 同步存储桶状态
@@ -1171,14 +1118,6 @@ func (bucket *SBucket) PerformSyncstatus(
 	return nil, StartResourceSyncStatusTask(ctx, userCred, bucket, "BucketSyncstatusTask", "")
 }
 
-func (bucket *SBucket) AllowPerformSync(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	data jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
 func (bucket *SBucket) PerformSync(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -1196,16 +1135,12 @@ func (bucket *SBucket) PerformSync(
 		return nil, errors.Wrap(err, "GetIBucket")
 	}
 
-	err = bucket.syncWithCloudBucket(ctx, userCred, iBucket, nil, statsOnly)
+	err = bucket.SyncWithCloudBucket(ctx, userCred, iBucket, statsOnly)
 	if err != nil {
 		return nil, httperrors.NewInternalServerError("syncWithCloudBucket error %s", err)
 	}
 
 	return nil, nil
-}
-
-func (bucket *SBucket) ValidatePurgeCondition(ctx context.Context) error {
-	return bucket.SSharableVirtualResourceBase.ValidateDeleteCondition(ctx, nil)
 }
 
 func (bucket *SBucket) ValidateDeleteCondition(ctx context.Context, info jsonutils.JSONObject) error {
@@ -1215,15 +1150,7 @@ func (bucket *SBucket) ValidateDeleteCondition(ctx context.Context, info jsonuti
 	if bucket.ObjectCnt > 0 {
 		return httperrors.NewNotEmptyError("Buckets that are not empty do not support this operation")
 	}
-	return bucket.ValidatePurgeCondition(ctx)
-}
-
-func (bucket *SBucket) AllowGetDetailsAcl(
-	ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
+	return bucket.SSharableVirtualResourceBase.ValidateDeleteCondition(ctx, info)
 }
 
 // 获取对象或bucket的ACL
@@ -1259,14 +1186,6 @@ func (bucket *SBucket) GetDetailsAcl(
 	}
 	output.Acl = string(acl)
 	return output, nil
-}
-
-func (bucket *SBucket) AllowPerformSetWebsite(
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.BucketWebsiteConf,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 func (bucket *SBucket) PerformSetWebsite(
@@ -1307,14 +1226,6 @@ func (bucket *SBucket) PerformSetWebsite(
 	return nil, nil
 }
 
-func (bucket *SBucket) AllowPerformDeleteWebsite(
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.BucketWebsiteConf,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
 func (bucket *SBucket) PerformDeleteWebsite(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -1332,14 +1243,6 @@ func (bucket *SBucket) PerformDeleteWebsite(
 	db.OpsLog.LogEvent(bucket, db.ACT_DELETE_WEBSITE, "", userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_DELETE_WEBSITE, "", userCred, true)
 	return nil, nil
-}
-
-func (bucket *SBucket) AllowGetDetailsWebsite(
-	ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 func (bucket *SBucket) GetDetailsWebsite(
@@ -1373,14 +1276,6 @@ func (bucket *SBucket) GetDetailsWebsite(
 		})
 	}
 	return websiteConf, nil
-}
-
-func (bucket *SBucket) AllowPerformSetCors(
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.BucketCORSRules,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 func (bucket *SBucket) PerformSetCors(
@@ -1417,14 +1312,6 @@ func (bucket *SBucket) PerformSetCors(
 	return nil, nil
 }
 
-func (bucket *SBucket) AllowPerformDeleteCors(
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.BucketCORSRuleDeleteInput,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
 func (bucket *SBucket) PerformDeleteCors(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -1442,14 +1329,6 @@ func (bucket *SBucket) PerformDeleteCors(
 	db.OpsLog.LogEvent(bucket, db.ACT_DELETE_CORS, result, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_DELETE_CORS, result, userCred, true)
 	return nil, nil
-}
-
-func (bucket *SBucket) AllowGetDetailsCors(
-	ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 func (bucket *SBucket) GetDetailsCors(
@@ -1481,14 +1360,6 @@ func (bucket *SBucket) GetDetailsCors(
 	return rules, nil
 }
 
-func (bucket *SBucket) AllowGetDetailsCdnDomain(
-	ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
 func (bucket *SBucket) GetDetailsCdnDomain(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -1514,14 +1385,6 @@ func (bucket *SBucket) GetDetailsCdnDomain(
 		})
 	}
 	return domains, nil
-}
-
-func (bucket *SBucket) AllowPerformSetReferer(
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.BucketRefererConf,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 func (bucket *SBucket) PerformSetReferer(
@@ -1555,14 +1418,6 @@ func (bucket *SBucket) PerformSetReferer(
 	return nil, nil
 }
 
-func (bucket *SBucket) AllowGetDetailsReferer(
-	ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
 func (bucket *SBucket) GetDetailsReferer(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -1585,14 +1440,6 @@ func (bucket *SBucket) GetDetailsReferer(
 	}
 
 	return conf, nil
-}
-
-func (bucket *SBucket) AllowGetDetailsPolicy(
-	ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 func (bucket *SBucket) GetDetailsPolicy(
@@ -1626,14 +1473,6 @@ func (bucket *SBucket) GetDetailsPolicy(
 	return policy, nil
 }
 
-func (bucket *SBucket) AllowPerformSetPolicy(
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.BucketPolicyStatementInput,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
 func (bucket *SBucket) PerformSetPolicy(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -1664,14 +1503,6 @@ func (bucket *SBucket) PerformSetPolicy(
 	db.OpsLog.LogEvent(bucket, db.ACT_SET_POLICY, opts, userCred)
 	logclient.AddActionLogWithContext(ctx, bucket, logclient.ACT_SET_POLICY, opts, userCred, true)
 	return nil, nil
-}
-
-func (bucket *SBucket) AllowPerformDeletePolicy(
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.BucketPolicyDeleteInput,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 func (bucket *SBucket) PerformDeletePolicy(
@@ -1715,10 +1546,10 @@ type SBucketUsages struct {
 	DiskUsedRate float64
 }
 
-func (manager *SBucketManager) TotalCount(scope rbacscope.TRbacScope, ownerId mcclient.IIdentityProvider, rangeObjs []db.IStandaloneModel, providers []string, brands []string, cloudEnv string, policyResult rbacutils.SPolicyResult) SBucketUsages {
+func (manager *SBucketManager) TotalCount(ctx context.Context, scope rbacscope.TRbacScope, ownerId mcclient.IIdentityProvider, rangeObjs []db.IStandaloneModel, providers []string, brands []string, cloudEnv string, policyResult rbacutils.SPolicyResult) SBucketUsages {
 	usage := SBucketUsages{}
 	bq := manager.Query()
-	bq = db.ObjectIdQueryWithPolicyResult(bq, manager, policyResult)
+	bq = db.ObjectIdQueryWithPolicyResult(ctx, bq, manager, policyResult)
 	bq = scopeOwnerIdFilter(bq, scope, ownerId)
 	buckets := bq.SubQuery()
 	bucketsQ := buckets.Query(
@@ -1728,6 +1559,7 @@ func (manager *SBucketManager) TotalCount(scope rbacscope.TRbacScope, ownerId mc
 				buckets.Field("object_cnt"),
 			).Else(sqlchemy.NewConstField(0)),
 			"object_cnt1",
+			false,
 		),
 		sqlchemy.NewFunction(
 			sqlchemy.NewCase().When(
@@ -1735,6 +1567,7 @@ func (manager *SBucketManager) TotalCount(scope rbacscope.TRbacScope, ownerId mc
 				buckets.Field("size_bytes"),
 			).Else(sqlchemy.NewConstField(0)),
 			"size_bytes1",
+			false,
 		),
 		sqlchemy.NewFunction(
 			sqlchemy.NewCase().When(
@@ -1743,6 +1576,7 @@ func (manager *SBucketManager) TotalCount(scope rbacscope.TRbacScope, ownerId mc
 			).Else(
 				buckets.Field("size_bytes")),
 			"size_bytes_limit",
+			false,
 		),
 	)
 	bucketsQ = manager.usageQ(bucketsQ, rangeObjs, providers, brands, cloudEnv)
@@ -1761,14 +1595,6 @@ func (manager *SBucketManager) TotalCount(scope rbacscope.TRbacScope, ownerId mc
 		usage.DiskUsedRate = float64(usage.Bytes) / float64(usage.BytesLimit)
 	}
 	return usage
-}
-
-func (bucket *SBucket) AllowPerformLimit(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	data jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 func (bucket *SBucket) PerformLimit(
@@ -1815,14 +1641,6 @@ func (bucket *SBucket) PerformLimit(
 	return nil, nil
 }
 
-func (bucket *SBucket) AllowGetDetailsAccessInfo(
-	ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-) bool {
-	return bucket.IsOwner(userCred)
-}
-
 func (bucket *SBucket) GetDetailsAccessInfo(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -1861,14 +1679,6 @@ func (bucket *SBucket) GetUsages() []db.IUsage {
 	return []db.IUsage{
 		&usage,
 	}
-}
-
-func (bucket *SBucket) AllowPerformMetadata(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.BucketMetadataInput,
-) bool {
-	return bucket.IsOwner(userCred)
 }
 
 func (bucket *SBucket) PerformMetadata(
@@ -1931,7 +1741,10 @@ func (bucket *SBucket) processObjectsActionInput(ctx context.Context, input api.
 }
 
 func (bucket *SBucket) OnMetadataUpdated(ctx context.Context, userCred mcclient.TokenCredential) {
-	if len(bucket.ExternalId) == 0 {
+	if len(bucket.ExternalId) == 0 || options.Options.KeepTagLocalization {
+		return
+	}
+	if account := bucket.GetCloudaccount(); account != nil && account.ReadOnly {
 		return
 	}
 	iBucket, err := bucket.GetIBucket(ctx)
@@ -1950,7 +1763,11 @@ func (bucket *SBucket) OnMetadataUpdated(ctx context.Context, userCred mcclient.
 	if diff.IsChanged() {
 		logclient.AddSimpleActionLog(bucket, logclient.ACT_UPDATE_TAGS, diff, userCred, true)
 	}
-	syncVirtualResourceMetadata(ctx, userCred, bucket, iBucket)
+	readOnly := false
+	if account := bucket.GetCloudaccount(); account != nil {
+		readOnly = account.ReadOnly
+	}
+	syncVirtualResourceMetadata(ctx, userCred, bucket, iBucket, readOnly)
 }
 
 func (manager *SBucketManager) ListItemExportKeys(ctx context.Context,

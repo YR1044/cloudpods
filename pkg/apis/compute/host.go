@@ -15,6 +15,8 @@
 package compute
 
 import (
+	"time"
+
 	cloudmux "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/jsonutils"
 
@@ -69,6 +71,7 @@ type HostListInput struct {
 
 	StorageFilterListInput
 	UsableResourceListInput
+	BackupstorageFilterListInput
 
 	// filter by ResourceType
 	ResourceType string `json:"resource_type"`
@@ -99,8 +102,10 @@ type HostListInput struct {
 	CpuCount []int `json:"cpu_count"`
 	// 内存大小,单位Mb
 	MemSize []int `json:"mem_size"`
-	// 存储类型
+	// 存储类型(磁盘类型，sdd, rotate, hybrid)
 	StorageType []string `json:"storage_type"`
+	// 宿主机绑定存储类型
+	HostStorageType []string `json:"host_storage_type"`
 	// IPMI地址
 	IpmiIp []string `json:"ipmi_ip"`
 	// 宿主机状态
@@ -129,7 +134,7 @@ type HostListInput struct {
 	OsArch          []string `json:"os_arch"`
 
 	// 按虚拟机数量排序
-	// enum: asc,desc
+	// enum: ["asc","desc"]
 	OrderByServerCount string `json:"order_by_server_count"`
 	// 按存储大小排序
 	// enmu: asc,desc
@@ -146,6 +151,18 @@ type HostListInput struct {
 	// 按内存超分率排序
 	// enmu: asc,desc
 	OrderByMemCommitRate string `json:"order_by_mem_commit_rate"`
+
+	// 按本地存储分配大小排序
+	// enmu: asc,desc
+	OrderByStorageUsed string `json:"order_by_storage_used"`
+
+	// 按cpu分配大小排序
+	// enmu: asc,desc
+	OrderByCpuCommit string `json:"order_by_cpu_commit"`
+
+	// 按内存分配大小排序
+	// enmu: asc,desc
+	OrderByMemCommit string `json:"order_by_mem_commit"`
 }
 
 type HostDetails struct {
@@ -172,6 +189,9 @@ type HostDetails struct {
 	// 云主机数量
 	// example: 10
 	Guests int `json:"guests,allowempty"`
+	// 主备云主机数量
+	// example: 10
+	BackupGuests int `json:"backup_guests,allowempty"`
 	// 非系统云主机数量
 	// example: 0
 	NonsystemGuests int `json:"nonsystem_guests,allowempty"`
@@ -220,9 +240,11 @@ type HostDetails struct {
 	AutoMigrateOnHostShutdown bool `json:"auto_migrate_on_host_shutdown"`
 
 	// reserved resource for isolated device
-	ReservedResourceForGpu IsolatedDeviceReservedResourceInput `json:"reserved_resource_for_gpu"`
+	ReservedResourceForGpu *IsolatedDeviceReservedResourceInput `json:"reserved_resource_for_gpu"`
 	// isolated device count
-	IsolatedDeviceCount int
+	IsolatedDeviceCount     int
+	IsolatedDeviceTypeCount map[string]int
+	GuestPinnedCpus         []int
 
 	// host init warnning
 	SysWarn string `json:"sys_warn"`
@@ -251,7 +273,8 @@ func (self HostDetails) GetMetricTags() map[string]string {
 		"account_id":     self.AccountId,
 		"external_id":    self.ExternalId,
 	}
-	return ret
+
+	return AppendMetricTags(ret, self.MetadataResourceInfo)
 }
 
 func (self HostDetails) GetMetricPairs() map[string]string {
@@ -282,11 +305,21 @@ type HostResourceInfo struct {
 	// 宿主机状态
 	HostStatus string `json:"host_status"`
 
+	HostResourceType string `json:"host_resource_type"`
+
+	// 宿主机计费类型
+	HostBillingType string `json:"host_billing_type"`
+
 	// 宿主机服务状态`
 	HostServiceStatus string `json:"host_service_status"`
 
 	// 宿主机类型
 	HostType string `json:"host_type"`
+
+	// 宿主机管理IP
+	HostAccessIp string `json:"host_access_ip"`
+	// 宿主机公网IP（如果有）
+	HostEIP string `json:"host_eip"`
 }
 
 type HostFilterListInput struct {
@@ -300,7 +333,10 @@ type HostFilterListInputBase struct {
 	HostResourceInput
 
 	// 以宿主机序列号过滤
-	HostSN string `json:"host_sn"`
+	HostSN []string `json:"host_sn"`
+
+	// 以宿主机对接二层网络过滤
+	HostWireId string `json:"host_wire_id"`
 
 	// 以宿主机名称排序
 	OrderByHost string `json:"order_by_host"`
@@ -343,6 +379,9 @@ type HostAccessAttributes struct {
 	AccessNet string `json:"access_net"`
 	// 物理机管理口二次网络
 	AccessWire string `json:"access_wire"`
+
+	// 公网IP
+	PublicIp *string `json:"public_ip"`
 }
 
 type HostSizeAttributes struct {
@@ -394,7 +433,7 @@ type HostIpmiAttributes struct {
 	// presence
 	IpmiPresent *bool `json:"ipmi_present"`
 	// lan channel
-	IpmiLanChannel *int `json:"ipmi_lan_channel"`
+	IpmiLanChannel *uint8 `json:"ipmi_lan_channel"`
 	// verified
 	IpmiVerified *bool `json:"ipmi_verified"`
 	// Redfish API support
@@ -495,6 +534,8 @@ type HostUpdateInput struct {
 
 	// 主机启动模式, 可能值位PXE和ISO
 	BootMode string `json:"boot_mode"`
+
+	EnableNumaAllocate *bool `json:"enable_numa_allocate"`
 }
 
 type HostOfflineInput struct {
@@ -517,12 +558,15 @@ type SHostPingInput struct {
 	RootPartitionUsedCapacityMb int `json:"root_partition_used_capacity_mb"`
 
 	StorageStats []SHostStorageStat `json:"storage_stats"`
+
+	QgaRunningGuestIds []string `json:"qga_running_guests"`
 }
 
 type HostReserveCpusInput struct {
 	Cpus                    string
 	Mems                    string
-	DisableSchedLoadBalance *bool `json:"disable_sched_load_balance"`
+	DisableSchedLoadBalance *bool    `json:"disable_sched_load_balance"`
+	ProcessesPrefix         []string `json:"processes_prefix"`
 }
 
 type HostAutoMigrateInput struct {
@@ -550,7 +594,7 @@ type HostAddNetifInput struct {
 
 	NicType cloudmux.TNicType `json:"nic_type"`
 
-	Index int8 `json:"index"`
+	Index int `json:"index"`
 
 	LinkUp string `json:"link_up"`
 
@@ -578,7 +622,7 @@ type HostEnableNetifInput struct {
 
 	AllocDir string `json:"alloc_dir"`
 
-	NetType string `json:"net_type"`
+	NetType TNetworkType `json:"net_type"`
 
 	Reserve *bool `json:"reserve"`
 
@@ -595,4 +639,33 @@ type HostRemoveNetifInput struct {
 	HostNetifInput
 
 	Reserve *bool `json:"reserve"`
+}
+
+type HostError struct {
+	Type    string
+	Id      string
+	Name    string
+	Content string
+	Time    time.Time
+}
+
+type HostSyncErrorsInput struct {
+	HostErrors []HostError
+}
+
+type HostLoginInfoInput struct {
+}
+
+type HostLoginInfoOutput struct {
+	Ip       string `json:"ip"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type HostPerformStartInput struct {
+}
+
+type HostSetCommitBoundInput struct {
+	CpuCmtbound *float32
+	MemCmtbound *float32
 }

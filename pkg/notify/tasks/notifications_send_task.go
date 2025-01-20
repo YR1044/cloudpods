@@ -45,9 +45,9 @@ func init() {
 func (self *NotificationSendTask) taskFailed(ctx context.Context, notification *models.SNotification, reason string, all bool) {
 	log.Errorf("fail to send notification %q", notification.GetId())
 	if all {
-		notification.SetStatus(self.UserCred, apis.NOTIFICATION_STATUS_FAILED, reason)
+		notification.SetStatus(ctx, self.UserCred, apis.NOTIFICATION_STATUS_FAILED, reason)
 	} else {
-		notification.SetStatus(self.UserCred, apis.NOTIFICATION_STATUS_PART_OK, reason)
+		notification.SetStatus(ctx, self.UserCred, apis.NOTIFICATION_STATUS_PART_OK, reason)
 	}
 	notification.AddOne()
 	logclient.AddActionLogWithContext(ctx, notification, logclient.ACT_SEND_NOTIFICATION, reason, self.UserCred, false)
@@ -70,6 +70,7 @@ var notificationGroupLock sync.Mutex
 func init() {
 	notificationGroupLock = sync.Mutex{}
 }
+
 func (self *NotificationSendTask) OnInit(ctx context.Context, obj db.IStandaloneModel, body jsonutils.JSONObject) {
 	notification := obj.(*models.SNotification)
 	if notification.Status == apis.NOTIFICATION_STATUS_OK {
@@ -88,7 +89,7 @@ func (self *NotificationSendTask) OnInit(ctx context.Context, obj db.IStandalone
 			return
 		}
 	}
-	notification.SetStatus(self.UserCred, apis.NOTIFICATION_STATUS_SENDING, "")
+	notification.SetStatus(ctx, self.UserCred, apis.NOTIFICATION_STATUS_SENDING, "")
 
 	// build contactMap
 	receivers := make([]ReceiverSpec, 0)
@@ -242,7 +243,7 @@ func (self *NotificationSendTask) OnInit(ctx context.Context, obj db.IStandalone
 		self.taskFailed(ctx, notification, strings.Join(failedRecord, "; "), false)
 		return
 	}
-	notification.SetStatus(self.UserCred, apis.NOTIFICATION_STATUS_OK, "")
+	notification.SetStatus(ctx, self.UserCred, apis.NOTIFICATION_STATUS_OK, "")
 	logclient.AddActionLogWithContext(ctx, notification, logclient.ACT_SEND_NOTIFICATION, "", self.UserCred, true)
 	self.SetStageComplete(ctx, nil)
 }
@@ -264,6 +265,7 @@ func (notificationSendTask *NotificationSendTask) batchSend(ctx context.Context,
 			params.Header = robot.Header
 			params.Body = robot.Body
 			params.MsgKey = robot.MsgKey
+			params.GroupTimes = uint(receivers[i].rNotificaion.GroupTimes)
 			err = driver.Send(ctx, params)
 			if err != nil {
 				fails = append(fails, FailedReceiverSpec{ReceiverSpec: receivers[i], Reason: err.Error()})
@@ -271,6 +273,7 @@ func (notificationSendTask *NotificationSendTask) batchSend(ctx context.Context,
 		} else if receivers[i].receiver.IsReceiver() {
 			receiver := receivers[i].receiver.(*models.SReceiver)
 			params.Receivers.Contact, _ = receiver.GetContact(notification.ContactType)
+			params.GroupTimes = uint(receivers[i].rNotificaion.GroupTimes)
 			driver := models.GetDriver(notification.ContactType)
 			if notification.ContactType == apis.EMAIL {
 				params.EmailMsg = apis.SEmailMessage{
@@ -285,6 +288,7 @@ func (notificationSendTask *NotificationSendTask) batchSend(ctx context.Context,
 				params.Receivers.Contact = mobile
 			}
 			params.ReceiverId = receiver.Id
+			params.SendTime = time.Now().Truncate(time.Second)
 			if len(params.GroupKey) > 0 && params.GroupTimes > 0 {
 				notificationGroupLock.Lock()
 				if _, ok := notificationSendMap.Load(params.GroupKey + receiver.Id + notification.ContactType); ok {
@@ -325,8 +329,8 @@ func createTimeTicker(ctx context.Context, driver models.ISenderDriver, params a
 		GroupKey:    params.GroupKey,
 		ReceiverId:  receiverId,
 		ContactType: contactType,
-		StartTime:   time.Now(),
-		EndTime:     time.Now().Add(time.Duration(params.GroupTimes) * time.Minute),
+		StartTime:   params.SendTime,
+		EndTime:     params.SendTime.Add(time.Duration(params.GroupTimes) * time.Minute),
 	})
 
 	// 启动一个goroutine来处理计时器触发的事件
@@ -346,8 +350,7 @@ func createTimeTicker(ctx context.Context, driver models.ISenderDriver, params a
 				log.Errorln("TaskSend err:", err)
 				return
 			}
-			driverT := models.GetDriver(contactType)
-			driverT.Send(ctx, *sendParams)
+			driver.Send(ctx, *sendParams)
 			notificationSendMap.Delete(params.GroupKey + receiverId + contactType)
 		}
 	}()

@@ -100,10 +100,6 @@ func (h *SHost) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
 	return in, nil
 }
 
-func (h *SHost) GetIWires() ([]cloudprovider.ICloudWire, error) {
-	return nil, nil
-}
-
 func (h *SHost) GetIStorages() ([]cloudprovider.ICloudStorage, error) {
 	return h.zone.GetIStorages()
 }
@@ -158,7 +154,7 @@ func (h *SHost) GetMemSizeMB() int {
 	return 0
 }
 
-func (h *SHost) GetStorageSizeMB() int {
+func (h *SHost) GetStorageSizeMB() int64 {
 	return 0
 }
 
@@ -182,6 +178,6 @@ func (h *SHost) CreateVM(desc *cloudprovider.SManagedVMCreateConfig) (cloudprovi
 	return nil, cloudprovider.ErrNotImplemented
 }
 
-func (h *SHost) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
-	return nil, cloudprovider.ErrNotSupported
+func (host *SHost) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
+	return nil, nil
 }

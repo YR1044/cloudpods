@@ -101,15 +101,19 @@ type SDiskInfo struct {
 	StorageExternalId string
 	StorageType       string
 	SizeGB            int
+	Iops              int
 	Name              string
+	// aws gp3 only
+	Throughput int
 }
 
 type GuestDiskCreateOptions struct {
-	SizeMb    int
-	UUID      string
-	Driver    string
-	Idx       int
-	StorageId string
+	SizeMb        int
+	UUID          string
+	Driver        string
+	Idx           int
+	StorageId     string
+	Preallocation string `choices:"off|metadata|full|falloc"`
 }
 
 const (
@@ -148,8 +152,8 @@ type SManagedVMCreateConfig struct {
 	Description         string
 	SysDisk             SDiskInfo
 	DataDisks           []SDiskInfo
+	KeypairName         string
 	PublicKey           string
-	ExternalSecgroupId  string
 	ExternalSecgroupIds []string
 	Account             string
 	Password            string
@@ -167,10 +171,18 @@ type SManagedVMCreateConfig struct {
 	UserDataType                    string
 	WindowsUserDataType             string
 	IsWindowsUserDataTypeNeedEncode bool
+
+	IsolateDevices []SIsolateDevice
+}
+
+type SIsolateDevice struct {
+	Id   string
+	Name string
 }
 
 type SManagedVMChangeConfig struct {
 	Cpu          int
+	CpuSocket    int
 	MemoryMB     int
 	InstanceType string
 }
@@ -182,6 +194,7 @@ type SManagedVMRebuildRootConfig struct {
 	PublicKey string
 	SysSizeGB int
 	OsType    string
+	UserData  string
 }
 
 func (vmConfig *SManagedVMCreateConfig) GetConfig(config *jsonutils.JSONDict) error {
@@ -332,6 +345,9 @@ type ServerVncOutput struct {
 	Protocol string `json:"protocol"`
 	Port     int64  `json:"port"`
 
+	// volcengine
+	Region string `json:"region"`
+
 	Url          string `json:"url"`
 	InstanceId   string `json:"instance_id"`
 	InstanceName string `json:"instance_name"`
@@ -345,5 +361,23 @@ type ServerVncOutput struct {
 	ConnectParams string `json:"connect_params"`
 	Session       string `json:"session"`
 
+	// sangfor
+	Cookie string `json:"cookie"`
+
 	Hypervisor string `json:"hypervisor"`
+}
+
+type SInstanceUpdateOptions struct {
+	NAME        string
+	HostName    string
+	Description string
+}
+
+type SInstanceDeployOptions struct {
+	Username      string
+	Password      string
+	PublicKey     string
+	KeypairName   string
+	DeleteKeypair bool
+	UserData      string
 }

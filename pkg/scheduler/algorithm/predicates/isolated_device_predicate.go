@@ -38,10 +38,40 @@ func (f *IsolatedDevicePredicate) Clone() core.FitPredicate {
 
 func (f *IsolatedDevicePredicate) PreExecute(ctx context.Context, u *core.Unit, cs []core.Candidater) (bool, error) {
 	data := u.SchedData()
-	if len(data.IsolatedDevices) == 0 {
+
+	if data.ResetCpuNumaPin {
 		return false, nil
 	}
-	return true, nil
+
+	if len(data.IsolatedDevices) > 0 {
+		return true, nil
+	}
+	networks := data.Networks
+	for i := 0; i < len(networks); i++ {
+		if networks[i].SriovDevice != nil {
+			return true, nil
+		}
+	}
+	disks := data.Disks
+	for i := 0; i < len(disks); i++ {
+		if disks[i].NVMEDevice != nil {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *IsolatedDevicePredicate) getIsolatedDeviceCountByType(getter core.CandidatePropertyGetter, devType string) int {
+	devs := getter.UnusedIsolatedDevicesByType(devType)
+	if devType != compute.CONTAINER_DEV_NVIDIA_MPS {
+		return len(devs)
+	} else {
+		devMap := map[string]struct{}{}
+		for _, dev := range devs {
+			devMap[dev.DevicePath] = struct{}{}
+		}
+		return len(devMap)
+	}
 }
 
 func (f *IsolatedDevicePredicate) Execute(ctx context.Context, u *core.Unit, c core.Candidater) (bool, []core.PredicateFailureReason, error) {
@@ -104,7 +134,7 @@ func (f *IsolatedDevicePredicate) Execute(ctx context.Context, u *core.Unit, c c
 		}
 	}
 	for devType, reqCount := range devTypeRequest {
-		freeCount := len(getter.UnusedIsolatedDevicesByType(devType))
+		freeCount := f.getIsolatedDeviceCountByType(getter, devType)
 		if freeCount < reqCount {
 			h.Exclude(fmt.Sprintf("IsolatedDevice type %q not enough, request: %d, hostFree: %d", devType, reqCount, freeCount))
 			return h.GetResult()
@@ -129,6 +159,25 @@ func (f *IsolatedDevicePredicate) Execute(ctx context.Context, u *core.Unit, c c
 			return h.GetResult()
 		}
 		cap := freeCount / reqCount
+		if int64(cap) < minCapacity {
+			minCapacity = int64(cap)
+		}
+	}
+
+	// check host device by device_path
+	devicePathReq := make(map[string]int, 0)
+	for _, dev := range reqIsoDevs {
+		if len(dev.DevicePath) != 0 {
+			devicePathReq[dev.DevicePath] += 1
+		}
+	}
+	for devPath, reqCnt := range devicePathReq {
+		freeCount := len(getter.UnusedIsolatedDevicesByDevicePath(devPath))
+		if freeCount < reqCount {
+			h.Exclude(fmt.Sprintf("IsolatedDevice device_path %q not enough, request: %d, hostFree: %d", devPath, reqCount, freeCount))
+			return h.GetResult()
+		}
+		cap := freeCount / reqCnt
 		if int64(cap) < minCapacity {
 			minCapacity = int64(cap)
 		}

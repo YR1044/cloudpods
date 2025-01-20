@@ -25,7 +25,6 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
-	"sync"
 	"time"
 
 	xj "github.com/basgys/goxml2json"
@@ -62,6 +61,8 @@ var (
 
 	defaultDcId = "esxi-default-datacenter"
 )
+
+var _ cloudprovider.ICloudRegion = (*SESXiClient)(nil)
 
 func init() {
 	defaultDc.ManagedEntity.Name = "Datacenter"
@@ -115,15 +116,17 @@ func (cfg *ESXiClientConfig) Managed(managed bool) *ESXiClientConfig {
 type SESXiClient struct {
 	*ESXiClientConfig
 
-	cloudprovider.SFakeOnPremiseRegion
 	multicloud.SRegion
+	multicloud.SRegionEipBase
 	multicloud.SNoObjectStorageRegion
+	multicloud.SRegionLbBase
 
 	client  *govmomi.Client
 	context context.Context
 
-	datacenters     []*SDatacenter
-	networkQueryMap *sync.Map
+	datacenters []*SDatacenter
+
+	fakeVpc *sFakeVpc
 }
 
 func NewESXiClient(cfg *ESXiClientConfig) (*SESXiClient, error) {
@@ -140,6 +143,10 @@ func NewESXiClient2(cfg *ESXiClientConfig) (*SESXiClient, error) {
 	err := cli.connect()
 	if err != nil {
 		return nil, err
+	}
+
+	cli.fakeVpc = &sFakeVpc{
+		client: cli,
 	}
 
 	if !cli.IsVCenter() {
@@ -234,7 +241,7 @@ func (cli *SESXiClient) connect() error {
 				KeepAlive: 30 * time.Second,
 			}).DialContext,
 		}
-		httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+		httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response) error, error) {
 			if cli.debug {
 				dump, _ := httputil.DumpRequestOut(req, false)
 				yellow(string(dump))
@@ -244,7 +251,7 @@ func (cli *SESXiClient) connect() error {
 					cyan("CURL:", curlCmd, "\n")
 				}
 			}
-			respCheck := func(resp *http.Response) {
+			respCheck := func(resp *http.Response) error {
 				if cli.debug {
 					dump, _ := httputil.DumpResponse(resp, true)
 					body := string(dump)
@@ -262,6 +269,7 @@ func (cli *SESXiClient) connect() error {
 						red(body)
 					}
 				}
+				return nil
 			}
 			return respCheck, nil
 		})
@@ -302,6 +310,7 @@ func (cli *SESXiClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 		return nil, err
 	}
 	subAccount := cloudprovider.SSubAccount{
+		Id:           cli.GetGlobalId(),
 		Account:      cli.account,
 		Name:         cli.cpcfg.Name,
 		HealthStatus: api.CLOUD_PROVIDER_HEALTH_NORMAL,
@@ -424,7 +433,7 @@ func (cli *SESXiClient) scanAllMObjects(props []string, dst interface{}) error {
 }
 
 func (cli *SESXiClient) SearchVM(id string) (*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["summary.config.uuid"] = id
 	var movms []mo.VirtualMachine
 	err := cli.scanMObjectsWithFilter(cli.client.ServiceContent.RootFolder, VIRTUAL_MACHINE_PROPS, &movms, filter)
@@ -444,20 +453,20 @@ func (cli *SESXiClient) SearchVM(id string) (*SVirtualMachine, error) {
 }
 
 func (cli *SESXiClient) SearchTemplateVM(id string) (*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	uuid := toTemplateUuid(id)
 	filter["summary.config.uuid"] = uuid
 	var movms []mo.VirtualMachine
 	err := cli.scanMObjectsWithFilter(cli.client.ServiceContent.RootFolder, VIRTUAL_MACHINE_PROPS, &movms, filter)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "scanMObjectsWithFilter")
 	}
 	if len(movms) == 0 {
-		return nil, errors.ErrNotFound
+		return nil, errors.Wrapf(errors.ErrNotFound, "empty templates")
 	}
 	vm := NewVirtualMachine(cli, &movms[0], nil)
 	if !vm.IsTemplate() {
-		return nil, errors.ErrNotFound
+		return nil, errors.Wrapf(errors.ErrNotFound, "%s is not template", vm.GetName())
 	}
 	dc, err := vm.fetchDatacenter()
 	if err != nil {
@@ -467,7 +476,7 @@ func (cli *SESXiClient) SearchTemplateVM(id string) (*SVirtualMachine, error) {
 	return vm, nil
 }
 
-func (cli *SESXiClient) scanMObjectsWithFilter(folder types.ManagedObjectReference, props []string, dst interface{}, filter property.Filter) error {
+func (cli *SESXiClient) scanMObjectsWithFilter(folder types.ManagedObjectReference, props []string, dst interface{}, filter property.Match) error {
 	dstValue := reflect.Indirect(reflect.ValueOf(dst))
 	dstType := dstValue.Type()
 	dstEleType := dstType.Elem()
@@ -494,6 +503,17 @@ func (cli *SESXiClient) scanMObjectsWithFilter(folder types.ManagedObjectReferen
 	return nil
 }
 
+func fixProps(props []string) []string {
+	for _, key := range []string{
+		"name", "parent",
+	} {
+		if !utils.IsInArray(key, props) {
+			props = append(props, key)
+		}
+	}
+	return props
+}
+
 func (cli *SESXiClient) scanMObjects(folder types.ManagedObjectReference, props []string, dst interface{}) error {
 	dstValue := reflect.Indirect(reflect.ValueOf(dst))
 	dstType := dstValue.Type()
@@ -509,7 +529,7 @@ func (cli *SESXiClient) scanMObjects(folder types.ManagedObjectReference, props 
 
 	defer v.Destroy(cli.context)
 
-	err = v.Retrieve(cli.context, []string{resType}, props, dst)
+	err = v.Retrieve(cli.context, []string{resType}, fixProps(props), dst)
 	if err != nil {
 		return errors.Wrapf(err, "v.Retrieve %s", resType)
 	}
@@ -519,17 +539,16 @@ func (cli *SESXiClient) scanMObjects(folder types.ManagedObjectReference, props 
 
 func (cli *SESXiClient) references2Objects(refs []types.ManagedObjectReference, props []string, dst interface{}) error {
 	pc := property.DefaultCollector(cli.client.Client)
-	err := pc.Retrieve(cli.context, refs, props, dst)
+	err := pc.Retrieve(cli.context, refs, fixProps(props), dst)
 	if err != nil {
-		log.Errorf("pc.Retrieve fail %s", err)
-		return err
+		return errors.Wrapf(err, "Retrieve")
 	}
 	return nil
 }
 
 func (cli *SESXiClient) reference2Object(ref types.ManagedObjectReference, props []string, dst interface{}) error {
 	pc := property.DefaultCollector(cli.client.Client)
-	err := pc.RetrieveOne(cli.context, ref, props, dst)
+	err := pc.RetrieveOne(cli.context, ref, fixProps(props), dst)
 	if err != nil {
 		return errors.Wrap(err, "pc.RetrieveOne")
 	}
@@ -624,8 +643,7 @@ func (cli *SESXiClient) IsHostIpExists(hostIp string) (bool, error) {
 
 	hostRef, err := searchIndex.FindByIp(cli.context, nil, cli.getPrivateId(hostIp), false)
 	if err != nil {
-		log.Errorf("searchIndex.FindByIp fail %s", err)
-		return false, err
+		return false, errors.Wrapf(err, "FindByIp %s", hostIp)
 	}
 	if hostRef == nil {
 		return false, nil
@@ -638,8 +656,7 @@ func (cli *SESXiClient) FindHostByIp(hostIp string) (*SHost, error) {
 
 	hostRef, err := searchIndex.FindByIp(cli.context, nil, cli.getPrivateId(hostIp), false)
 	if err != nil {
-		log.Errorf("searchIndex.FindByIp fail %s", err)
-		return nil, errors.Wrap(err, "searchIndex.FindByIp")
+		return nil, errors.Wrapf(err, "FindByIp %s", hostIp)
 	}
 
 	if hostRef == nil {
@@ -649,8 +666,7 @@ func (cli *SESXiClient) FindHostByIp(hostIp string) (*SHost, error) {
 	var host mo.HostSystem
 	err = cli.reference2Object(hostRef.Reference(), HOST_SYSTEM_PROPS, &host)
 	if err != nil {
-		log.Errorf("reference2Object fail %s", err)
-		return nil, errors.Wrap(err, "cli.reference2Object")
+		return nil, errors.Wrapf(err, "reference2Object %s", hostIp)
 	}
 
 	h := NewHost(cli, &host, nil)
@@ -677,7 +693,7 @@ func (cli *SESXiClient) GetCapabilities() []string {
 	caps := []string{
 		cloudprovider.CLOUD_CAPABILITY_PROJECT,
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
-		// cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_NETWORK,
 		// cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
 		// cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
 		// cloudprovider.CLOUD_CAPABILITY_RDS,

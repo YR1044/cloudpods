@@ -36,6 +36,9 @@ type STimer struct {
 	Minute int `nullable:"false"`
 	// 0-23
 	Hour int `nullable:"false"`
+
+	CycleNum int `nullable:"false"`
+
 	// 0-7 1 is Monday 0 is unlimited
 	WeekDays uint8 `nullable:"false"`
 	// 0-31 0 is unlimited
@@ -98,9 +101,32 @@ func (st *STimer) Update(now time.Time) {
 				suitTime.Minute(), 0, 0, suitTime.Location())
 			break
 		}
+	case st.CycleNum != 0:
+		switch st.Type {
+		case api.TIMER_TYPE_HOUR:
+			newNextTime = time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), 0, 0, time.UTC).In(now.Location())
+			if now.After(newNextTime) {
+				newNextTime = newNextTime.Add(time.Duration(st.CycleNum) * time.Hour)
+			}
+		case api.TIMER_TYPE_DAY:
+			newNextTime = time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), 0, 0, time.UTC).In(now.Location())
+			if now.After(newNextTime) {
+				newNextTime = newNextTime.AddDate(0, 0, st.CycleNum)
+			}
+		case api.TIMER_TYPE_WEEK:
+			newNextTime = time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), 0, 0, time.UTC).In(now.Location())
+			if now.After(newNextTime) {
+				newNextTime = newNextTime.AddDate(0, 0, st.CycleNum*7)
+			}
+		case api.TIMER_TYPE_MONTH:
+			newNextTime = time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), 0, 0, time.UTC).In(now.Location())
+			if now.After(newNextTime) {
+				newNextTime = newNextTime.AddDate(0, st.CycleNum, 0)
+			}
+		}
+
 	default:
 		// day
-
 	}
 	log.Debugf("The final NextTime: %s", newNextTime)
 	st.NextTime = newNextTime
@@ -172,13 +198,13 @@ func init() {
 	timerDescTable.Set("timerLang", i18n.NewTableEntry().EN("en").CN("cn"))
 }
 
-func (st *STimer) Description(ctx context.Context, zone *time.Location) string {
+func (st *STimer) Description(ctx context.Context, createdAt time.Time, zone *time.Location) string {
 	lang := timerDescTable.Lookup(ctx, TIMERLANG)
 	switch lang {
 	case "en":
-		return st.descEnglish(zone)
+		return st.descEnglish(createdAt, zone)
 	case "cn":
-		return st.descChinese(zone)
+		return st.descChinese(createdAt, zone)
 	}
 	return ""
 }
@@ -188,14 +214,19 @@ var (
 	wdsEN = []string{"", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
 )
 
-func (st *STimer) descChinese(zone *time.Location) string {
+func (st *STimer) descChinese(createdAt time.Time, zone *time.Location) string {
 	format := "2006-01-02 15:04:05"
 	var prefix string
 	switch st.Type {
 	case api.TIMER_TYPE_ONCE:
 		return fmt.Sprintf("单次 %s触发", st.StartTime.In(zone).Format(format))
+	case api.TIMER_TYPE_HOUR:
+		prefix = fmt.Sprintf("每%d小时", st.CycleNum)
 	case api.TIMER_TYPE_DAY:
 		prefix = "每天"
+		if st.CycleNum > 0 {
+			prefix = fmt.Sprintf("每%d天", st.CycleNum)
+		}
 	case api.TIMER_TYPE_WEEK:
 		wds := st.GetWeekDays()
 		weekDays := make([]string, len(wds))
@@ -203,6 +234,9 @@ func (st *STimer) descChinese(zone *time.Location) string {
 			weekDays[i] = fmt.Sprintf("星期%s", wdsCN[wds[i]])
 		}
 		prefix = fmt.Sprintf("每周 【%s】", strings.Join(weekDays, "｜"))
+		if st.CycleNum > 0 {
+			prefix = fmt.Sprintf("每%d周", st.CycleNum)
+		}
 	case api.TIMER_TYPE_MONTH:
 		mns := st.GetMonthDays()
 		monthDays := make([]string, len(mns))
@@ -210,6 +244,12 @@ func (st *STimer) descChinese(zone *time.Location) string {
 			monthDays[i] = fmt.Sprintf("%d号", mns[i])
 		}
 		prefix = fmt.Sprintf("每月 【%s】", strings.Join(monthDays, "｜"))
+		if st.CycleNum > 0 {
+			prefix = fmt.Sprintf("每%d月", st.CycleNum)
+		}
+	}
+	if st.CycleNum > 0 {
+		return fmt.Sprintf("%s同步一次，开始时间：%s,有效时间为%s至%s", prefix, createdAt.In(zone).Format(format), st.StartTime.In(zone).Format(format), st.EndTime.In(zone).Format(format))
 	}
 	return fmt.Sprintf("%s %s触发 有效时间为%s至%s", prefix, st.hourMinutesDesc(zone), st.StartTime.In(zone).Format(format), st.EndTime.In(zone).Format(format))
 }
@@ -220,18 +260,35 @@ func (st *STimer) hourMinutesDesc(zone *time.Location) string {
 	return fmt.Sprintf("%02d:%02d", t.Hour(), t.Minute())
 }
 
-func (st *STimer) descEnglish(zone *time.Location) string {
+func (st *STimer) descEnglish(createdAt time.Time, zone *time.Location) string {
 	var detail string
 	format := "2006-01-02 15:04:05"
 	switch st.Type {
 	case api.TIMER_TYPE_ONCE:
 		return st.EndTime.In(zone).Format(format)
+	case api.TIMER_TYPE_HOUR:
+		detail = fmt.Sprintf("every %d hours", st.CycleNum)
 	case api.TIMER_TYPE_DAY:
-		detail = fmt.Sprintf("%s every day", st.hourMinutesDesc(zone))
+		if st.CycleNum > 0 {
+			detail = fmt.Sprintf("every %d days", st.CycleNum)
+		} else {
+			detail = fmt.Sprintf("%s every day", st.hourMinutesDesc(zone))
+		}
 	case api.TIMER_TYPE_WEEK:
-		detail = st.weekDaysDesc(zone)
+		if st.CycleNum > 0 {
+			detail = fmt.Sprintf("every %d weeks", st.CycleNum)
+		} else {
+			detail = st.weekDaysDesc(zone)
+		}
 	case api.TIMER_TYPE_MONTH:
-		detail = st.monthDaysDesc(zone)
+		if st.CycleNum > 0 {
+			detail = fmt.Sprintf("every %d months", st.CycleNum)
+		} else {
+			detail = st.monthDaysDesc(zone)
+		}
+	}
+	if st.CycleNum > 0 {
+		return fmt.Sprintf("Execute %s, start at:%s , from %s to %s", detail, createdAt.In(zone).Format(format), st.StartTime.In(zone).Format(format), st.EndTime.In(zone).Format(format))
 	}
 	if st.EndTime.IsZero() {
 		return detail
@@ -304,16 +361,22 @@ func checkCycleTimerCreateInput(in api.CycleTimerCreateInput) (api.CycleTimerCre
 		return in, fmt.Errorf("hour should between 0 and 23")
 	}
 	switch in.CycleType {
+	case api.TIMER_TYPE_HOUR:
+		if in.CycleNum <= 0 || in.CycleNum >= 24 {
+			return in, fmt.Errorf("hour cycle_num should between 1 and 23")
+		}
+		in.WeekDays = []int{}
+		in.MonthDays = []int{}
 	case api.TIMER_TYPE_DAY:
 		in.WeekDays = []int{}
 		in.MonthDays = []int{}
 	case api.TIMER_TYPE_WEEK:
-		if len(in.WeekDays) == 0 {
+		if len(in.WeekDays) == 0 && in.CycleNum == 0 {
 			return in, fmt.Errorf("week_days should not be empty")
 		}
 		in.MonthDays = []int{}
 	case api.TIMER_TYPE_MONTH:
-		if len(in.MonthDays) == 0 {
+		if len(in.MonthDays) == 0 && in.CycleNum == 0 {
 			return in, fmt.Errorf("month_days should not be empty")
 		}
 		in.WeekDays = []int{}

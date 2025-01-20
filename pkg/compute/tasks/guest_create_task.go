@@ -25,6 +25,7 @@ import (
 	"yunion.io/x/pkg/util/billing"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	imageapi "yunion.io/x/onecloud/pkg/apis/image"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
@@ -42,8 +43,8 @@ func init() {
 
 func (self *GuestCreateTask) OnInit(ctx context.Context, obj db.IStandaloneModel, body jsonutils.JSONObject) {
 	guest := obj.(*models.SGuest)
-	guest.SetStatus(self.UserCred, api.VM_CREATE_NETWORK, "")
-	self.SetStage("on_wait_guest_networks_ready", nil)
+	guest.SetStatus(ctx, self.UserCred, api.VM_CREATE_NETWORK, "")
+	self.SetStage("OnWaitGuestNetworksReady", nil)
 	self.OnWaitGuestNetworksReady(ctx, obj, nil)
 }
 
@@ -59,18 +60,22 @@ func (self *GuestCreateTask) OnWaitGuestNetworksReady(ctx context.Context, obj d
 }
 
 func (self *GuestCreateTask) OnGuestNetworkReady(ctx context.Context, guest *models.SGuest) {
-	guest.SetStatus(self.UserCred, api.VM_CREATE_DISK, "")
+	guest.SetStatus(ctx, self.UserCred, api.VM_CREATE_DISK, "")
 	self.SetStage("OnDiskPrepared", nil)
-	err := guest.GetDriver().RequestGuestCreateAllDisks(ctx, guest, self)
+	drv, err := guest.GetDriver()
+	if err != nil {
+		self.OnDiskPreparedFailed(ctx, guest, jsonutils.NewString(err.Error()))
+		return
+	}
+	err = drv.RequestGuestCreateAllDisks(ctx, guest, self)
 	if err != nil {
 		msg := fmt.Sprintf("unable to RequestGuestCreateAllDisks: %v", err)
 		self.OnDiskPreparedFailed(ctx, guest, jsonutils.NewString(msg))
 	}
 }
 
-func (self *GuestCreateTask) OnDiskPreparedFailed(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
-	guest := obj.(*models.SGuest)
-	guest.SetStatus(self.UserCred, api.VM_DISK_FAILED, "allocation failed")
+func (self *GuestCreateTask) OnDiskPreparedFailed(ctx context.Context, guest *models.SGuest, data jsonutils.JSONObject) {
+	guest.SetStatus(ctx, self.UserCred, api.VM_DISK_FAILED, "allocation failed")
 	db.OpsLog.LogEvent(guest, db.ACT_ALLOCATE_FAIL, data, self.UserCred)
 	logclient.AddActionLogWithStartable(self, guest, logclient.ACT_ALLOCATE, data, self.UserCred, false)
 	notifyclient.EventNotify(ctx, self.GetUserCred(), notifyclient.SEventNotifyParam{
@@ -82,8 +87,52 @@ func (self *GuestCreateTask) OnDiskPreparedFailed(ctx context.Context, obj db.IS
 	self.SetStageFailed(ctx, data)
 }
 
-func (self *GuestCreateTask) OnDiskPrepared(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
-	guest := obj.(*models.SGuest)
+func (self *GuestCreateTask) OnDiskPrepared(ctx context.Context, guest *models.SGuest, data jsonutils.JSONObject) {
+	secgroups, err := guest.GetSecgroups()
+	if err != nil {
+		self.OnSecurityGroupPreparedFailed(ctx, guest, jsonutils.NewString(errors.Wrapf(err, "GetSecgroups").Error()))
+		return
+	}
+	if len(secgroups) == 0 {
+		self.OnSecurityGroupPrepared(ctx, guest, nil)
+		return
+	}
+
+	vpc, err := guest.GetVpc()
+	if err != nil {
+		self.OnSecurityGroupPreparedFailed(ctx, guest, jsonutils.NewString(errors.Wrapf(err, "GetVpc").Error()))
+		return
+	}
+	region, err := vpc.GetRegion()
+	if err != nil {
+		self.OnSecurityGroupPreparedFailed(ctx, guest, jsonutils.NewString(errors.Wrapf(err, "GetRegion").Error()))
+		return
+	}
+
+	self.SetStage("OnSecurityGroupPrepared", nil)
+	err = region.GetDriver().RequestPrepareSecurityGroups(ctx, self.UserCred, guest.GetOwnerId(), secgroups, vpc, func(ids []string) error {
+		return guest.SaveSecgroups(ctx, self.UserCred, ids)
+	}, self)
+	if err != nil {
+		self.OnSecurityGroupPreparedFailed(ctx, guest, jsonutils.NewString(err.Error()))
+		return
+	}
+}
+
+func (self *GuestCreateTask) OnSecurityGroupPreparedFailed(ctx context.Context, guest *models.SGuest, data jsonutils.JSONObject) {
+	guest.SetStatus(ctx, self.UserCred, api.VM_SECURITY_GROUP_FAILED, "prepare security group failed")
+	db.OpsLog.LogEvent(guest, db.ACT_ALLOCATE_FAIL, data, self.UserCred)
+	logclient.AddActionLogWithStartable(self, guest, logclient.ACT_ALLOCATE, data, self.UserCred, false)
+	notifyclient.EventNotify(ctx, self.GetUserCred(), notifyclient.SEventNotifyParam{
+		Obj:    guest,
+		Action: notifyclient.ActionCreate,
+		IsFail: true,
+	})
+
+	self.SetStageFailed(ctx, data)
+}
+
+func (self *GuestCreateTask) OnSecurityGroupPrepared(ctx context.Context, guest *models.SGuest, data jsonutils.JSONObject) {
 	cdrom, _ := self.Params.GetString("cdrom")
 	var bootIndex *int8
 	if self.Params.Contains("cdrom_boot_index") {
@@ -93,25 +142,41 @@ func (self *GuestCreateTask) OnDiskPrepared(ctx context.Context, obj db.IStandal
 	}
 
 	if len(cdrom) > 0 {
+		image, err := models.CachedimageManager.GetImageInfo(ctx, self.UserCred, cdrom, false)
+		if err != nil {
+			log.Errorf("failed get image %s info: %s", cdrom, err)
+		} else {
+			imagePros := map[string]interface{}{}
+			for _, k := range []string{imageapi.IMAGE_OS_ARCH, imageapi.IMAGE_OS_DISTRO, imageapi.IMAGE_OS_VERSION, imageapi.IMAGE_OS_TYPE} {
+				if v, ok := image.Properties[k]; ok {
+					imagePros[k] = v
+				}
+			}
+			guest.SetAllMetadata(ctx, imagePros, self.UserCred)
+		}
 		self.SetStage("OnCdromPrepared", nil)
-		guest.GetDriver().RequestGuestCreateInsertIso(ctx, cdrom, bootIndex, self, guest)
+		drv, err := guest.GetDriver()
+		if err != nil {
+			self.OnCdromPreparedFailed(ctx, guest, jsonutils.NewString(err.Error()))
+			return
+		}
+		drv.RequestGuestCreateInsertIso(ctx, cdrom, bootIndex, self, guest)
 	} else {
-		self.OnCdromPrepared(ctx, obj, data)
+		self.OnCdromPrepared(ctx, guest, data)
 	}
 }
 
-func (self *GuestCreateTask) OnCdromPrepared(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
-	guest := obj.(*models.SGuest)
+func (self *GuestCreateTask) OnCdromPrepared(ctx context.Context, guest *models.SGuest, data jsonutils.JSONObject) {
 	log.Infof("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
 	log.Infof("DEPLOY GUEST %s", guest.Name)
 	log.Infof("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
-	guest.SetStatus(self.UserCred, api.VM_DEPLOYING, "")
+	guest.SetStatus(ctx, self.UserCred, api.VM_DEPLOYING, "")
 	self.StartDeployGuest(ctx, guest)
 }
 
 func (self *GuestCreateTask) OnCdromPreparedFailed(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
 	guest := obj.(*models.SGuest)
-	guest.SetStatus(self.UserCred, api.VM_DISK_FAILED, "")
+	guest.SetStatus(ctx, self.UserCred, api.VM_DISK_FAILED, "")
 	db.OpsLog.LogEvent(guest, db.ACT_ALLOCATE_FAIL, data, self.UserCred)
 	logclient.AddActionLogWithStartable(self, guest, logclient.ACT_ALLOCATE, data, self.UserCred, false)
 	notifyclient.EventNotify(ctx, self.GetUserCred(), notifyclient.SEventNotifyParam{
@@ -129,11 +194,6 @@ func (self *GuestCreateTask) StartDeployGuest(ctx context.Context, guest *models
 
 func (self *GuestCreateTask) OnDeployGuestDescComplete(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
 	guest := obj.(*models.SGuest)
-	// sync capacityUsed for storage
-	// err := guest.SyncCapacityUsedForStorage(ctx, nil)
-	// if err != nil {
-	// 	log.Errorf("unable to SyncCapacityUsedForStorage: %v", err)
-	// }
 
 	// bind eip
 	{
@@ -184,7 +244,7 @@ func (self *GuestCreateTask) notifyServerCreated(ctx context.Context, guest *mod
 
 func (self *GuestCreateTask) OnDeployGuestDescCompleteFailed(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
 	guest := obj.(*models.SGuest)
-	guest.SetStatus(self.UserCred, api.VM_DEPLOY_FAILED, "deploy_failed")
+	guest.SetStatus(ctx, self.UserCred, api.VM_DEPLOY_FAILED, "deploy_failed")
 	db.OpsLog.LogEvent(guest, db.ACT_ALLOCATE_FAIL, data, self.UserCred)
 	notifyclient.EventNotify(ctx, self.GetUserCred(), notifyclient.SEventNotifyParam{
 		Obj:    guest,
@@ -218,17 +278,19 @@ func (self *GuestCreateTask) OnDeployEipComplete(ctx context.Context, obj db.ISt
 	}
 
 	if jsonutils.QueryBoolean(self.GetParams(), "auto_start", false) {
-		self.SetStage("on_auto_start_guest", nil)
-		guest.StartGueststartTask(ctx, self.GetUserCred(), nil, self.GetTaskId())
+		self.SetStage("OnAutoStartGuest", nil)
+		params := jsonutils.NewDict()
+		params.Set("start_from_create", jsonutils.JSONTrue)
+		guest.StartGueststartTask(ctx, self.GetUserCred(), params, self.GetTaskId())
 	} else {
-		self.SetStage("on_sync_status_complete", nil)
+		self.SetStage("OnSyncStatusComplete", nil)
 		guest.StartSyncstatus(ctx, self.GetUserCred(), self.GetTaskId())
 	}
 }
 
 func (self *GuestCreateTask) OnDeployEipCompleteFailed(ctx context.Context, obj db.IStandaloneModel, data jsonutils.JSONObject) {
 	guest := obj.(*models.SGuest)
-	guest.SetStatus(self.UserCred, api.INSTANCE_ASSOCIATE_EIP_FAILED, "deploy_failed")
+	guest.SetStatus(ctx, self.UserCred, api.INSTANCE_ASSOCIATE_EIP_FAILED, "deploy_failed")
 	db.OpsLog.LogEvent(guest, db.ACT_EIP_ATTACH, data, self.UserCred)
 	logclient.AddActionLogWithStartable(self, guest, logclient.ACT_EIP_ASSOCIATE, data, self.UserCred, false)
 	notifyclient.NotifySystemErrorWithCtx(ctx, guest.Id, guest.Name, api.INSTANCE_ASSOCIATE_EIP_FAILED, data.String())

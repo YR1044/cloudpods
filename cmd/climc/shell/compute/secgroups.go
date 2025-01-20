@@ -17,7 +17,8 @@ package compute
 import (
 	"yunion.io/x/onecloud/cmd/climc/shell"
 	modules "yunion.io/x/onecloud/pkg/mcclient/modules/compute"
-	"yunion.io/x/onecloud/pkg/mcclient/options"
+	baseoptions "yunion.io/x/onecloud/pkg/mcclient/options"
+	options "yunion.io/x/onecloud/pkg/mcclient/options/compute"
 )
 
 func init() {
@@ -25,15 +26,13 @@ func init() {
 	cmd.List(&options.SecgroupListOptions{})
 	cmd.Create(&options.SecgroupCreateOptions{})
 	cmd.Show(&options.SecgroupIdOptions{})
-	cmd.Update(&options.BaseUpdateOptions{})
+	cmd.Update(&baseoptions.BaseUpdateOptions{})
 	cmd.Delete(&options.SecgroupIdOptions{})
-	cmd.Perform("merge", &options.SecgroupMergeOptions{})
 	cmd.Perform("public", &options.SecgroupIdOptions{})
+	cmd.Perform("syncstatus", &options.SecgroupIdOptions{})
 	cmd.Perform("private", &options.SecgroupIdOptions{})
 	cmd.Perform("add-rule", &options.SecgroupsAddRuleOptions{})
-	cmd.Perform("cache-secgroup", &options.SecurityGroupCacheOptions{})
-	cmd.Perform("uncache-secgroup", &options.SecurityGroupUncacheSecurityGroup{})
-	cmd.Perform("purge", &options.SecgroupIdOptions{})
 	cmd.Perform("change-owner", &options.SecgroupChangeOwnerOptions{})
 	cmd.Perform("import-rules", &options.SecgroupImportRulesOptions{})
+	cmd.PerformClass("clean", &options.SecgroupCleanOptions{})
 }

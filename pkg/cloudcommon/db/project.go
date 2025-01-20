@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/rbacscope"
 	"yunion.io/x/pkg/util/reflectutils"
@@ -51,7 +52,7 @@ func (model *SProjectizedResourceBase) GetOwnerId() mcclient.IIdentityProvider {
 	return &owner
 }
 
-func (manager *SProjectizedResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+func (manager *SProjectizedResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
 	if owner != nil {
 		switch scope {
 		case rbacscope.ScopeProject:
@@ -61,7 +62,7 @@ func (manager *SProjectizedResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery
 				if !result.ObjectTags.IsEmpty() {
 					policyTagFilters := tagutils.STagFilters{}
 					policyTagFilters.AddFilters(result.ObjectTags)
-					q = ObjectIdQueryWithTagFilters(q, "id", man.Keyword(), policyTagFilters)
+					q = ObjectIdQueryWithTagFilters(ctx, q, "id", man.Keyword(), policyTagFilters)
 				}
 			}
 		case rbacscope.ScopeDomain:
@@ -71,12 +72,12 @@ func (manager *SProjectizedResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery
 				if !result.ProjectTags.IsEmpty() {
 					policyTagFilters := tagutils.STagFilters{}
 					policyTagFilters.AddFilters(result.ProjectTags)
-					q = ObjectIdQueryWithTagFilters(q, "tenant_id", "project", policyTagFilters)
+					q = ObjectIdQueryWithTagFilters(ctx, q, "tenant_id", "project", policyTagFilters)
 				}
 				if !result.ObjectTags.IsEmpty() {
 					policyTagFilters := tagutils.STagFilters{}
 					policyTagFilters.AddFilters(result.ObjectTags)
-					q = ObjectIdQueryWithTagFilters(q, "id", man.Keyword(), policyTagFilters)
+					q = ObjectIdQueryWithTagFilters(ctx, q, "id", man.Keyword(), policyTagFilters)
 				}
 			}
 		case rbacscope.ScopeSystem:
@@ -85,17 +86,17 @@ func (manager *SProjectizedResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery
 				if !result.DomainTags.IsEmpty() {
 					policyTagFilters := tagutils.STagFilters{}
 					policyTagFilters.AddFilters(result.DomainTags)
-					q = ObjectIdQueryWithTagFilters(q, "domain_id", "domain", policyTagFilters)
+					q = ObjectIdQueryWithTagFilters(ctx, q, "domain_id", "domain", policyTagFilters)
 				}
 				if !result.ProjectTags.IsEmpty() {
 					policyTagFilters := tagutils.STagFilters{}
 					policyTagFilters.AddFilters(result.ProjectTags)
-					q = ObjectIdQueryWithTagFilters(q, "tenant_id", "project", policyTagFilters)
+					q = ObjectIdQueryWithTagFilters(ctx, q, "tenant_id", "project", policyTagFilters)
 				}
 				if !result.ObjectTags.IsEmpty() {
 					policyTagFilters := tagutils.STagFilters{}
 					policyTagFilters.AddFilters(result.ObjectTags)
-					q = ObjectIdQueryWithTagFilters(q, "id", man.Keyword(), policyTagFilters)
+					q = ObjectIdQueryWithTagFilters(ctx, q, "id", man.Keyword(), policyTagFilters)
 				}
 			}
 		}
@@ -161,7 +162,7 @@ func (manager *SProjectizedResourceBaseManager) ListItemFilter(
 	if !query.NoProjectTags.IsEmpty() {
 		tagFilters.AddNoFilters(query.NoProjectTags)
 	}
-	q = ObjectIdQueryWithTagFilters(q, "tenant_id", "project", tagFilters)
+	q = ObjectIdQueryWithTagFilters(ctx, q, "tenant_id", "project", tagFilters)
 	return q, nil
 }
 
@@ -189,12 +190,14 @@ func (manager *SProjectizedResourceBaseManager) FetchCustomizeColumns(
 	isList bool,
 ) []apis.ProjectizedResourceInfo {
 	ret := make([]apis.ProjectizedResourceInfo, len(objs))
+	resIds := make([]string, len(objs))
 	if len(fields) == 0 || fields.Contains("project_domain") || fields.Contains("tenant") {
 		projectIds := stringutils2.SSortedStrings{}
 		for i := range objs {
 			var base *SProjectizedResourceBase
 			reflectutils.FindAnonymouStructPointer(objs[i], &base)
 			if base != nil && len(base.ProjectId) > 0 {
+				resIds[i] = getObjectIdstr("project", base.ProjectId)
 				projectIds = stringutils2.Append(projectIds, base.ProjectId)
 			}
 		}
@@ -216,6 +219,26 @@ func (manager *SProjectizedResourceBaseManager) FetchCustomizeColumns(
 			}
 		}
 	}
+
+	if fields == nil || fields.Contains("__meta__") {
+		q := Metadata.Query("id", "key", "value")
+		metaKeyValues := make(map[string][]SMetadata)
+		err := FetchQueryObjectsByIds(q, "id", resIds, &metaKeyValues)
+		if err != nil {
+			log.Errorf("FetchQueryObjectsByIds metadata fail %s", err)
+			return ret
+		}
+
+		for i := range objs {
+			if metaList, ok := metaKeyValues[resIds[i]]; ok {
+				ret[i].ProjectMetadata = map[string]string{}
+				for _, meta := range metaList {
+					ret[i].ProjectMetadata[meta.Key] = meta.Value
+				}
+			}
+		}
+	}
+
 	domainRows := manager.SDomainizedResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
 	for i := range ret {
 		ret[i].DomainizedResourceInfo = domainRows[i]
@@ -274,7 +297,8 @@ func ValidateProjectizedResourceInput(ctx context.Context, input apis.Projectize
 }
 
 func (manager *SProjectizedResourceBaseManager) ListItemExportKeys(ctx context.Context, q *sqlchemy.SQuery, userCred mcclient.TokenCredential, keys stringutils2.SSortedStrings) (*sqlchemy.SQuery, error) {
-	q, err := manager.SDomainizedResourceBaseManager.ListItemExportKeys(ctx, q, userCred, keys)
+	var err error
+	q, err = manager.SDomainizedResourceBaseManager.ListItemExportKeys(ctx, q, userCred, keys)
 	if err != nil {
 		return nil, errors.Wrap(err, "SDomainizedResourceBaseManager.ListItemExportKeys")
 	}

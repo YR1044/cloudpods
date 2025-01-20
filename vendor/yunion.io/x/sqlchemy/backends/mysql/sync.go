@@ -32,32 +32,47 @@ func (mysql *SMySQLBackend) CommitTableChangeSQL(ts sqlchemy.ITableSpec, changes
 	}
 
 	alters := make([]string, 0)
+
 	// first check if primary key is modifed
 	changePrimary := false
-	// oldHasPrimary := false
 	for _, col := range changes.RemoveColumns {
 		if col.IsPrimary() {
 			changePrimary = true
-			// oldHasPrimary = true
+			break
 		}
 	}
-	for _, cols := range changes.UpdatedColumns {
-		if cols.OldCol.IsPrimary() != cols.NewCol.IsPrimary() {
-			changePrimary = true
-		}
-		// if cols.OldCol.IsPrimary() {
-		//	oldHasPrimary = true
-		// }
-	}
-	for _, col := range changes.AddColumns {
-		if col.IsPrimary() {
-			changePrimary = true
+	if !changePrimary {
+		for _, cols := range changes.UpdatedColumns {
+			if cols.OldCol.IsPrimary() != cols.NewCol.IsPrimary() {
+				changePrimary = true
+				break
+			}
 		}
 	}
+	if !changePrimary {
+		for _, col := range changes.AddColumns {
+			if col.IsPrimary() {
+				changePrimary = true
+				break
+			}
+		}
+	}
+	// in case of a primary key change, we first need to drop primary key.
+	// BUT if a mysql table has no primary key at all,
+	// exec drop primary key will cause error
 	if changePrimary {
-		sql := fmt.Sprintf("DROP PRIMARY KEY")
-		alters = append(alters, sql)
+		oldHasPrimary := false
+		for _, col := range changes.OldColumns {
+			if col.IsPrimary() {
+				oldHasPrimary = true
+				break
+			}
+		}
+		if oldHasPrimary {
+			alters = append(alters, "DROP PRIMARY KEY")
+		}
 	}
+
 	/* IGNORE DROP STATEMENT */
 	for _, col := range changes.RemoveColumns {
 		sql := fmt.Sprintf("DROP COLUMN `%s`", col.Name())
@@ -84,8 +99,13 @@ func (mysql *SMySQLBackend) CommitTableChangeSQL(ts sqlchemy.ITableSpec, changes
 		}
 	}
 	for _, cols := range changes.UpdatedColumns {
-		sql := fmt.Sprintf("MODIFY COLUMN %s", cols.NewCol.DefinitionString())
-		alters = append(alters, sql)
+		if cols.OldCol.Name() != cols.NewCol.Name() {
+			sql := fmt.Sprintf("CHANGE COLUMN `%s` %s", cols.OldCol.Name(), cols.NewCol.DefinitionString())
+			alters = append(alters, sql)
+		} else {
+			sql := fmt.Sprintf("MODIFY COLUMN %s", cols.NewCol.DefinitionString())
+			alters = append(alters, sql)
+		}
 	}
 	for _, col := range changes.AddColumns {
 		sql := fmt.Sprintf("ADD COLUMN %s", col.DefinitionString())
@@ -119,5 +139,5 @@ func (mysql *SMySQLBackend) CommitTableChangeSQL(ts sqlchemy.ITableSpec, changes
 }
 
 func createIndexSQL(ts sqlchemy.ITableSpec, idx sqlchemy.STableIndex) string {
-	return fmt.Sprintf("CREATE INDEX `%s` ON `%s` (%s)", idx.Name(), ts.Name(), strings.Join(idx.QuotedColumns(), ","))
+	return fmt.Sprintf("CREATE INDEX `%s` ON `%s` (%s)", idx.Name(), ts.Name(), strings.Join(idx.QuotedColumns("`"), ","))
 }

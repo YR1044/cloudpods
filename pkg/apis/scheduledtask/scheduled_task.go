@@ -68,7 +68,7 @@ type ScheduledTaskListInput struct {
 
 	// description: resource type
 	// example: server
-	// enum: server
+	// enum: ["server"]
 	ResourceType string `json:"resource_type"`
 
 	// description: label type
@@ -81,7 +81,7 @@ type ScheduledTaskListInput struct {
 
 	// description: operation
 	// example: stop
-	// enum: start,stop,restart
+	// enum: ["start","stop","restart"]
 	Operation string `json:"operation"`
 }
 
@@ -90,22 +90,22 @@ type ScheduledTaskCreateInput struct {
 	apis.EnabledBaseResourceCreateInput
 
 	// description: scheduled type
-	// enum: cycle,timing
+	// enum: ["cycle","timing"]
 	// example: timing
 	ScheduledType string                `json:"scheduled_type"`
 	Timer         TimerCreateInput      `json:"timer"`
 	CycleTimer    CycleTimerCreateInput `json:"cycle_timer"`
 
 	// description: resource type
-	// enum: server
+	// enum: ["server"]
 	// example: server
 	ResourceType string `json:"resource_type"`
 	// description: operation
-	// enum: start,stop,restart
+	// enum: ["start","stop","restart"]
 	// example: stop
 	Operation string `json:"operation"`
 	// description: label type
-	// enum: tag,id
+	// enum: ["tag","id"]
 	// example: id
 	LabelType string `json:"label_type"`
 	// description: labels
@@ -122,7 +122,7 @@ type TimerCreateInput struct {
 type CycleTimerCreateInput struct {
 
 	// description: 周期类型
-	// enum: day,week,month
+	// enum: ["hour","day","week","month"]
 	CycleType string `json:"cycle_type"`
 
 	// description: 分(0-59)
@@ -132,6 +132,10 @@ type CycleTimerCreateInput struct {
 	// description: 时(0-23)
 	// example: 13
 	Hour int `json:"hour"`
+
+	// 频率为小时或天时启用，泛指间隔单位
+	// example: 2
+	CycleNum int `json:"cycle_num"`
 
 	// description: 每周的周几; 1-7, 1: Monday, 7: Sunday
 	// example: [1,3,5,7]

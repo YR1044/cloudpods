@@ -18,6 +18,7 @@ import (
 	"yunion.io/x/pkg/util/rbacscope"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	common_policy "yunion.io/x/onecloud/pkg/cloudcommon/policy"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
 )
@@ -142,18 +143,6 @@ var (
 				{
 					Service:  api.SERVICE_TYPE,
 					Resource: "dns_recodsets",
-					Action:   PolicyActionGet,
-					Result:   rbacutils.Allow,
-				},
-				{
-					Service:  api.SERVICE_TYPE,
-					Resource: "dns_zonecaches",
-					Action:   PolicyActionList,
-					Result:   rbacutils.Allow,
-				},
-				{
-					Service:  api.SERVICE_TYPE,
-					Resource: "dns_zonecaches",
 					Action:   PolicyActionGet,
 					Result:   rbacutils.Allow,
 				},
@@ -398,7 +387,7 @@ var (
 					Action:   PolicyActionList,
 					Result:   rbacutils.Allow,
 				},
-				/*{
+				{
 					Service:  api.SERVICE_TYPE,
 					Resource: "networks",
 					Action:   PolicyActionGet,
@@ -410,12 +399,13 @@ var (
 					Action:   PolicyActionList,
 					Result:   rbacutils.Allow,
 				},
-				*/
 			},
 		},
 	}
 )
 
-func init() {
-	common_policy.AppendDefaultPolicies(predefinedDefaultPolicies)
+func Init() {
+	if consts.IsEnableDefaultPolicy() {
+		common_policy.AppendDefaultPolicies(predefinedDefaultPolicies)
+	}
 }

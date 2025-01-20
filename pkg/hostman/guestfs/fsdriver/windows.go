@@ -49,6 +49,8 @@ const (
 
 	WIN_TELEGRAF_BINARY_PATH = "/opt/yunion/bin/telegraf.exe"
 	WIN_TELEGRAF_PATH        = "/Program Files/Telegraf"
+
+	WIN_QGA_PATH = "/Program Files/Qemu-ga"
 )
 
 type SWindowsRootFs struct {
@@ -129,7 +131,7 @@ func (w *SWindowsRootFs) GetLoginAccount(rootFs IDiskPartition, sUser string, de
 	selUsr := ""
 	isWin10NonPro := w.IsWindows10NonPro()
 	// Win10 try not to use Administrator users // Win 10 professional can use Adminsitrator
-	if _, ok := users[admin]; ok && windowsDefaultAdminUser && !isWin10NonPro {
+	if _, ok := users[admin]; ok && windowsDefaultAdminUser && !isWin10NonPro && w.GetIRootFsDriver().AllowAdminLogin() {
 		selUsr = admin
 	} else {
 		// Looking for an unlocked user who is not an Administrator
@@ -160,7 +162,6 @@ func (w *SWindowsRootFs) GetArch(hostCpuArch string) string {
 		return apis.OS_ARCH_X86_64
 	} else if w.rootFs.Exists("/program files (arm)", true) {
 		return apis.OS_ARCH_AARCH64
-
 	}
 	if hostCpuArch == apis.OS_ARCH_AARCH32 {
 		return apis.OS_ARCH_AARCH32
@@ -318,15 +319,23 @@ func (w *SWindowsRootFs) DeployNetworkingScripts(rootfs IDiskPartition, nics []*
 				cfg += fmt.Sprintf(" %s", snic.Gateway)
 			}
 			lines = append(lines, cfg)
+			if len(snic.Ip6) > 0 {
+				cfg := fmt.Sprintf(`      netsh interface ipv6 add address "%%%%b" %s/%d store=persistent`, snic.Ip6, snic.Masklen6)
+				lines = append(lines, cfg)
+				if len(snic.Gateway) > 0 && snic.Ip == mainIp {
+					cfg := fmt.Sprintf(`      netsh interface ipv6 add route ::/0 "%%%%b" %s`, snic.Gateway6)
+					lines = append(lines, cfg)
+				}
+			}
 			routes := [][]string{}
-			netutils2.AddNicRoutes(&routes, snic, mainIp, len(nics), privatePrefixes)
+			routes = netutils2.AddNicRoutes(routes, snic, mainIp, len(nics))
 			for _, r := range routes {
 				lines = append(lines, fmt.Sprintf(`      netsh interface ip add route %s "%%%%b" %s`, r[0], r[1]))
 			}
 			dnslist := netutils2.GetNicDns(snic)
 			if len(dnslist) > 0 {
 				lines = append(lines, fmt.Sprintf(
-					`      netsh interface ip set dns name="%%%%b" source=static addr=%s ddns=disabled suffix=interface`, dnslist[0]))
+					`      netsh interface ip set dns name="%%%%b" source=static addr=%s`, dnslist[0]))
 				if len(dnslist) > 1 {
 					for i := 1; i < len(dnslist); i++ {
 						lines = append(lines, fmt.Sprintf(`      netsh interface ip add dns "%%%%b" %s index=%d`, dnslist[i], i+1))
@@ -340,6 +349,14 @@ func (w *SWindowsRootFs) DeployNetworkingScripts(rootfs IDiskPartition, nics []*
 		} else {
 			lines = append(lines, `      netsh interface ip set address "%%b" dhcp`)
 			lines = append(lines, `      netsh interface ip set dns "%%b" dhcp`)
+			if len(snic.Ip6) > 0 {
+				cfg := fmt.Sprintf(`      netsh interface ipv6 add address "%%%%b" %s/%d store=persistent`, snic.Ip6, snic.Masklen6)
+				lines = append(lines, cfg)
+				if len(snic.Gateway) > 0 && snic.Ip == mainIp {
+					cfg := fmt.Sprintf(`      netsh interface ipv6 add route ::/0 "%%%%b" %s`, snic.Gateway6)
+					lines = append(lines, cfg)
+				}
+			}
 		}
 		lines = append(lines, `    )`)
 	}
@@ -562,6 +579,28 @@ func (w *SWindowsRootFs) DetectIsUEFISupport(part IDiskPartition) bool {
 
 func (l *SWindowsRootFs) IsResizeFsPartitionSupport() bool {
 	return true
+}
+
+func (w *SWindowsRootFs) DeployQgaService(part IDiskPartition) error {
+	if err := w.rootFs.Mkdir(WIN_QGA_PATH, syscall.S_IRUSR|syscall.S_IWUSR|syscall.S_IXUSR, true); err != nil {
+		return errors.Wrap(err, "mkdir qemu-ga path")
+	}
+
+	qgaInstallerPath := path.Join(w.rootFs.GetMountPath(), WIN_QGA_PATH, "qemu-ga-x86_64.msi")
+	output, err := procutils.NewCommand("cp", "-f", QGA_WIN_MSI_INSTALLER_PATH, qgaInstallerPath).Output()
+	if err != nil {
+		return errors.Wrapf(err, "cp qga installer failed %s", output)
+	}
+
+	bootScript := strings.Join([]string{
+		`start "" "%PROGRAMFILES%\Qemu-ga\qemu-ga-x86_64.msi"`,
+	}, "\r\n")
+	w.appendGuestBootScript("qemu-ga", bootScript)
+	return nil
+}
+
+func (w *SWindowsRootFs) DeployQgaBlackList(part IDiskPartition) error {
+	return nil
 }
 
 func (w *SWindowsRootFs) DeployTelegraf(config string) (bool, error) {

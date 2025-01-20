@@ -59,6 +59,8 @@ func (self *SManagedVirtualizationHostDriver) CheckAndSetCacheImage(ctx context.
 		image.OsVersion = input.OsFullVersion
 	}
 
+	size := int64(0)
+
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
 
 		lockman.LockRawObject(ctx, models.CachedimageManager.Keyword(), fmt.Sprintf("%s-%s", storageCache.Id, image.ImageId))
@@ -136,16 +138,17 @@ func (self *SManagedVirtualizationHostDriver) CheckAndSetCacheImage(ctx context.
 				log.Debugf("UploadImage: no external ID")
 				return iStorageCache.UploadImage(ctx, image, callback)
 			}()
+			if err != nil {
+				return nil, err
+			}
 			log.Infof("upload image %s id: %s", image.ImageName, image.ExternalId)
 		} else {
-			_, err = iStorageCache.GetIImageById(cachedImage.ExternalId)
+			_, err := iStorageCache.GetIImageById(cachedImage.ExternalId)
 			if err != nil {
 				return nil, errors.Wrapf(err, "iStorageCache.GetIImageById(%s) for %s", cachedImage.ExternalId, iStorageCache.GetGlobalId())
 			}
 			image.ExternalId = cachedImage.ExternalId
-		}
-		if err != nil {
-			return nil, err
+			size = cachedImage.Size
 		}
 
 		// should record the externalId immediately
@@ -155,12 +158,13 @@ func (self *SManagedVirtualizationHostDriver) CheckAndSetCacheImage(ctx context.
 
 		ret := jsonutils.NewDict()
 		ret.Add(jsonutils.NewString(image.ExternalId), "image_id")
+		ret.Add(jsonutils.NewInt(size), "size")
 		return ret, nil
 	})
 	return nil
 }
 
-func (self *SManagedVirtualizationHostDriver) RequestUncacheImage(ctx context.Context, host *models.SHost, storageCache *models.SStoragecache, task taskman.ITask) error {
+func (self *SManagedVirtualizationHostDriver) RequestUncacheImage(ctx context.Context, host *models.SHost, storageCache *models.SStoragecache, task taskman.ITask, deactivateImage bool) error {
 	params := task.GetParams()
 	imageId, err := params.GetString("image_id")
 	if err != nil {
@@ -251,12 +255,17 @@ func (self *SManagedVirtualizationHostDriver) RequestAllocateDiskOnStorage(ctx c
 		}
 		projectId, err := _cloudprovider.SyncProject(ctx, userCred, disk.ProjectId)
 		if err != nil {
-			logclient.AddSimpleActionLog(disk, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+			if errors.Cause(err) != cloudprovider.ErrNotSupported && errors.Cause(err) != cloudprovider.ErrNotImplemented {
+				logclient.AddSimpleActionLog(disk, logclient.ACT_SYNC_CLOUD_PROJECT, err, userCred, false)
+			}
 		}
 		conf := cloudprovider.DiskCreateConfig{
-			Name:      disk.GetName(),
-			SizeGb:    input.DiskSizeMb >> 10,
-			ProjectId: projectId,
+			Name:       disk.GetName(),
+			SizeGb:     input.DiskSizeMb >> 10,
+			ProjectId:  projectId,
+			Iops:       disk.Iops,
+			Throughput: disk.Throughput,
+			Desc:       disk.Description,
 		}
 		iDisk, err := iCloudStorage.CreateIDisk(&conf)
 		if err != nil {
@@ -269,7 +278,9 @@ func (self *SManagedVirtualizationHostDriver) RequestAllocateDiskOnStorage(ctx c
 
 		cloudprovider.WaitStatus(iDisk, api.DISK_READY, time.Second*5, time.Minute*5)
 
-		models.SyncVirtualResourceMetadata(ctx, task.GetUserCred(), disk, iDisk)
+		if account := host.GetCloudaccount(); account != nil {
+			models.SyncVirtualResourceMetadata(ctx, task.GetUserCred(), disk, iDisk, account.ReadOnly)
+		}
 
 		data := jsonutils.NewDict()
 		data.Add(jsonutils.NewInt(int64(iDisk.GetDiskSizeMB())), "disk_size")
@@ -282,28 +293,17 @@ func (self *SManagedVirtualizationHostDriver) RequestAllocateDiskOnStorage(ctx c
 	return nil
 }
 
-func (self *SManagedVirtualizationHostDriver) RequestDeallocateDiskOnHost(ctx context.Context, host *models.SHost, storage *models.SStorage, disk *models.SDisk, task taskman.ITask) error {
-	data := jsonutils.NewDict()
-
-	iCloudStorage, err := storage.GetIStorage(ctx)
-	if err != nil {
-		return err
-	}
-
-	iDisk, err := iCloudStorage.GetIDiskById(disk.GetExternalId())
-	if err != nil {
-		if errors.Cause(err) == cloudprovider.ErrNotFound {
-			task.ScheduleRun(data)
-			return nil
-		}
-		return err
-	}
-
+func (self *SManagedVirtualizationHostDriver) RequestDeallocateDiskOnHost(ctx context.Context, host *models.SHost, storage *models.SStorage, disk *models.SDisk, cleanSnapshots bool, task taskman.ITask) error {
 	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		err := iDisk.Delete(ctx)
-		return nil, err
+		idisk, err := disk.GetIDisk(ctx)
+		if err != nil {
+			if errors.Cause(err) == cloudprovider.ErrNotFound {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return nil, idisk.Delete(ctx)
 	})
-
 	return nil
 }
 
@@ -374,7 +374,11 @@ func (self *SManagedVirtualizationHostDriver) RequestRebuildDiskOnStorage(ctx co
 }
 
 func (driver *SManagedVirtualizationHostDriver) IsReachStoragecacheCapacityLimit(host *models.SHost, cachedImages []models.SCachedimage) bool {
-	quota := host.GetHostDriver().GetStoragecacheQuota(host)
+	hostDriver, err := host.GetHostDriver()
+	if err != nil {
+		return false
+	}
+	quota := hostDriver.GetStoragecacheQuota(host)
 	log.Debugf("Cached image total: %d quota: %d", len(cachedImages), quota)
 	if quota > 0 && len(cachedImages) >= quota {
 		return true

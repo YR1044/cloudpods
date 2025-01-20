@@ -23,9 +23,8 @@ import (
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
-	"yunion.io/x/pkg/util/pinyinutils"
+	"yunion.io/x/pkg/util/secrules"
 	"yunion.io/x/pkg/utils"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
@@ -35,6 +34,7 @@ import (
 	"yunion.io/x/onecloud/pkg/compute/models"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
+	"yunion.io/x/onecloud/pkg/util/logclient"
 	"yunion.io/x/onecloud/pkg/util/seclib2"
 )
 
@@ -45,14 +45,6 @@ type SAwsRegionDriver struct {
 func init() {
 	driver := SAwsRegionDriver{}
 	models.RegisterRegionDriver(&driver)
-}
-
-func (self *SAwsRegionDriver) IsAllowSecurityGroupNameRepeat() bool {
-	return false
-}
-
-func (self *SAwsRegionDriver) GenerateSecurityGroupName(name string) string {
-	return pinyinutils.Text2Pinyin(name)
 }
 
 func (self *SAwsRegionDriver) GetProvider() string {
@@ -239,12 +231,7 @@ func (self *SAwsRegionDriver) RequestCreateLoadbalancerListener(ctx context.Cont
 				if err != nil {
 					return nil, errors.Wrapf(err, "GetCertificate")
 				}
-
-				lbcert, err := models.CachedLoadbalancerCertificateManager.GetOrCreateCachedCertificate(ctx, userCred, provider, lblis, cert)
-				if err != nil {
-					return nil, errors.Wrap(err, "CachedLoadbalancerCertificateManager.GetOrCreateCachedCertificate")
-				}
-				opts.CertificateId = lbcert.ExternalId
+				opts.CertificateId = cert.ExternalId
 			}
 		}
 
@@ -310,81 +297,19 @@ func (self *SAwsRegionDriver) RequestCreateLoadbalancerBackendGroup(ctx context.
 	return task.ScheduleRun(nil)
 }
 
-func (self *SAwsRegionDriver) IsSecurityGroupBelongVpc() bool {
-	return true
-}
-
 func (self *SAwsRegionDriver) IsCertificateBelongToRegion() bool {
 	return false
 }
 
 func (self *SAwsRegionDriver) ValidateCreateVpcData(ctx context.Context, userCred mcclient.TokenCredential, input api.VpcCreateInput) (api.VpcCreateInput, error) {
 	cidrV := validators.NewIPv4PrefixValidator("cidr_block")
-	if err := cidrV.Validate(jsonutils.Marshal(input).(*jsonutils.JSONDict)); err != nil {
+	if err := cidrV.Validate(ctx, jsonutils.Marshal(input).(*jsonutils.JSONDict)); err != nil {
 		return input, err
 	}
 	if cidrV.Value.MaskLen < 16 || cidrV.Value.MaskLen > 28 {
 		return input, httperrors.NewInputParameterError("%s request the mask range should be between 16 and 28", self.GetProvider())
 	}
 	return input, nil
-}
-
-func (self *SAwsRegionDriver) RequestDeleteVpc(ctx context.Context, userCred mcclient.TokenCredential, region *models.SCloudregion, vpc *models.SVpc, task taskman.ITask) error {
-	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
-		provider := vpc.GetCloudprovider()
-		if provider == nil {
-			return nil, fmt.Errorf("vpc %s(%s) related provider not  found", vpc.GetName(), vpc.GetName())
-		}
-
-		region, err := vpc.GetIRegion(ctx)
-		if err != nil {
-			return nil, errors.Wrap(err, "vpc.GetIRegion")
-		}
-		ivpc, err := region.GetIVpcById(vpc.GetExternalId())
-		if err != nil {
-			if errors.Cause(err) == cloudprovider.ErrNotFound {
-				// already deleted, do nothing
-				return nil, nil
-			}
-			return nil, errors.Wrap(err, "region.GetIVpcById")
-		}
-
-		// remove related secgroups
-		segs, err := ivpc.GetISecurityGroups()
-		if err != nil {
-			return nil, errors.Wrap(err, "GetISecurityGroups")
-		}
-
-		for i := range segs {
-			// 默认安全组不需要删除
-			if segs[i].GetName() == "default" {
-				log.Debugf("RequestDeleteVpc delete secgroup skipped default secgroups %s(%s)", segs[i].GetName(), segs[i].GetId())
-				continue
-			}
-
-			err = segs[i].Delete()
-			if err != nil {
-				return nil, errors.Wrap(err, "DeleteSecurityGroup")
-			}
-		}
-
-		_, _, result := models.SecurityGroupCacheManager.SyncSecurityGroupCaches(ctx, userCred, provider, []cloudprovider.ICloudSecurityGroup{}, vpc, true)
-		if result.IsError() {
-			return nil, fmt.Errorf("SyncSecurityGroupCaches %s", result.Result())
-		}
-
-		err = ivpc.Delete()
-		if err != nil {
-			return nil, errors.Wrap(err, "ivpc.Delete")
-		}
-		err = cloudprovider.WaitDeleted(ivpc, 10*time.Second, 300*time.Second)
-		if err != nil {
-			return nil, errors.Wrap(err, "cloudprovider.WaitDeleted")
-		}
-
-		return nil, nil
-	})
-	return nil
 }
 
 func (self *SAwsRegionDriver) RequestAssociateEip(ctx context.Context, userCred mcclient.TokenCredential, eip *models.SElasticip, input api.ElasticipAssociateInput, obj db.IStatusStandaloneModel, task taskman.ITask) error {
@@ -411,7 +336,7 @@ func (self *SAwsRegionDriver) RequestAssociateEip(ctx context.Context, userCred 
 		}
 
 		if obj.GetStatus() != api.INSTANCE_ASSOCIATE_EIP {
-			db.StatusBaseSetStatus(obj, userCred, api.INSTANCE_ASSOCIATE_EIP, "associate eip")
+			db.StatusBaseSetStatus(ctx, obj, userCred, api.INSTANCE_ASSOCIATE_EIP, "associate eip")
 		}
 
 		err = eip.AssociateInstance(ctx, userCred, input.InstanceType, obj)
@@ -437,7 +362,7 @@ func (self *SAwsRegionDriver) RequestAssociateEip(ctx context.Context, userCred 
 			}
 		}
 
-		eip.SetStatus(userCred, api.EIP_STATUS_READY, "associate")
+		eip.SetStatus(ctx, userCred, api.EIP_STATUS_READY, "associate")
 		return nil, nil
 	})
 	return nil
@@ -471,4 +396,74 @@ func (self *SAwsRegionDriver) ValidateCreateWafInstanceData(ctx context.Context,
 
 func (self *SAwsRegionDriver) ValidateCreateWafRuleData(ctx context.Context, userCred mcclient.TokenCredential, waf *models.SWafInstance, input api.WafRuleCreateInput) (api.WafRuleCreateInput, error) {
 	return input, nil
+}
+
+func (self *SAwsRegionDriver) ValidateCreateSecurityGroupInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupCreateInput) (*api.SSecgroupCreateInput, error) {
+	for i := range input.Rules {
+		if input.Rules[i].Action != string(secrules.SecurityRuleAllow) {
+			return nil, httperrors.NewInputParameterError("invalid action %s, only support allow", input.Rules[i].Action)
+		}
+
+		if len(input.Rules[i].Ports) > 0 && strings.Contains(input.Rules[i].Ports, ",") {
+			return nil, httperrors.NewInputParameterError("invalid ports %s", input.Rules[i].Ports)
+		}
+
+	}
+	return self.SManagedVirtualizationRegionDriver.ValidateCreateSecurityGroupInput(ctx, userCred, input)
+}
+
+func (self *SAwsRegionDriver) ValidateUpdateSecurityGroupRuleInput(ctx context.Context, userCred mcclient.TokenCredential, input *api.SSecgroupRuleUpdateInput) (*api.SSecgroupRuleUpdateInput, error) {
+	if input.Action != nil && *input.Action != string(secrules.SecurityRuleAllow) {
+		return nil, httperrors.NewInputParameterError("invalid action %s", *input.Action)
+	}
+
+	if input.Ports != nil && strings.Contains(*input.Ports, ",") {
+		return nil, httperrors.NewInputParameterError("invalid ports %s", *input.Ports)
+	}
+
+	return self.SManagedVirtualizationRegionDriver.ValidateUpdateSecurityGroupRuleInput(ctx, userCred, input)
+}
+
+func (self *SAwsRegionDriver) RequestRemoteUpdateElasticcache(ctx context.Context, userCred mcclient.TokenCredential, elasticcache *models.SElasticcache, replaceTags bool, task taskman.ITask) error {
+	taskman.LocalTaskRun(task, func() (jsonutils.JSONObject, error) {
+		iRegion, err := elasticcache.GetIRegion(ctx)
+		if err != nil {
+			return nil, errors.Wrap(err, "elasticcache.GetIRegion")
+		}
+
+		iElasticcache, err := iRegion.GetIElasticcacheById(elasticcache.ExternalId)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetIElasticcacheById(%s)", elasticcache.ExternalId)
+		}
+
+		oldTags, err := iElasticcache.GetTags()
+		if err != nil {
+			if errors.Cause(err) == cloudprovider.ErrNotSupported || errors.Cause(err) == cloudprovider.ErrNotImplemented {
+				return nil, nil
+			}
+			return nil, errors.Wrap(err, "iElasticcache.GetTags()")
+		}
+		tags, err := elasticcache.GetAllUserMetadata()
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetAllUserMetadata")
+		}
+		tagsUpdateInfo := cloudprovider.TagsUpdateInfo{OldTags: oldTags, NewTags: tags}
+		mangerId := ""
+		if vpc, _ := elasticcache.GetVpc(); vpc != nil {
+			mangerId = vpc.ManagerId
+		}
+		err = cloudprovider.SetTags(ctx, iElasticcache, mangerId, tags, replaceTags)
+		if err != nil {
+			if errors.Cause(err) == cloudprovider.ErrNotSupported || errors.Cause(err) == cloudprovider.ErrNotImplemented {
+				return nil, nil
+			}
+
+			logclient.AddActionLogWithStartable(task, elasticcache, logclient.ACT_UPDATE_TAGS, err, userCred, false)
+			return nil, errors.Wrap(err, "iElasticcache.SetTags")
+		}
+		cloudprovider.WaitMultiStatus(iElasticcache, []string{api.ELASTIC_CACHE_STATUS_RUNNING}, 15*time.Second, 2*time.Minute)
+		logclient.AddActionLogWithStartable(task, elasticcache, logclient.ACT_UPDATE_TAGS, tagsUpdateInfo, userCred, true)
+		return nil, nil
+	})
+	return nil
 }

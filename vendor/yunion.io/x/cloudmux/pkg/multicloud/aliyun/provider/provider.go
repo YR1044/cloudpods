@@ -43,18 +43,6 @@ func (self *SAliyunProviderFactory) IsCloudeventRegional() bool {
 	return true
 }
 
-func (self *SAliyunProviderFactory) IsSupportCloudIdService() bool {
-	return true
-}
-
-func (self *SAliyunProviderFactory) IsSupportCreateCloudgroup() bool {
-	return true
-}
-
-func (factory *SAliyunProviderFactory) IsSystemCloudpolicyUnified() bool {
-	return false
-}
-
 func (factory *SAliyunProviderFactory) IsSupportSAMLAuth() bool {
 	return true
 }
@@ -179,9 +167,9 @@ func (self *SAliyunProviderFactory) ValidateUpdateCloudaccountCredential(ctx con
 }
 
 func validateClientCloudenv(client *aliyun.SAliyunClient) error {
-	regions := client.GetIRegions()
-	if len(regions) == 0 {
-		return nil
+	regions, err := client.GetIRegions()
+	if err != nil {
+		return err
 	}
 
 	isFinanceAccount := false
@@ -206,12 +194,13 @@ func validateClientCloudenv(client *aliyun.SAliyunClient) error {
 }
 
 func (self *SAliyunProviderFactory) GetProvider(cfg cloudprovider.ProviderConfig) (cloudprovider.ICloudProvider, error) {
+	accessKey, secret, accountId := parseAccount(cfg.Account, cfg.Secret)
 	client, err := aliyun.NewAliyunClient(
 		aliyun.NewAliyunClientConfig(
 			cfg.URL,
-			cfg.Account,
-			cfg.Secret,
-		).CloudproviderConfig(cfg),
+			accessKey,
+			secret,
+		).AccountId(accountId).CloudproviderConfig(cfg),
 	)
 	if err != nil {
 		return nil, err
@@ -228,11 +217,25 @@ func (self *SAliyunProviderFactory) GetProvider(cfg cloudprovider.ProviderConfig
 	}, nil
 }
 
+func parseAccount(account, secret string) (accessKey string, secretKey string, accountId string) {
+	slash := strings.Index(account, "/")
+	if slash > 0 {
+		accessKey = account[:slash]
+		accountId = account[slash+1:]
+	} else {
+		accessKey = account
+	}
+	secretKey = secret
+	return
+}
+
 func (self *SAliyunProviderFactory) GetClientRC(info cloudprovider.SProviderInfo) (map[string]string, error) {
+	accessKey, secret, accountId := parseAccount(info.Account, info.Secret)
 	return map[string]string{
-		"ALIYUN_ACCESS_KEY": info.Account,
-		"ALIYUN_SECRET":     info.Secret,
+		"ALIYUN_ACCESS_KEY": accessKey,
+		"ALIYUN_SECRET":     secret,
 		"ALIYUN_REGION":     aliyun.ALIYUN_DEFAULT_REGION,
+		"ALIYUN_ACCOUNT_ID": accountId,
 	}, nil
 }
 
@@ -247,7 +250,7 @@ type SAliyunProvider struct {
 }
 
 func (self *SAliyunProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	regions := self.client.GetIRegions()
+	regions, _ := self.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(regions))), "region_count")
 	info.Add(jsonutils.NewString(aliyun.ALIYUN_API_VERSION), "api_version")
@@ -266,7 +269,7 @@ func (self *SAliyunProvider) GetAccountId() string {
 	return self.client.GetAccountId()
 }
 
-func (self *SAliyunProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SAliyunProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
@@ -355,12 +358,8 @@ func (self *SAliyunProvider) CreateICloudgroup(name, desc string) (cloudprovider
 	return self.client.CreateICloudgroup(name, desc)
 }
 
-func (self *SAliyunProvider) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetISystemCloudpolicies()
-}
-
-func (self *SAliyunProvider) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetICustomCloudpolicies()
+func (self *SAliyunProvider) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+	return self.client.GetICloudpolicies()
 }
 
 func (self *SAliyunProvider) CreateICloudpolicy(opts *cloudprovider.SCloudpolicyCreateOptions) (cloudprovider.ICloudpolicy, error) {
@@ -511,4 +510,12 @@ func (self *SAliyunProvider) GetICloudCDNDomainByName(name string) (cloudprovide
 
 func (self *SAliyunProvider) GetMetrics(opts *cloudprovider.MetricListOptions) ([]cloudprovider.MetricValues, error) {
 	return self.client.GetMetrics(opts)
+}
+
+func (self *SAliyunProvider) GetISSLCertificates() ([]cloudprovider.ICloudSSLCertificate, error) {
+	return self.client.GetISSLCertificates()
+}
+
+func (self *SAliyunProvider) GetISSLCertificate(certId string) (cloudprovider.ICloudSSLCertificate, error) {
+	return self.client.GetISSLCertificate(certId)
 }

@@ -20,13 +20,15 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"strings"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/rbacscope"
+	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
-	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
@@ -39,8 +41,12 @@ import (
 	"yunion.io/x/onecloud/pkg/util/tagutils"
 )
 
+var _ db.IModelManager = (*SOrganizationNodeManager)(nil)
+var _ db.IModel = (*SOrganizationNode)(nil)
+
 type SOrganizationNodeManager struct {
 	db.SStandaloneResourceBaseManager
+	db.SPendingDeletedBaseManager
 }
 
 var OrganizationNodeManager *SOrganizationNodeManager
@@ -60,6 +66,7 @@ func init() {
 
 type SOrganizationNode struct {
 	db.SStandaloneResourceBase `name:""`
+	db.SPendingDeletedBase
 
 	OrgId string `width:"36" charset:"ascii" list:"user" create:"admin_required"`
 
@@ -67,7 +74,7 @@ type SOrganizationNode struct {
 
 	Level int `list:"user" create:"admin_required"`
 
-	Weight *int `list:"user" create:"admin_required" update:"admin" default:"1"`
+	Weight int `list:"user" create:"admin_required" update:"admin" default:"1"`
 }
 
 func (orgNode *SOrganizationNode) GetOrganization() (*SOrganization, error) {
@@ -103,7 +110,10 @@ func generateId(orgId string, fullLabel string, level int) string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
-func (manager *SOrganizationNodeManager) ensureNode(ctx context.Context, orgId string, label string, fullLabel string, level int, weight *int, desc string) (*SOrganizationNode, error) {
+func (manager *SOrganizationNodeManager) ensureNode(ctx context.Context, orgId string, fullLabel string, weight *int, desc string) (*SOrganizationNode, error) {
+	labels := api.SplitLabel(fullLabel)
+	level := len(labels)
+	label := labels[level-1]
 	id := generateId(orgId, fullLabel, level)
 	obj, err := manager.FetchById(id)
 	if err != nil {
@@ -111,8 +121,15 @@ func (manager *SOrganizationNodeManager) ensureNode(ctx context.Context, orgId s
 			return nil, errors.Wrap(err, "FetchById")
 		}
 		// not exist
+		if weight == nil {
+			one := 1
+			weight = &one
+		}
 	} else {
 		// exist
+		if weight == nil {
+			weight = &obj.(*SOrganizationNode).Weight
+		}
 		if len(desc) == 0 {
 			desc = obj.(*SOrganizationNode).Description
 		}
@@ -121,7 +138,7 @@ func (manager *SOrganizationNodeManager) ensureNode(ctx context.Context, orgId s
 		OrgId:     orgId,
 		FullLabel: fullLabel,
 		Level:     level,
-		Weight:    weight,
+		Weight:    *weight,
 	}
 	node.Description = desc
 	node.Name = label
@@ -141,7 +158,17 @@ func (orgNode *SOrganizationNode) PerformBind(
 	query jsonutils.JSONObject,
 	input api.OrganizationNodePerformBindInput,
 ) (jsonutils.JSONObject, error) {
-	orgNode.startOrganizationBindTask(ctx, userCred, input)
+	orgNode.startOrganizationBindTask(ctx, userCred, input, true)
+	return nil, nil
+}
+
+func (orgNode *SOrganizationNode) PerformUnbind(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	input api.OrganizationNodePerformBindInput,
+) (jsonutils.JSONObject, error) {
+	orgNode.startOrganizationBindTask(ctx, userCred, input, false)
 	return nil, nil
 }
 
@@ -149,9 +176,11 @@ func (orgNode *SOrganizationNode) startOrganizationBindTask(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
 	input api.OrganizationNodePerformBindInput,
+	bind bool,
 ) error {
 	params := jsonutils.NewDict()
 	params.Set("input", jsonutils.Marshal(input))
+	params.Set("bind", jsonutils.NewBool(bind))
 	task, err := taskman.TaskManager.NewTask(ctx, "OrganizationBindTask", orgNode, userCred, params, "", "", nil)
 	if err != nil {
 		return err
@@ -160,10 +189,20 @@ func (orgNode *SOrganizationNode) startOrganizationBindTask(
 	return nil
 }
 
-func (orgNode *SOrganizationNode) BindTargetIds(ctx context.Context, userCred mcclient.TokenCredential, input api.OrganizationNodePerformBindInput) error {
+func (orgNode *SOrganizationNode) BindTargetIds(ctx context.Context, userCred mcclient.TokenCredential, input api.OrganizationNodePerformBindInput, bind bool) error {
+	org, err := orgNode.GetOrganization()
+	if err != nil {
+		return errors.Wrap(err, "GetOrganization")
+	}
+	tags := orgNode.GetTags(org)
+	if !bind {
+		for k := range tags {
+			tags[k] = "None"
+		}
+	}
 	var errs []error
 	for _, id := range input.TargetId {
-		err := orgNode.bindTargetId(ctx, userCred, input.ResourceType, id)
+		err := orgNode.bindTargetId(ctx, userCred, input.ResourceType, id, tags)
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -171,71 +210,43 @@ func (orgNode *SOrganizationNode) BindTargetIds(ctx context.Context, userCred mc
 	return errors.NewAggregate(errs)
 }
 
-func (orgNode *SOrganizationNode) bindTargetId(ctx context.Context, userCred mcclient.TokenCredential, resType string, idstr string) error {
+func (orgNode *SOrganizationNode) bindTargetId(ctx context.Context, userCred mcclient.TokenCredential, resType string, idstr string, tags map[string]string) error {
 	org, err := OrganizationManager.fetchOrganizationById(orgNode.OrgId)
 	if err != nil {
 		return errors.Wrap(err, "fetchOrganizationById")
 	}
 	switch org.Type {
 	case api.OrgTypeProject:
-		return orgNode.bindProject(ctx, userCred, idstr)
+		return orgNode.bindProject(ctx, userCred, idstr, tags)
 	case api.OrgTypeDomain:
-		return orgNode.bindDomain(ctx, userCred, idstr)
+		return orgNode.bindDomain(ctx, userCred, idstr, tags)
 	case api.OrgTypeObject:
-		return orgNode.bindObject(ctx, userCred, resType, idstr)
+		return orgNode.bindObject(ctx, userCred, resType, idstr, tags)
 	}
 	return errors.Wrapf(errors.ErrNotSupported, "cannot bind to %s %s", resType, idstr)
 }
 
-func (orgNode *SOrganizationNode) GetTags() (map[string]string, error) {
-	org, err := OrganizationManager.fetchOrganizationById(orgNode.OrgId)
-	if err != nil {
-		return nil, errors.Wrap(err, "fetchOrganizationById")
-	}
-	tags := make(map[string]string)
-	keys := api.SplitLabel(org.Keys)
-	values := api.SplitLabel(orgNode.FullLabel)
-	for i := 0; i < orgNode.Level; i++ {
-		k := keys[i]
-		v := values[i]
-		tags[k] = v
-	}
-	return tags, nil
-}
-
-func (orgNode *SOrganizationNode) bindProject(ctx context.Context, userCred mcclient.TokenCredential, idstr string) error {
+func (orgNode *SOrganizationNode) bindProject(ctx context.Context, userCred mcclient.TokenCredential, idstr string, tags map[string]string) error {
 	projObj, err := ProjectManager.FetchById(idstr)
 	if err != nil {
 		return errors.Wrapf(err, "ProjectManager.FetchById %s", idstr)
 	}
-	tags, err := orgNode.GetTags()
-	if err != nil {
-		return errors.Wrap(err, "GetTags")
-	}
 	return projObj.(*SProject).SetOrganizationMetadataAll(ctx, tags, userCred)
 }
 
-func (orgNode *SOrganizationNode) bindDomain(ctx context.Context, userCred mcclient.TokenCredential, idstr string) error {
+func (orgNode *SOrganizationNode) bindDomain(ctx context.Context, userCred mcclient.TokenCredential, idstr string, tags map[string]string) error {
 	domainObj, err := DomainManager.FetchById(idstr)
 	if err != nil {
 		return errors.Wrapf(err, "DomainManager.FetchById %s", idstr)
 	}
-	tags, err := orgNode.GetTags()
-	if err != nil {
-		return errors.Wrap(err, "GetTags")
-	}
 	return domainObj.(*SDomain).SetOrganizationMetadataAll(ctx, tags, userCred)
 }
 
-func (orgNode *SOrganizationNode) bindObject(ctx context.Context, userCred mcclient.TokenCredential, resType, idstr string) error {
+func (orgNode *SOrganizationNode) bindObject(ctx context.Context, userCred mcclient.TokenCredential, resType, idstr string, tags map[string]string) error {
 	s := auth.GetSession(ctx, userCred, consts.GetRegion())
 	module, err := modulebase.GetModule(s, resType)
 	if err != nil {
 		return errors.Wrap(err, "GetModule")
-	}
-	tags, err := orgNode.GetTags()
-	if err != nil {
-		return errors.Wrap(err, "GetTags")
 	}
 	input := jsonutils.Marshal(tags)
 	_, err = module.PerformAction(s, idstr, "set-org-metadata", input)
@@ -270,6 +281,30 @@ func (orgNode *SOrganizationNode) ValidateUpdateData(
 	return input, nil
 }
 
+func tagSetList2Conditions(tagsetList tagutils.TTagSetList, keys []string, q *sqlchemy.SQuery) sqlchemy.ICondition {
+	for i := range keys {
+		if !strings.HasPrefix(keys[i], "org:") {
+			keys[i] = "org:" + keys[i]
+		}
+	}
+	conds := make([]sqlchemy.ICondition, 0)
+	paths := tagutils.TagSetList2Paths(tagsetList, keys)
+	for i := range paths {
+		for j := range paths[i] {
+			label := api.JoinLabels(paths[i][:j+1]...)
+			conds = append(conds, sqlchemy.Equals(q.Field("full_label"), label))
+			if j == len(paths[i])-1 {
+				labelSlash := label + api.OrganizationLabelSeparator
+				conds = append(conds, sqlchemy.Startswith(q.Field("full_label"), labelSlash))
+			}
+		}
+	}
+	if len(conds) > 0 {
+		return sqlchemy.OR(conds...)
+	}
+	return nil
+}
+
 // 项目列表
 func (manager *SOrganizationNodeManager) ListItemFilter(
 	ctx context.Context,
@@ -285,7 +320,7 @@ func (manager *SOrganizationNodeManager) ListItemFilter(
 	}
 
 	if len(query.OrgId) > 0 {
-		orgObj, err := OrganizationManager.FetchByIdOrName(userCred, query.OrgId)
+		orgObj, err := OrganizationManager.FetchByIdOrName(ctx, userCred, query.OrgId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(OrganizationManager.Keyword(), query.OrgId)
@@ -293,7 +328,27 @@ func (manager *SOrganizationNodeManager) ListItemFilter(
 				return nil, errors.Wrapf(err, "FetchByIdOrName %s", query.OrgId)
 			}
 		}
-		q = q.Equals("org_id", orgObj.GetId())
+		org := orgObj.(*SOrganization)
+		q = q.Equals("org_id", org.GetId())
+
+		var cond sqlchemy.ICondition
+		switch org.Type {
+		case api.OrgTypeDomain:
+			if !query.PolicyDomainTags.IsEmpty() {
+				cond = tagSetList2Conditions(query.PolicyDomainTags, org.GetKeys(), q)
+			}
+		case api.OrgTypeProject:
+			if !query.PolicyProjectTags.IsEmpty() {
+				cond = tagSetList2Conditions(query.PolicyProjectTags, org.GetKeys(), q)
+			}
+		case api.OrgTypeObject:
+			if !query.PolicyObjectTags.IsEmpty() {
+				cond = tagSetList2Conditions(query.PolicyObjectTags, org.GetKeys(), q)
+			}
+		}
+		if cond != nil {
+			q = q.Filter(cond)
+		}
 	}
 
 	if len(query.OrgType) > 0 {
@@ -336,16 +391,30 @@ func (manager *SOrganizationNodeManager) QueryDistinctExtraField(q *sqlchemy.SQu
 	return q, httperrors.ErrNotFound
 }
 
-type SOrganizationNodeDetails struct {
-	apis.StandaloneResourceDetails
+func (orgNode *SOrganizationNode) GetTags(org *SOrganization) map[string]string {
+	tags := make(map[string]string)
+	keys := api.SplitLabel(org.Keys)
+	values := api.SplitLabel(orgNode.FullLabel)
+	for i := 0; i < orgNode.Level; i++ {
+		k := db.ORGANIZATION_TAG_PREFIX + keys[i]
+		v := values[i]
+		tags[k] = v
+	}
+	return tags
+}
 
-	SOrganizationNode
-
-	Tags tagutils.TTagSet `json:"tags"`
-
-	Organization string `json:"organization"`
-
-	Type api.TOrgType `json:"type"`
+func (orgNode *SOrganizationNode) GetTagSet(org *SOrganization) tagutils.TTagSet {
+	tags := make(tagutils.TTagSet, 0)
+	keys := api.SplitLabel(org.Keys)
+	values := api.SplitLabel(orgNode.FullLabel)
+	for i := 0; i < orgNode.Level; i++ {
+		tag := tagutils.STag{
+			Key:   db.ORGANIZATION_TAG_PREFIX + keys[i],
+			Value: values[i],
+		}
+		tags = append(tags, tag)
+	}
+	return tags
 }
 
 func (manager *SOrganizationNodeManager) FetchCustomizeColumns(
@@ -355,36 +424,98 @@ func (manager *SOrganizationNodeManager) FetchCustomizeColumns(
 	objs []interface{},
 	fields stringutils2.SSortedStrings,
 	isList bool,
-) []SOrganizationNodeDetails {
-	rows := make([]SOrganizationNodeDetails, len(objs))
-	stdRows := manager.SStandaloneResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+) []api.SOrganizationNodeDetails {
+	rows := make([]api.SOrganizationNodeDetails, len(objs))
+	orgIds := make([]string, 0)
 	for i := range rows {
 		orgNode := objs[i].(*SOrganizationNode)
-		tags := make(tagutils.TTagSet, 0)
-		orgName := ""
-		orgType := api.TOrgType("")
-		org, err := OrganizationManager.fetchOrganizationById(orgNode.OrgId)
-		if err != nil {
-			log.Errorf("SOrganizationNodeManager.FetchCustomizeColumns fetchOrganizationById %s fail %s", orgNode.OrgId, err)
-		} else {
-			orgName = org.Name
-			orgType = org.Type
-			labels := api.SplitLabel(orgNode.FullLabel)
-			keys := api.SplitLabel(org.Keys)
-			for i := 0; i < len(keys) && i < len(labels); i++ {
-				tag := tagutils.STag{
-					Key:   db.ORGANIZATION_TAG_PREFIX + keys[i],
-					Value: labels[i],
-				}
-				tags = append(tags, tag)
-			}
-		}
-		rows[i] = SOrganizationNodeDetails{
-			StandaloneResourceDetails: stdRows[i],
-			Organization:              orgName,
-			Tags:                      tags,
-			Type:                      orgType,
+		if !utils.IsInArray(orgNode.OrgId, orgIds) {
+			orgIds = append(orgIds, orgNode.OrgId)
 		}
 	}
+
+	orgMaps := make(map[string]SOrganization)
+	err := db.FetchModelObjectsByIds(OrganizationManager, "id", orgIds, &orgMaps)
+	if err != nil {
+		log.Errorf("FetchModelObjectsByIds fail %s", err)
+		return rows
+	}
+
+	stdRows := manager.SStandaloneResourceBaseManager.FetchCustomizeColumns(ctx, userCred, query, objs, fields, isList)
+
+	for i := range rows {
+		orgNode := objs[i].(*SOrganizationNode)
+		if org, ok := orgMaps[orgNode.OrgId]; ok {
+			rows[i] = api.SOrganizationNodeDetails{
+				SOrganizationNode: api.SOrganizationNode{
+					OrgId:     orgNode.OrgId,
+					FullLabel: orgNode.FullLabel,
+					Level:     orgNode.Level,
+					Weight:    orgNode.Weight,
+				},
+				StandaloneResourceDetails: stdRows[i],
+				Organization:              org.Name,
+				Tags:                      orgNode.GetTagSet(&org),
+				Type:                      org.Type,
+			}
+			rows[i].Id = orgNode.Id
+		}
+	}
+
 	return rows
+}
+
+func (manager *SOrganizationNodeManager) FilterBySystemAttributes(q *sqlchemy.SQuery, userCred mcclient.TokenCredential, query jsonutils.JSONObject, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	q = manager.SStandaloneResourceBaseManager.FilterBySystemAttributes(q, userCred, query, scope)
+	q = manager.SPendingDeletedBaseManager.FilterBySystemAttributes(manager.GetIStandaloneModelManager(), q, userCred, query, scope)
+	return q
+}
+
+func (orgNode *SOrganizationNode) ValidateDeleteCondition(ctx context.Context, info *api.ProjectDetails) error {
+	childCnt, err := orgNode.GetDirectChildCount()
+	if err != nil {
+		return errors.Wrap(err, "GetDirectChildCount")
+	}
+	if childCnt > 0 {
+		return errors.Wrapf(httperrors.ErrNotEmpty, "childnodes %d", childCnt)
+	}
+	return orgNode.SStandaloneResourceBase.ValidateDeleteCondition(ctx, nil)
+}
+
+// fake delete
+func (orgNode *SOrganizationNode) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
+	if !orgNode.PendingDeleted {
+		err := orgNode.SPendingDeletedBase.MarkPendingDelete(orgNode.GetIStandaloneModel(), ctx, userCred, "")
+		if err != nil {
+			return errors.Wrap(err, "MarkPendingDelete")
+		}
+	}
+	return nil
+}
+
+func (manager *SOrganizationNodeManager) fetchOrgNodesInfo(ctx context.Context, userCred mcclient.TokenCredential, nodeIds []string, isList bool) ([]api.SOrganizationNodeInfo, error) {
+	q := manager.Query().In("id", nodeIds)
+	nodes := make([]SOrganizationNode, 0)
+	err := db.FetchModelObjects(manager, q, &nodes)
+	if err != nil {
+		return nil, errors.Wrap(err, "FetchModelObjects")
+	}
+	infs := make([]interface{}, 0)
+	for i := range nodes {
+		infs = append(infs, &nodes[i])
+	}
+	nodeDetails := manager.FetchCustomizeColumns(ctx, userCred, nil, infs, nil, isList)
+	ret := make([]api.SOrganizationNodeInfo, 0)
+	for i := range nodeDetails {
+		node := nodeDetails[i]
+		ret = append(ret, api.SOrganizationNodeInfo{
+			Id:           node.Id,
+			FullLabel:    node.FullLabel,
+			OrgId:        node.OrgId,
+			Organization: node.Organization,
+			Tags:         node.Tags,
+			Type:         node.Type,
+		})
+	}
+	return ret, nil
 }

@@ -153,10 +153,6 @@ func (service *SService) PostDelete(ctx context.Context, userCred mcclient.Token
 	logclient.AddActionLogWithContext(ctx, service, logclient.ACT_DELETE, nil, userCred, true)
 }
 
-func (service *SService) AllowGetDetailsConfig(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) bool {
-	return db.IsAdminAllowGetSpec(ctx, userCred, service, "config")
-}
-
 func (service *SService) GetDetailsConfig(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject) (jsonutils.JSONObject, error) {
 	var whiteList, blackList map[string][]string
 	if service.isCommonService() {
@@ -173,10 +169,6 @@ func (service *SService) GetDetailsConfig(ctx context.Context, userCred mcclient
 	result := jsonutils.NewDict()
 	result.Add(jsonutils.Marshal(conf), "config")
 	return result, nil
-}
-
-func (service *SService) AllowPerformConfig(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input api.PerformConfigInput) bool {
-	return db.IsAdminAllowUpdateSpec(ctx, userCred, service, "config")
 }
 
 func (service *SService) isCommonService() bool {
@@ -198,7 +190,7 @@ func (service *SService) PerformConfig(ctx context.Context, userCred mcclient.To
 		changed, err = saveConfigs(userCred, action, service, opts, nil, api.MergeServiceConfigOptions(api.CommonWhitelistOptionMap, api.ServiceBlacklistOptionMap), nil)
 	}
 	if err != nil {
-		return nil, httperrors.NewInternalServerError("saveConfigs fail %s", err)
+		return nil, err
 	}
 	if changed {
 		diff := SService{ConfigVersion: 1}
@@ -207,7 +199,7 @@ func (service *SService) PerformConfig(ctx context.Context, userCred mcclient.To
 			return nil, httperrors.NewInternalServerError("update config version fail %s", err)
 		}
 		if service.Type == api.SERVICE_TYPE || service.Type == consts.COMMON_SERVICE {
-			options.OptionManager.SyncOnce()
+			options.OptionManager.SyncOnce(false, false)
 		}
 	}
 	return service.GetDetailsConfig(ctx, userCred, query)

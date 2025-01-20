@@ -186,7 +186,7 @@ func (self *BlockJob) CalcOffset(preOffset int64) {
 
 type Monitor interface {
 	Connect(host string, port int) error
-	ConnectWithSocket(address string) error
+	ConnectWithSocket(address string, timeout time.Duration) error
 	Disconnect()
 	IsConnected() bool
 
@@ -200,7 +200,7 @@ type Monitor interface {
 	GetBlockJobCounts(func(jobs int))
 	GetBlockJobs(func([]BlockJob))
 	QueryPci(callback QueryPciCallback)
-	GetScsiNumQueues(callback func(int64))
+	InfoQtree(cb StringCallback)
 
 	GetCpuCount(func(count int))
 	AddCpu(cpuIndex int, callback StringCallback)
@@ -238,6 +238,7 @@ type Monitor interface {
 	GetMigrateStatus(callback StringCallback)
 	MigrateStartPostcopy(callback StringCallback)
 	GetMigrateStats(callback MigrateStatsCallback)
+	MigrateCancel(cb StringCallback)
 
 	ReloadDiskBlkdev(device, path string, callback StringCallback)
 	SetVncPassword(proto, password string, callback StringCallback)
@@ -304,6 +305,12 @@ func (m *SBaseMonitor) onConnectSuccess(conn net.Conn) {
 	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	// set rwc hand
 	m.rwc = conn
+}
+
+func (m *SBaseMonitor) SetReadDeadlineTimeout(duration time.Duration) {
+	if m.rwc != nil {
+		m.rwc.SetReadDeadline(time.Now().Add(duration))
+	}
 }
 
 func (m *SBaseMonitor) Connect(host string, port int) error {

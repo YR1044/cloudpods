@@ -137,6 +137,7 @@ func (manager *SVpcResourceBaseManager) FetchCustomizeColumns(
 			vpc := vpcs[vpcIds[i]]
 			rows[i].Vpc = vpc.Name
 			rows[i].VpcExtId = vpc.ExternalId
+			rows[i].IsDefaultVpc = vpc.IsDefault
 			rows[i].CloudregionId = vpc.CloudregionId
 			rows[i].ManagerId = vpc.ManagerId
 		}
@@ -170,7 +171,7 @@ func (manager *SVpcResourceBaseManager) ListItemFilter(
 		case api.CLASSIC_VPC_NAME:
 			conditions = append(conditions, sqlchemy.Equals(q.Field("name"), api.CLASSIC_VPC_NAME))
 		default:
-			_, err := validators.ValidateModel(userCred, VpcManager, &vpcId)
+			_, err := validators.ValidateModel(ctx, userCred, VpcManager, &vpcId)
 			if err != nil {
 				return nil, err
 			}

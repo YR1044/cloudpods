@@ -405,9 +405,9 @@ func (self *SHost) GetMemSizeMB() int {
 	return int(self.MemoryCapacityInBytes / 1024 / 1024)
 }
 
-func (self *SHost) GetStorageSizeMB() int {
+func (self *SHost) GetStorageSizeMB() int64 {
 	sizeBytes, _ := strconv.Atoi(self.UsageStats.StorageCapacityBytes)
-	return sizeBytes / 1024 / 1024
+	return int64(sizeBytes) / 1024 / 1024
 }
 
 func (self *SHost) GetStorageType() string {
@@ -422,8 +422,12 @@ func (self *SHost) GetHostStatus() string {
 	return api.HOST_ONLINE
 }
 
-func (self *SHost) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
-	return []cloudprovider.ICloudHostNetInterface{}, nil
+func (host *SHost) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
+	wires, err := host.getIWires()
+	if err != nil {
+		return nil, errors.Wrap(err, "GetIWires")
+	}
+	return cloudprovider.GetHostNetifs(host, wires), nil
 }
 
 func (self *SHost) GetIsMaintenance() bool {
@@ -495,7 +499,7 @@ func (self *SHost) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
 	return vm, nil
 }
 
-func (self *SHost) GetIWires() ([]cloudprovider.ICloudWire, error) {
+func (self *SHost) getIWires() ([]cloudprovider.ICloudWire, error) {
 	vpcs, err := self.zone.region.GetIVpcs()
 	if err != nil {
 		return nil, err

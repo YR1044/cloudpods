@@ -106,7 +106,7 @@ type SUcloudClient struct {
 func NewUcloudClient(cfg *UcloudClientConfig) (*SUcloudClient, error) {
 	httpClient := cfg.cpcfg.AdaptiveTimeoutHttpClient()
 	ts, _ := httpClient.Transport.(*http.Transport)
-	httpClient.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response), error) {
+	httpClient.Transport = cloudprovider.GetCheckTransport(ts, func(req *http.Request) (func(resp *http.Response) error, error) {
 		if cfg.cpcfg.ReadOnly {
 			if req.ContentLength > 0 {
 				body, err := ioutil.ReadAll(req.Body)
@@ -298,6 +298,7 @@ func (self *SUcloudClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error)
 	subAccounts := make([]cloudprovider.SSubAccount, 0)
 	for _, project := range projects {
 		subAccount := cloudprovider.SSubAccount{}
+		subAccount.Id = project.ProjectID
 		subAccount.Name = fmt.Sprintf("%s-%s", self.cpcfg.Name, project.ProjectName)
 		// ucloud账号ID中可能包含/。因此使用::作为分割符号
 		subAccount.Account = fmt.Sprintf("%s::%s", self.accessKeyId, project.ProjectID)
@@ -313,8 +314,8 @@ func (self *SUcloudClient) GetAccountId() string {
 	return "" // no account ID found for ucloud
 }
 
-func (self *SUcloudClient) GetIRegions() []cloudprovider.ICloudRegion {
-	return self.iregions
+func (self *SUcloudClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
+	return self.iregions, nil
 }
 
 func removeDigit(idstr string) string {
@@ -403,6 +404,7 @@ func (self *SUcloudClient) GetCapabilities() []string {
 		// cloudprovider.CLOUD_CAPABILITY_PROJECT,
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 		// cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
 		// cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,

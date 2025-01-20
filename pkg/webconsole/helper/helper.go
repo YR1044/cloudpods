@@ -30,7 +30,7 @@ import (
 	o "yunion.io/x/onecloud/pkg/webconsole/options"
 )
 
-func GetValidPrivateKey(host string, port int64, username string, projectId string) (string, error) {
+func GetValidPrivateKey(host string, port int, username string, projectId string) (string, error) {
 	errs := []error{}
 	ctx := context.Background()
 	admin := auth.GetAdminSession(ctx, o.Options.Region)
@@ -85,7 +85,7 @@ func GetValidPrivateKey(host string, port int64, username string, projectId stri
 		addr := fmt.Sprintf("%s:%d", host, port)
 		client, err := ssh.Dial("tcp", addr, config)
 		if err != nil {
-			errs = append(errs, errors.Wrapf(err, "dial %s", addr))
+			errs = append(errs, errors.Wrapf(err, "dial %s by %s", addr, username))
 			continue
 		}
 		defer client.Close()

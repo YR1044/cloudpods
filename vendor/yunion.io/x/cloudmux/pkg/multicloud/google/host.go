@@ -109,7 +109,7 @@ func (host *SHost) GetMemSizeMB() int {
 	return 0
 }
 
-func (host *SHost) GetStorageSizeMB() int {
+func (host *SHost) GetStorageSizeMB() int64 {
 	return 0
 }
 
@@ -126,7 +126,7 @@ func (host *SHost) GetWire() *SWire {
 	return &SWire{vpc: vpc}
 }
 
-func (host *SHost) GetIWires() ([]cloudprovider.ICloudWire, error) {
+func (host *SHost) getIWires() ([]cloudprovider.ICloudWire, error) {
 	ivpcs, err := host.zone.region.GetIVpcs()
 	if err != nil {
 		return nil, errors.Wrap(err, "region.GetIVpcs")
@@ -177,7 +177,11 @@ func (host *SHost) CreateVM(desc *cloudprovider.SManagedVMCreateConfig) (cloudpr
 }
 
 func (host *SHost) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
-	return nil, cloudprovider.ErrNotSupported
+	wires, err := host.getIWires()
+	if err != nil {
+		return nil, errors.Wrap(err, "getIWires")
+	}
+	return cloudprovider.GetHostNetifs(host, wires), nil
 }
 
 func (host *SHost) GetIsMaintenance() bool {

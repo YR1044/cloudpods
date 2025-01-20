@@ -60,11 +60,12 @@ const (
 	STORAGE_CLOUD_HSSD    = "cloud_hssd"    //增强型SSD云硬盘
 
 	// huawei storage type
-	STORAGE_HUAWEI_SSD   = "SSD"   // 超高IO云硬盘
-	STORAGE_HUAWEI_SAS   = "SAS"   // 高IO云硬盘
-	STORAGE_HUAWEI_SATA  = "SATA"  // 普通IO云硬盘
-	STORAGE_HUAWEI_GPSSD = "GPSSD" // 通用型SSD
-	STORAGE_HUAWEI_ESSD  = "ESSD"  // 急速型SSD
+	STORAGE_HUAWEI_SSD    = "SSD"    // 超高IO云硬盘
+	STORAGE_HUAWEI_SAS    = "SAS"    // 高IO云硬盘
+	STORAGE_HUAWEI_SATA   = "SATA"   // 普通IO云硬盘
+	STORAGE_HUAWEI_GPSSD  = "GPSSD"  // 通用型SSD
+	STORAGE_HUAWEI_GPSSD2 = "GPSSD2" // 通用型SSD V2
+	STORAGE_HUAWEI_ESSD   = "ESSD"   // 急速型SSD
 
 	// openstack
 	STORAGE_OPENSTACK_ISCSI = "iscsi"
@@ -80,6 +81,7 @@ const (
 	// Zstack storage type
 	STORAGE_ZSTACK_LOCAL_STORAGE = "localstorage"
 	STORAGE_ZSTACK_CEPH          = "ceph"
+	STORAGE_ZSTACK_SHARED_BLOCK  = "sharedblock"
 
 	// Google storage type
 	STORAGE_GOOGLE_LOCAL_SSD   = "local-ssd"   //本地SSD暂存盘 (最多8个)
@@ -88,9 +90,10 @@ const (
 	STORAGE_GOOGLE_PD_BALANCED = "pd-balanced" //平衡永久性磁盘
 
 	// ctyun storage type
-	STORAGE_CTYUN_SSD  = "SSD"  // 超高IO云硬盘
-	STORAGE_CTYUN_SAS  = "SAS"  // 高IO云硬盘
-	STORAGE_CTYUN_SATA = "SATA" // 普通IO云硬盘
+	STORAGE_CTYUN_SSD        = "SSD"        // 超高IO云硬盘
+	STORAGE_CTYUN_SAS        = "SAS"        // 高IO云硬盘
+	STORAGE_CTYUN_SATA       = "SATA"       // 普通IO云硬盘
+	STORAGE_CTYUN_SSD_GENRIC = "SSD-genric" // 超高IO
 
 	// jd cloud storage type
 	STORAGE_JDCLOUD_GP1 = "ssd.gp1"     // 通用型SSD云硬盘
@@ -104,6 +107,25 @@ const (
 	STORAGE_ECLOUD_SSD    = "ssd"    // 高性能盘
 	STORAGE_ECLOUD_SSDEBS = "ssdebs" // 性能优化盘
 	STORAGE_ECLOUD_SYSTEM = "system" // 系统盘
+
+	// volcengine storage type
+	STORAGE_VOLCENGINE_FlexPL = "ESSD_FlexPL" // 极速型SSD(单盘最大IOPS 5万)
+	STORAGE_VOLCENGINE_PL0    = "ESSD_PL0"    // 极速型SSD(单盘最大IOPS 1万)
+	STORAGE_VOLCENGINE_PTSSD  = "PTSSD"       // 性能型SSD(上一代产品)
+
+	STORAGE_FULL        = "full"
+	STORAGE_SYSTEM_FULL = "system_full"
+
+	// baidu storage type
+	STORAGE_BAIDU_SSD              = "ssd"              // 通用型SSD
+	STORAGE_BAIDU_PREMIUM_SSD      = "premium_ssd"      // 高性能云磁盘
+	STORAGE_BAIDU_HDD              = "hdd"              // 通用型HDD
+	STORAGE_BAIDU_ENHANCED_SSD_PL1 = "enhanced_ssd_pl1" // 增强型SSD_PL1
+	STORAGE_BAIDU_ENHANCED_SSD_PL2 = "enhanced_ssd_pl2" // 增强型SSD_PL2
+	STORAGE_BAIDU_ENHANCED_SSD_PL3 = "enhanced_ssd_pl3" // 增强型SSD_PL2
+
+	// ZettaKit
+	STORAGE_ZETTAKIT_NORMAL = "normal"
 )
 
 const (

@@ -42,6 +42,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-model-singular=cloud_kube_cluster
+// +onecloud:swagger-gen-model-plural=cloud_kube_clusters
 type SKubeClusterManager struct {
 	db.SEnabledStatusInfrasResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -71,7 +73,7 @@ type SKubeCluster struct {
 	SVpcResourceBase         `wdith:"36" charset:"ascii" nullable:"false" list:"domain" create:"domain_required"`
 	SCloudregionResourceBase `width:"36" charset:"ascii" nullable:"false" list:"domain" create:"domain_required" default:"default"`
 
-	Version string `width:"12" charset:"utf8" nullable:"false" list:"admin" create:"domain_optional"`
+	Version string `width:"24" charset:"utf8" nullable:"false" list:"admin" create:"domain_optional"`
 
 	// 本地KubeserverId
 	ExternalClusterId string `width:"36" charset:"ascii" nullable:"false" list:"admin"`
@@ -133,10 +135,10 @@ func (manager *SKubeClusterManager) FetchCustomizeColumns(
 	for i := range rows {
 		rows[i] = api.KubeClusterDetails{
 			EnabledStatusInfrasResourceBaseDetails: stdRows[i],
-			ManagedResourceInfo:                    managerRows[i],
-			CloudregionResourceInfo:                regionRows[i],
 			VpcResourceInfo:                        vpcRows[i],
 		}
+		rows[i].ManagedResourceInfo = managerRows[i]
+		rows[i].CloudregionResourceInfo = regionRows[i]
 	}
 	return rows
 }
@@ -225,7 +227,7 @@ func (self *SKubeCluster) syncRemoveCloudKubeCluster(ctx context.Context, userCr
 
 	err := self.ValidateDeleteCondition(ctx, nil)
 	if err != nil { // cannot delete
-		self.SetStatus(userCred, apis.STATUS_UNKNOWN, "sync to delete")
+		self.SetStatus(ctx, userCred, apis.STATUS_UNKNOWN, "sync to delete")
 		return errors.Wrapf(err, "ValidateDeleteCondition")
 	}
 	return self.RealDelete(ctx, userCred)
@@ -360,7 +362,9 @@ func (self *SKubeCluster) SyncWithCloudKubeCluster(ctx context.Context, userCred
 		return err
 	}
 
-	syncMetadata(ctx, userCred, self, ext)
+	if account, _ := provider.GetCloudaccount(); account != nil {
+		syncMetadata(ctx, userCred, self, ext, account.ReadOnly)
+	}
 
 	if provider != nil {
 		SyncCloudDomain(userCred, self, provider.GetOwnerId())
@@ -426,7 +430,7 @@ func (self *SCloudregion) newFromCloudKubeCluster(ctx context.Context, userCred 
 		return nil, errors.Wrapf(err, "Insert")
 	}
 
-	syncMetadata(ctx, userCred, &cluster, ext)
+	syncMetadata(ctx, userCred, &cluster, ext, false)
 	SyncCloudDomain(userCred, &cluster, provider.GetOwnerId())
 
 	if provider != nil {
@@ -457,7 +461,7 @@ func (manager *SKubeClusterManager) ValidateCreateData(
 	if len(input.VpcId) == 0 {
 		return nil, httperrors.NewMissingParameterError("vpc_id")
 	}
-	vpcObj, err := validators.ValidateModel(userCred, VpcManager, &input.VpcId)
+	vpcObj, err := validators.ValidateModel(ctx, userCred, VpcManager, &input.VpcId)
 	if err != nil {
 		return nil, err
 	}
@@ -476,7 +480,7 @@ func (manager *SKubeClusterManager) ValidateCreateData(
 		return nil, httperrors.NewMissingParameterError("network_ids")
 	}
 	for i := range input.NetworkIds {
-		_, err = validators.ValidateModel(userCred, NetworkManager, &input.NetworkIds[i])
+		_, err = validators.ValidateModel(ctx, userCred, NetworkManager, &input.NetworkIds[i])
 		if err != nil {
 			return nil, err
 		}
@@ -503,7 +507,7 @@ func (self *SKubeCluster) StartKubeClusterCreateTask(ctx context.Context, userCr
 	if err != nil {
 		return errors.Wrapf(err, "NewTask")
 	}
-	self.SetStatus(userCred, api.KUBE_CLUSTER_STATUS_CREATING, "")
+	self.SetStatus(ctx, userCred, api.KUBE_CLUSTER_STATUS_CREATING, "")
 	return task.ScheduleRun(nil)
 }
 
@@ -531,7 +535,7 @@ func (self *SKubeCluster) GetIKubeCluster(ctx context.Context) (cloudprovider.IC
 }
 
 func (self *SKubeCluster) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
-	self.SetStatus(userCred, apis.STATUS_DELETING, "")
+	self.SetStatus(ctx, userCred, apis.STATUS_DELETING, "")
 	return nil
 }
 

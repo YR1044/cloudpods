@@ -34,6 +34,12 @@ func (self StorageUsage) IsZero() bool {
 	return self.HostCount+self.DiskCount+self.SnapshotCount == 0
 }
 
+type StorageHardwareInfo struct {
+	Model     *string `json:"model"`
+	Vendor    *string `json:"vendor"`
+	Bandwidth float64 `json:"bandwidth" help:"Bandwidth of the device, and the unit is GB/s"`
+}
+
 type StorageCreateInput struct {
 	apis.EnabledStatusInfrasResourceBaseCreateInput
 
@@ -54,12 +60,12 @@ type StorageCreateInput struct {
 	// local: 本地存储
 	// rbd: ceph块存储, ceph存储创建时仅会检测是否重复创建，不会具体检测认证参数是否合法，只有挂载存储时
 	// 计算节点会验证参数，若挂载失败，宿主机和存储不会关联，可以通过查看存储日志查找挂载失败原因
-	// enum: local, rbd, nfs, gpfs
+	// enum: ["local", "rbd", "nfs", "gpfs"]
 	// required: true
 	StorageType string `json:"storage_type"`
 
 	// 存储介质类型
-	// enum: rotate, ssd, hybird
+	// enum: ["rotate", "ssd", "hybird"]
 	// required: true
 	// default: ssd
 	MediumType string `json:"medium_type"`
@@ -70,6 +76,9 @@ type StorageCreateInput struct {
 	// 单个ip或以逗号分隔的多个ip具体可查询 /etc/ceph/ceph.conf 文件
 	// example: 192.168.222.3,192.168.222.4,192.168.222.99
 	RbdMonHost string `json:"rbd_mon_host"`
+
+	// enable ceph messenger v2
+	EnableMessengerV2 *bool `json:"enable_messenger_v2"`
 
 	// swagger:ignore
 	MonHost string
@@ -104,6 +113,14 @@ type StorageCreateInput struct {
 	// 网络文件系统共享目录, storage_type 为 nfs 时, 此参数必传
 	// example: /nfs_root/
 	NfsSharedDir string `json:"nfs_shared_dir"`
+
+	// swagger:ignore
+	HardwareInfo *StorageHardwareInfo `json:"hardware_info"`
+	// CLVM VG Name
+	CLVMVgName string
+	// SLVM VG Name
+	SLVMVgName string
+	Lvmlockd   bool
 }
 
 type RbdTimeoutInput struct {
@@ -140,8 +157,10 @@ type SStorageCapacityInfo struct {
 }
 
 type StorageHost struct {
-	Id   string
-	Name string
+	Id         string
+	Name       string
+	Status     string
+	HostStatus string
 }
 
 type StorageDetails struct {
@@ -163,6 +182,9 @@ type StorageDetails struct {
 
 	// 超分比
 	CommitBound float32 `json:"commit_bound"`
+
+	// master host name
+	MasterHostName string `json:"master_host_name"`
 }
 
 func (self StorageDetails) GetMetricTags() map[string]string {
@@ -175,7 +197,7 @@ func (self StorageDetails) GetMetricTags() map[string]string {
 		"project_domain": self.ProjectDomain,
 		"external_id":    self.ExternalId,
 	}
-	return ret
+	return AppendMetricTags(ret, self.MetadataResourceInfo)
 }
 
 func (self StorageDetails) GetMetricPairs() map[string]string {
@@ -222,10 +244,21 @@ type StorageUpdateInput struct {
 	// example: AQDigB9dtnDAKhAAxS6X4zi4BPR/lIle4nf4Dw==
 	RbdKey string `json:"rbd_key"`
 
+	// enable ceph messenger v2
+	EnableMessengerV2 *bool `json:"enable_messenger_v2"`
+
 	RbdTimeoutInput
 
 	// swagger:ignore
 	StorageConf *jsonutils.JSONDict
 
 	UpdateStorageConf bool
+
+	// swagger:ignore
+	HardwareInfo *StorageHardwareInfo `json:"hardware_info"`
+	MasterHost   string
+}
+
+type StorageSetCmtBoundInput struct {
+	Cmtbound *float32
 }

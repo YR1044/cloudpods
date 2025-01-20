@@ -23,7 +23,6 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/tristate"
 
-	"yunion.io/x/onecloud/pkg/apis/compute"
 	"yunion.io/x/onecloud/pkg/compute/models"
 	"yunion.io/x/onecloud/pkg/scheduler/api"
 	"yunion.io/x/onecloud/pkg/scheduler/core/score"
@@ -448,15 +447,17 @@ func (u *Unit) SchedData() *api.SchedInfo {
 }
 
 func (u *Unit) GetHypervisor() string {
-	hypervisor := compute.HOSTTYPE_HYPERVISOR[u.SchedData().Hypervisor]
-	if hypervisor == "" {
-		hypervisor = u.SchedData().Hypervisor
+	driver, _ := models.GetHostDriver(u.SchedInfo.Hypervisor, u.SchedInfo.Provider)
+	if driver != nil {
+		return driver.GetHypervisor()
 	}
-	return hypervisor
+	return u.SchedData().Hypervisor
 }
 
 func (u *Unit) GetHypervisorDriver() models.IGuestDriver {
-	return models.GetDriver(u.GetHypervisor())
+	hypervisor := u.GetHypervisor()
+	driver, _ := models.GetDriver(hypervisor, u.SchedInfo.Provider)
+	return driver
 }
 
 func (u *Unit) AppendFailedCandidates(fcs []FailedCandidate) {
@@ -636,7 +637,7 @@ func (u *Unit) setScore(id string, val score.SScore, prefer tristate.TriState) {
 
 	scoreObj.ScoreBucket.SetScore(val, prefer)
 
-	log.V(10).Infof("SetScore: %q -> %s", id, val.String())
+	log.V(10).Infof("SetScore: %q -> %s, prefer: %s", id, val.String(), prefer)
 }
 
 func (u *Unit) SetScore(id string, val score.SScore) {

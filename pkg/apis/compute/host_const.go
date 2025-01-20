@@ -21,9 +21,9 @@ import (
 const (
 	HOST_TYPE_BAREMETAL  = "baremetal"
 	HOST_TYPE_HYPERVISOR = "hypervisor" // KVM
+	HOST_TYPE_CONTAINER  = "container"
 	HOST_TYPE_KVM        = "kvm"
 	HOST_TYPE_ESXI       = compute.HOST_TYPE_ESXI // # VMWare vSphere ESXi
-	HOST_TYPE_KUBELET    = "kubelet"              // # Kubernetes Kubelet
 	HOST_TYPE_HYPERV     = "hyperv"               // # Microsoft Hyper-V
 	HOST_TYPE_XEN        = "xen"                  // # XenServer
 
@@ -38,6 +38,7 @@ const (
 	HOST_TYPE_HCS            = compute.HOST_TYPE_HCS
 	HOST_TYPE_OPENSTACK      = compute.HOST_TYPE_OPENSTACK
 	HOST_TYPE_UCLOUD         = compute.HOST_TYPE_UCLOUD
+	HOST_TYPE_VOLCENGINE     = compute.HOST_TYPE_VOLCENGINE
 	HOST_TYPE_ZSTACK         = compute.HOST_TYPE_ZSTACK
 	HOST_TYPE_GOOGLE         = compute.HOST_TYPE_GOOGLE
 	HOST_TYPE_CTYUN          = compute.HOST_TYPE_CTYUN
@@ -52,6 +53,13 @@ const (
 	HOST_TYPE_H3C            = compute.HOST_TYPE_H3C
 	HOST_TYPE_KSYUN          = compute.HOST_TYPE_KSYUN
 	HOST_TYPE_BAIDU          = compute.HOST_TYPE_BAIDU
+	HOST_TYPE_CUCLOUD        = compute.HOST_TYPE_CUCLOUD
+	HOST_TYPE_QINGCLOUD      = compute.HOST_TYPE_QINGCLOUD
+	HOST_TYPE_ORACLE         = compute.HOST_TYPE_ORACLE
+	HOST_TYPE_SANGFOR        = compute.HOST_TYPE_SANGFOR
+	HOST_TYPE_ZETTAKIT       = compute.HOST_TYPE_ZETTAKIT
+	HOST_TYPE_UIS            = compute.HOST_TYPE_UIS
+	HOST_TYPE_CAS            = compute.HOST_TYPE_CAS
 
 	HOST_TYPE_DEFAULT = HOST_TYPE_HYPERVISOR
 
@@ -61,9 +69,10 @@ const (
 	HOST_OFFLINE  = compute.HOST_OFFLINE
 	HOST_DISABLED = "offline"
 
-	NIC_TYPE_IPMI   = compute.NIC_TYPE_IPMI
-	NIC_TYPE_ADMIN  = compute.NIC_TYPE_ADMIN
-	NIC_TYPE_NORMAL = compute.NIC_TYPE_NORMAL
+	NIC_TYPE_IPMI       = compute.NIC_TYPE_IPMI
+	NIC_TYPE_ADMIN      = compute.NIC_TYPE_ADMIN
+	NIC_TYPE_NORMAL     = compute.NIC_TYPE_NORMAL
+	NIC_TYPE_INFINIBAND = compute.TNicType("infiniband")
 
 	BAREMETAL_INIT           = "init"
 	BAREMETAL_PREPARE        = "prepare"
@@ -118,7 +127,7 @@ var HOST_TYPES = []string{
 	HOST_TYPE_BAREMETAL,
 	HOST_TYPE_HYPERVISOR,
 	HOST_TYPE_ESXI,
-	HOST_TYPE_KUBELET,
+	HOST_TYPE_CONTAINER,
 	HOST_TYPE_XEN,
 	HOST_TYPE_ALIYUN,
 	HOST_TYPE_APSARA,
@@ -131,6 +140,7 @@ var HOST_TYPES = []string{
 	HOST_TYPE_HCSOP,
 	HOST_TYPE_OPENSTACK,
 	HOST_TYPE_UCLOUD,
+	HOST_TYPE_VOLCENGINE,
 	HOST_TYPE_ZSTACK,
 	HOST_TYPE_CTYUN,
 	HOST_TYPE_GOOGLE,
@@ -144,6 +154,12 @@ var HOST_TYPES = []string{
 	HOST_TYPE_H3C,
 	HOST_TYPE_KSYUN,
 	HOST_TYPE_BAIDU,
+	HOST_TYPE_CUCLOUD,
+	HOST_TYPE_QINGCLOUD,
+	HOST_TYPE_ORACLE,
+	HOST_TYPE_SANGFOR,
+	HOST_TYPE_ZETTAKIT,
+	HOST_TYPE_UIS,
 }
 
 var ALL_NIC_TYPES = []compute.TNicType{NIC_TYPE_IPMI, NIC_TYPE_ADMIN, NIC_TYPE_NORMAL}
@@ -169,8 +185,10 @@ const (
 const (
 	HOSTMETA_AUTO_MIGRATE_ON_HOST_DOWN     = "__auto_migrate_on_host_down"
 	HOSTMETA_AUTO_MIGRATE_ON_HOST_SHUTDOWN = "__auto_migrate_on_host_shutdown"
+	HOSTMETA_HOST_ERRORS                   = "__host_errors"
 )
 
 const (
 	HOSTMETA_RESERVED_CPUS_INFO = "reserved_cpus_info"
+	HOSTMETA_RESERVED_CPUS_RATE = "reserved_cpus_rate"
 )

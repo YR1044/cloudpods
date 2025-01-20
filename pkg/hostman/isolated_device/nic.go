@@ -26,7 +26,6 @@ import (
 	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
-	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 )
@@ -57,6 +56,17 @@ func getSRIOVNics(hostNics []HostNic) ([]*sSRIOVNicDevice, error) {
 	log.Infof("host nics %s detected support sriov nics %v", hostNics, nics)
 	sriovNics := make([]*sSRIOVNicDevice, 0)
 	for i := 0; i < len(nics); i++ {
+		nicType, err := fileutils2.FileGetContents(path.Join(sysfsNetDir, nics[i].Interface, "type"))
+		if err != nil {
+			return nil, errors.Wrap(err, "failed get nic type")
+		}
+		var isInfinibandNic = false
+		if strings.TrimSpace(nicType) == "32" {
+			// include/uapi/linux/if_arp.h
+			// #define ARPHRD_INFINIBAND 32		/* InfiniBand			*/
+			isInfinibandNic = true
+		}
+
 		nicDir := path.Join(sysfsNetDir, nics[i].Interface, "device")
 		err = ensureNumvfsEqualTotalvfs(nicDir)
 		if err != nil {
@@ -77,158 +87,50 @@ func getSRIOVNics(hostNics []HostNic) ([]*sSRIOVNicDevice, error) {
 					return nil, err
 				}
 				vfBDF := path.Base(vfPath)
-				vfDev, err := detectSRIOVNicDevice(vfBDF)
+				vfDev, err := detectSRIOVDevice(vfBDF)
 				if err != nil {
 					return nil, err
 				}
-				sriovNics = append(sriovNics, NewSRIOVNicDevice(vfDev, api.NIC_TYPE, nics[i].Wire, nics[i].Interface, virtfn))
+				sriovNics = append(sriovNics, NewSRIOVNicDevice(vfDev, api.NIC_TYPE, nics[i].Wire, nics[i].Interface, virtfn, isInfinibandNic))
 			}
 		}
 	}
 	return sriovNics, nil
 }
 
-func ensureNumvfsEqualTotalvfs(nicDir string) error {
-	sriovNumvfs := path.Join(nicDir, "sriov_numvfs")
-	sriovTotalvfs := path.Join(nicDir, "sriov_totalvfs")
-	numvfs, err := fileutils2.FileGetContents(sriovNumvfs)
-	if err != nil {
-		return err
-	}
-	totalvfs, err := fileutils2.FileGetContents(sriovTotalvfs)
-	if err != nil {
-		return err
-	}
-	log.Errorf("numvfs %s total vfs %s", numvfs, totalvfs)
-	if numvfs != totalvfs {
-		return fileutils2.FilePutContents(sriovNumvfs, fmt.Sprintf("%s", totalvfs), false)
-	}
-	return nil
-}
-
-func detectSRIOVNicDevice(vfBDF string) (*PCIDevice, error) {
-	dev, err := detectPCIDevByAddrWithoutIOMMUGroup(vfBDF)
-	if err != nil {
-		return nil, err
-	}
-	driver, err := dev.getKernelDriver()
-	if err != nil {
-		return nil, err
-	}
-	if driver == VFIO_PCI_KERNEL_DRIVER {
-		return dev, nil
-	}
-	if driver != "" {
-		if err = dev.unbindDriver(); err != nil {
-			return nil, err
-		}
-	}
-	if err = dev.bindDriver(); err != nil {
-		return nil, err
-	}
-	return dev, nil
-}
-
-func NewSRIOVNicDevice(dev *PCIDevice, devType, wireId, pfName string, virtfn int) *sSRIOVNicDevice {
+func NewSRIOVNicDevice(dev *PCIDevice, devType, wireId, pfName string, virtfn int, isInfinibandNic bool) *sSRIOVNicDevice {
 	return &sSRIOVNicDevice{
-		sBaseDevice: newBaseDevice(dev, devType),
-		WireId:      wireId,
-		pfName:      pfName,
-		virtfn:      virtfn,
+		sSRIOVBaseDevice: newSRIOVBaseDevice(dev, devType),
+		WireId:           wireId,
+		pfName:           pfName,
+		virtfn:           virtfn,
+		isInfinibandNic:  isInfinibandNic,
 	}
 }
 
 type sSRIOVNicDevice struct {
-	*sBaseDevice
+	*sSRIOVBaseDevice
 
-	WireId string
-	pfName string
-	virtfn int
+	WireId          string
+	pfName          string
+	virtfn          int
+	isInfinibandNic bool
 }
 
 func (dev *sSRIOVNicDevice) GetPfName() string {
 	return dev.pfName
 }
 
+func (dev *sSRIOVNicDevice) IsInfinibandNic() bool {
+	return dev.isInfinibandNic
+}
+
 func (dev *sSRIOVNicDevice) GetVirtfn() int {
 	return dev.virtfn
 }
 
-func (dev *sSRIOVNicDevice) GetVGACmd() string {
-	return ""
-}
-
-func (dev *sSRIOVNicDevice) GetCPUCmd() string {
-	return ""
-}
-
-func (dev *sSRIOVNicDevice) GetQemuId() string {
-	return fmt.Sprintf("dev_%s", strings.ReplaceAll(dev.GetAddr(), ":", "_"))
-}
-
 func (dev *sSRIOVNicDevice) GetWireId() string {
 	return dev.WireId
-}
-
-func (dev *sSRIOVNicDevice) GetHotPlugOptions(isolatedDev *desc.SGuestIsolatedDevice) ([]*HotPlugOption, error) {
-	ret := make([]*HotPlugOption, 0)
-
-	var masterDevOpt *HotPlugOption
-	for i := 0; i < len(isolatedDev.VfioDevs); i++ {
-		cmd := isolatedDev.VfioDevs[i].HostAddr
-		if optCmd := isolatedDev.VfioDevs[i].OptionsStr(); len(optCmd) > 0 {
-			cmd += fmt.Sprintf(",%s", optCmd)
-		}
-		opts := map[string]string{
-			"host": cmd,
-			"id":   isolatedDev.VfioDevs[i].Id,
-		}
-		devOpt := &HotPlugOption{
-			Device:  isolatedDev.VfioDevs[i].DevType,
-			Options: opts,
-		}
-		if isolatedDev.VfioDevs[i].Function == 0 {
-			masterDevOpt = devOpt
-		} else {
-			ret = append(ret, devOpt)
-		}
-	}
-	// if PCI slot function 0 already assigned, qemu will reject hotplug function
-	// so put function 0 at the enda
-	if masterDevOpt == nil {
-		return nil, errors.Errorf("Device no function 0 found")
-	}
-	ret = append(ret, masterDevOpt)
-	return ret, nil
-}
-
-func (dev *sSRIOVNicDevice) GetHotUnplugOptions(isolatedDev *desc.SGuestIsolatedDevice) ([]*HotUnplugOption, error) {
-	if len(isolatedDev.VfioDevs) == 0 {
-		return nil, errors.Errorf("device %s no pci ids", isolatedDev.Id)
-	}
-
-	return []*HotUnplugOption{
-		{
-			Id: isolatedDev.VfioDevs[0].Id,
-		},
-	}, nil
-}
-
-func (dev *sSRIOVNicDevice) CustomProbe(idx int) error {
-	// check environments on first probe
-	if idx == 0 {
-		for _, driver := range []string{"vfio", "vfio_iommu_type1", "vfio-pci"} {
-			if err := procutils.NewRemoteCommandAsFarAsPossible("modprobe", driver).Run(); err != nil {
-				return fmt.Errorf("modprobe %s: %v", driver, err)
-			}
-		}
-	}
-
-	driver, err := dev.GetKernelDriver()
-	if err != nil {
-		return fmt.Errorf("Nic %s is occupied by another driver: %s", dev.GetAddr(), driver)
-	}
-	return nil
 }
 
 func getOvsOffloadNics(hostNics []HostNic) ([]*sOvsOffloadNicDevice, error) {
@@ -350,9 +252,9 @@ func getOvsOffloadNics(hostNics []HostNic) ([]*sOvsOffloadNicDevice, error) {
 					return nil, errors.Wrap(err, "filepath.EvalSymlinks vfpath")
 				}
 				vfBDF := path.Base(vfPath)
-				vfDev, err := detectSRIOVNicDevice(vfBDF)
+				vfDev, err := detectSRIOVDevice(vfBDF)
 				if err != nil {
-					return nil, errors.Wrap(err, "detectSRIOVNicDevice")
+					return nil, errors.Wrap(err, "detectSRIOVDevice")
 				}
 				// out, err := procutils.NewRemoteCommandAsFarAsPossible(
 				// 	"ovs-vsctl", "--may-exist", "add-port", nics[i].Bridge, vfNames[virtfn]).Output()
@@ -385,13 +287,9 @@ type sOvsOffloadNicDevice struct {
 
 func NewSRIOVOffloadNicDevice(dev *PCIDevice, devType, wireId, pfName string, virtfn int, ifname string) *sOvsOffloadNicDevice {
 	return &sOvsOffloadNicDevice{
-		sSRIOVNicDevice: NewSRIOVNicDevice(dev, devType, wireId, pfName, virtfn),
+		sSRIOVNicDevice: NewSRIOVNicDevice(dev, devType, wireId, pfName, virtfn, false),
 		interfaceName:   ifname,
 	}
-}
-
-func (dev *sOvsOffloadNicDevice) setInterfaceName(ifname string) {
-	dev.interfaceName = ifname
 }
 
 func (dev *sOvsOffloadNicDevice) GetOvsOffloadInterfaceName() string {

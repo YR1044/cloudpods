@@ -41,8 +41,8 @@ type SNode struct {
 	CpuNode      int
 	CpuSockets   int
 	CpuUsed      int
-	DiskMax      int
-	DiskNode     int
+	DiskMax      int64
+	DiskNode     int64
 	DiskUsed     int
 	MemNode      int
 	MemoryMax    int
@@ -139,7 +139,7 @@ func (self *SNode) GetReservedMemoryMb() int {
 	return 0
 }
 
-func (self *SNode) GetStorageSizeMB() int {
+func (self *SNode) GetStorageSizeMB() int64 {
 	if self.DiskMax > 0 {
 		return self.DiskMax * 1024
 	}
@@ -173,8 +173,12 @@ func (self *SNode) GetNodeStatus() string {
 	return api.HOST_OFFLINE
 }
 
-func (self *SNode) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
-	return nil, cloudprovider.ErrNotImplemented
+func (node *SNode) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
+	wires, err := node.getIWires()
+	if err != nil {
+		return nil, errors.Wrap(err, "getIWires")
+	}
+	return cloudprovider.GetHostNetifs(node, wires), nil
 }
 
 func (self *SNode) GetIVMs() ([]cloudprovider.ICloudVM, error) {
@@ -210,7 +214,7 @@ func (self *SNode) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
 	return nil, cloudprovider.ErrNotFound
 }
 
-func (self *SNode) GetIWires() ([]cloudprovider.ICloudWire, error) {
+func (self *SNode) getIWires() ([]cloudprovider.ICloudWire, error) {
 	vpcs, err := self.cluster.region.GetIVpcs()
 	if err != nil {
 		return nil, err

@@ -19,10 +19,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 
+	"yunion.io/x/cloudmux/pkg/apis"
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/multicloud"
@@ -108,6 +110,13 @@ func (self *SHost) GetStatus() string {
 	return api.HOST_STATUS_RUNNING
 }
 
+func (self *SHost) GetCpuArchitecture() string {
+	if strings.Contains(self.Kversion, "arm") {
+		return apis.OS_ARCH_AARCH64
+	}
+	return apis.OS_ARCH_X86_64
+}
+
 func (self *SHost) GetAccessIp() string {
 	network := fmt.Sprintf("nodes/%s/network", self.Node)
 	ret := []struct {
@@ -169,8 +178,8 @@ func (self *SHost) GetReservedMemoryMb() int {
 	return 0
 }
 
-func (self *SHost) GetStorageSizeMB() int {
-	return int(self.Rootfs.Total / 1024 / 1024)
+func (self *SHost) GetStorageSizeMB() int64 {
+	return self.Rootfs.Total / 1024 / 1024
 }
 
 func (self *SHost) GetStorageType() string {
@@ -233,6 +242,17 @@ func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudpr
 	}
 
 	vmIdRet := strconv.Itoa(vmId)
+	cloudprovider.Wait(time.Second*5, time.Minute, func() (bool, error) {
+		_, err := self.zone.region.GetInstance(vmIdRet)
+		if err != nil {
+			if errors.Cause(err) == cloudprovider.ErrNotFound {
+				return false, nil
+			}
+			return false, errors.Wrapf(err, "after created")
+		}
+		return true, nil
+	})
+
 	vm, err := self.zone.region.GetInstance(vmIdRet)
 	if err != nil {
 		return nil, err
@@ -242,8 +262,12 @@ func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudpr
 	return vm, nil
 }
 
-func (self *SHost) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
-	return nil, cloudprovider.ErrNotImplemented
+func (host *SHost) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
+	wires, err := host.getIWires()
+	if err != nil {
+		return nil, errors.Wrap(err, "getIWires")
+	}
+	return cloudprovider.GetHostNetifs(host, wires), nil
 }
 
 func (self *SHost) GetIVMs() ([]cloudprovider.ICloudVM, error) {
@@ -272,7 +296,7 @@ func (self *SHost) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
 	return vm, nil
 }
 
-func (self *SHost) GetIWires() ([]cloudprovider.ICloudWire, error) {
+func (self *SHost) getIWires() ([]cloudprovider.ICloudWire, error) {
 	wires, err := self.zone.region.GetWires()
 	if err != nil {
 		return nil, err

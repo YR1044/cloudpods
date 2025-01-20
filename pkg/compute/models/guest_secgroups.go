@@ -16,7 +16,6 @@ package models
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 
 	"gopkg.in/fatih/set.v0"
@@ -45,7 +44,12 @@ func (self *SGuest) PerformAddSecgroup(
 		return nil, httperrors.NewInputParameterError("Cannot add security groups in status %s", self.Status)
 	}
 
-	maxCount := self.GetDriver().GetMaxSecurityGroupCount()
+	drv, err := self.GetDriver()
+	if err != nil {
+		return nil, err
+	}
+
+	maxCount := drv.GetMaxSecurityGroupCount()
 	if maxCount == 0 {
 		return nil, httperrors.NewUnsupportOperationError("Cannot add security groups for hypervisor %s", self.Hypervisor)
 	}
@@ -67,30 +71,33 @@ func (self *SGuest) PerformAddSecgroup(
 		secgroupIds = append(secgroupIds, secgroup.Id)
 	}
 
-	secgroupNames := []string{}
-	for _, secgroupId := range input.SecgroupIds {
-		secgrp, err := SecurityGroupManager.FetchByIdOrName(userCred, secgroupId)
-		if err != nil {
-			if errors.Cause(err) == sql.ErrNoRows {
-				return nil, httperrors.NewResourceNotFoundError2("secgroup", secgroupId)
-			}
-			return nil, httperrors.NewGeneralError(errors.Wrapf(err, "SecurityGroupManager.FetchByIdOrName(%s)", secgroupId))
-		}
-
-		err = SecurityGroupManager.ValidateName(secgrp.GetName())
-		if err != nil {
-			return nil, httperrors.NewInputParameterError("The secgroup name %s does not meet the requirements, please change the name", secgrp.GetName())
-		}
-
-		if utils.IsInStringArray(secgrp.GetId(), secgroupIds) {
-			return nil, httperrors.NewInputParameterError("security group %s has already been assigned to guest %s", secgrp.GetName(), self.Name)
-		}
-
-		secgroupIds = append(secgroupIds, secgrp.GetId())
-		secgroupNames = append(secgroupNames, secgrp.GetName())
+	vpc, err := self.GetVpc()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetVpc")
 	}
 
-	err = self.saveSecgroups(ctx, userCred, secgroupIds)
+	secgroupNames := []string{}
+	for i := range input.SecgroupIds {
+		secObj, err := validators.ValidateModel(ctx, userCred, SecurityGroupManager, &input.SecgroupIds[i])
+		if err != nil {
+			return nil, err
+		}
+		secgroup := secObj.(*SSecurityGroup)
+
+		if utils.IsInStringArray(secObj.GetId(), secgroupIds) {
+			return nil, httperrors.NewInputParameterError("security group %s has already been assigned to guest %s", secObj.GetName(), self.Name)
+		}
+
+		err = vpc.CheckSecurityGroupConsistent(secgroup)
+		if err != nil {
+			return nil, err
+		}
+
+		secgroupIds = append(secgroupIds, secgroup.GetId())
+		secgroupNames = append(secgroupNames, secgroup.Name)
+	}
+
+	err = self.SaveSecgroups(ctx, userCred, secgroupIds)
 	if err != nil {
 		return nil, httperrors.NewGeneralError(errors.Wrap(err, "saveSecgroups"))
 	}
@@ -118,6 +125,7 @@ func (self *SGuest) saveDefaultSecgroupId(userCred mcclient.TokenCredential, sec
 	return nil
 }
 
+// 解绑安全组
 func (self *SGuest) PerformRevokeSecgroup(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -142,14 +150,12 @@ func (self *SGuest) PerformRevokeSecgroup(
 	}
 
 	secgroupNames := []string{}
-	for _, secgroupId := range input.SecgroupIds {
-		secgrp, err := SecurityGroupManager.FetchByIdOrName(userCred, secgroupId)
+	for i := range input.SecgroupIds {
+		secObj, err := validators.ValidateModel(ctx, userCred, SecurityGroupManager, &input.SecgroupIds[i])
 		if err != nil {
-			if errors.Cause(err) == sql.ErrNoRows {
-				return nil, httperrors.NewResourceNotFoundError2("secgroup", secgroupId)
-			}
-			return nil, httperrors.NewGeneralError(errors.Wrapf(err, "SecurityGroupManager.FetchByIdOrName(%s)", secgroupId))
+			return nil, err
 		}
+		secgrp := secObj.(*SSecurityGroup)
 		_, ok := secgroupMaps[secgrp.GetId()]
 		if !ok {
 			return nil, httperrors.NewInputParameterError("security group %s not assigned to guest %s", secgrp.GetName(), self.Name)
@@ -163,7 +169,7 @@ func (self *SGuest) PerformRevokeSecgroup(
 		secgrpIds = append(secgrpIds, secgroupId)
 	}
 
-	err = self.saveSecgroups(ctx, userCred, secgrpIds)
+	err = self.SaveSecgroups(ctx, userCred, secgrpIds)
 	if err != nil {
 		return nil, httperrors.NewGeneralError(errors.Wrap(err, "saveSecgroups"))
 	}
@@ -173,6 +179,7 @@ func (self *SGuest) PerformRevokeSecgroup(
 	return nil, self.StartSyncTask(ctx, userCred, true, "")
 }
 
+// 解绑管理员安全组
 func (self *SGuest) PerformRevokeAdminSecgroup(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -219,6 +226,7 @@ func (self *SGuest) PerformAssignSecgroup(
 	return self.performAssignSecgroup(ctx, userCred, query, input, false)
 }
 
+// +onecloud:swagger-gen-ignore
 func (self *SGuest) PerformAssignAdminSecgroup(
 	ctx context.Context,
 	userCred mcclient.TokenCredential,
@@ -247,14 +255,20 @@ func (self *SGuest) performAssignSecgroup(
 		return nil, httperrors.NewMissingParameterError("secgroup_id")
 	}
 
-	secObj, err := validators.ValidateModel(userCred, SecurityGroupManager, &input.SecgroupId)
+	vpc, err := self.GetVpc()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetVpc")
+	}
+
+	secObj, err := validators.ValidateModel(ctx, userCred, SecurityGroupManager, &input.SecgroupId)
 	if err != nil {
 		return nil, err
 	}
+	secgroup := secObj.(*SSecurityGroup)
 
-	err = SecurityGroupManager.ValidateName(secObj.GetName())
+	err = vpc.CheckSecurityGroupConsistent(secgroup)
 	if err != nil {
-		return nil, httperrors.NewInputParameterError("The secgroup name %s does not meet the requirements, please change the name", secObj.GetName())
+		return nil, err
 	}
 
 	err = self.saveDefaultSecgroupId(userCred, input.SecgroupId, isAdmin)
@@ -281,7 +295,12 @@ func (self *SGuest) PerformSetSecgroup(
 		return nil, httperrors.NewMissingParameterError("secgroup_ids")
 	}
 
-	maxCount := self.GetDriver().GetMaxSecurityGroupCount()
+	drv, err := self.GetDriver()
+	if err != nil {
+		return nil, err
+	}
+
+	maxCount := drv.GetMaxSecurityGroupCount()
 	if maxCount == 0 {
 		return nil, httperrors.NewUnsupportOperationError("Cannot set security group for this guest %s", self.Name)
 	}
@@ -290,20 +309,23 @@ func (self *SGuest) PerformSetSecgroup(
 		return nil, httperrors.NewUnsupportOperationError("guest %s band to up to %d security groups", self.Name, maxCount)
 	}
 
+	vpc, err := self.GetVpc()
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetVpc")
+	}
+
 	secgroupIds := []string{}
 	secgroupNames := []string{}
-	for _, secgroupId := range input.SecgroupIds {
-		secgrp, err := SecurityGroupManager.FetchByIdOrName(userCred, secgroupId)
+	for i := range input.SecgroupIds {
+		secObj, err := validators.ValidateModel(ctx, userCred, SecurityGroupManager, &input.SecgroupIds[i])
 		if err != nil {
-			if errors.Cause(err) == sql.ErrNoRows {
-				return nil, httperrors.NewResourceNotFoundError2("secgroup", secgroupId)
-			}
-			return nil, httperrors.NewGeneralError(errors.Wrapf(err, "FetchByIdOrName(%s)", secgroupId))
+			return nil, err
 		}
+		secgrp := secObj.(*SSecurityGroup)
 
-		err = SecurityGroupManager.ValidateName(secgrp.GetName())
+		err = vpc.CheckSecurityGroupConsistent(secgrp)
 		if err != nil {
-			return nil, httperrors.NewInputParameterError("The secgroup name %s does not meet the requirements, please change the name", secgrp.GetName())
+			return nil, err
 		}
 
 		if !utils.IsInStringArray(secgrp.GetId(), secgroupIds) {
@@ -312,7 +334,7 @@ func (self *SGuest) PerformSetSecgroup(
 		}
 	}
 
-	err := self.saveSecgroups(ctx, userCred, secgroupIds)
+	err = self.SaveSecgroups(ctx, userCred, secgroupIds)
 	if err != nil {
 		return nil, httperrors.NewGeneralError(errors.Wrapf(err, "saveSecgroups"))
 	}
@@ -332,7 +354,7 @@ func (self *SGuest) GetGuestSecgroups() ([]SGuestsecgroup, error) {
 	return gss, nil
 }
 
-func (self *SGuest) saveSecgroups(ctx context.Context, userCred mcclient.TokenCredential, secgroupIds []string) error {
+func (self *SGuest) SaveSecgroups(ctx context.Context, userCred mcclient.TokenCredential, secgroupIds []string) error {
 	if len(secgroupIds) == 0 {
 		return self.RevokeAllSecgroups(ctx, userCred)
 	}

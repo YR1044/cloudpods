@@ -20,6 +20,7 @@ import (
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
@@ -30,6 +31,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SGuestdiskManager struct {
 	SGuestJointsManager
 	SDiskResourceBaseManager
@@ -54,6 +56,7 @@ func init() {
 
 }
 
+// +onecloud:model-api-gen
 type SGuestdisk struct {
 	SGuestJointsBase
 
@@ -65,8 +68,8 @@ type SGuestdisk struct {
 	Driver    string `width:"32" charset:"ascii" nullable:"true" list:"user" update:"user"` // Column(VARCHAR(32, charset='ascii'), nullable=True)
 	CacheMode string `width:"32" charset:"ascii" nullable:"true" list:"user" update:"user"` // Column(VARCHAR(32, charset='ascii'), nullable=True)
 	AioMode   string `width:"32" charset:"ascii" nullable:"true" get:"user" update:"user"`  // Column(VARCHAR(32, charset='ascii'), nullable=True)
-	Iops      int    `nullable:"true" default:"0"`
-	Bps       int    `nullable:"true" default:"0"` // Mb
+	Iops      int    `nullable:"true" default:"0" list:"user" update:"user"`
+	Bps       int    `nullable:"true" default:"0" list:"user" update:"user"` // Mb
 
 	Mountpoint string `width:"256" charset:"utf8" nullable:"true" get:"user"` // Column(VARCHAR(256, charset='utf8'), nullable=True)
 
@@ -92,6 +95,21 @@ func (self *SGuestdisk) ValidateUpdateData(ctx context.Context, userCred mcclien
 			return input, httperrors.NewInputParameterError("DISK Index %d has been occupied", index)
 		}
 	}
+	if self.CacheMode != input.CacheMode {
+		if input.CacheMode != "none" {
+			input.AioMode = "threads"
+		}
+	}
+	if self.AioMode != input.AioMode {
+		cacheMode := self.CacheMode
+		if input.CacheMode != "" {
+			cacheMode = input.CacheMode
+		}
+		if input.AioMode == "native" && cacheMode != "none" {
+			return input, httperrors.NewBadRequestError("Aio mode %s with cache mode %s not supported", input.AioMode, cacheMode)
+		}
+	}
+
 	var err error
 	input.GuestJointBaseUpdateInput, err = self.SGuestJointsBase.ValidateUpdateData(ctx, userCred, query, input.GuestJointBaseUpdateInput)
 	if err != nil {
@@ -180,13 +198,14 @@ func (self *SGuestdisk) GetJsonDescAtHost(ctx context.Context, host *SHost) *api
 
 func (self *SGuestdisk) GetDiskJsonDescAtHost(ctx context.Context, host *SHost, disk *SDisk) *api.GuestdiskJsonDesc {
 	desc := &api.GuestdiskJsonDesc{
-		DiskId:    disk.Id,
-		Driver:    self.Driver,
-		CacheMode: self.CacheMode,
-		AioMode:   self.AioMode,
-		Iops:      self.Iops,
-		Bps:       self.Bps,
-		Size:      disk.DiskSize,
+		DiskId:     disk.Id,
+		Driver:     self.Driver,
+		CacheMode:  self.CacheMode,
+		AioMode:    self.AioMode,
+		Iops:       self.Iops,
+		Throughput: disk.Throughput,
+		Bps:        self.Bps,
+		Size:       disk.DiskSize,
 	}
 	desc.TemplateId = disk.GetTemplateId()
 	storage, _ := disk.GetStorage()
@@ -197,7 +216,7 @@ func (self *SGuestdisk) GetDiskJsonDescAtHost(ctx context.Context, host *SHost, 
 			desc.ImagePath = storagecacheimg.Path
 		}
 	}
-	if host.HostType == api.HOST_TYPE_HYPERVISOR {
+	if utils.IsInStringArray(host.HostType, []string{api.HOST_TYPE_HYPERVISOR, api.HOST_TYPE_CONTAINER}) {
 		desc.StorageId = disk.StorageId
 		localpath := disk.GetPathAtHost(host)
 		if len(localpath) == 0 {
@@ -226,9 +245,14 @@ func (self *SGuestdisk) GetDiskJsonDescAtHost(ctx context.Context, host *SHost, 
 			}
 		}
 	}
-	if fpath := disk.GetMetadata(ctx, api.DISK_META_ESXI_FLAT_FILE_PATH, nil); len(fpath) > 0 {
+	if fpath := disk.GetMetadata(ctx, api.DISK_META_REMOTE_ACCESS_PATH, nil); len(fpath) > 0 {
+		guest := self.getGuest()
+		if sid := guest.GetMetadata(ctx, api.SERVER_META_CONVERT_FROM_ESXI, nil); len(sid) > 0 {
+			desc.EsxiFlatFilePath = fpath
+		} else {
+			desc.Url = fpath
+		}
 		desc.MergeSnapshot = true
-		desc.EsxiFlatFilePath = fpath
 	}
 	desc.Fs = disk.GetFsFormat()
 	desc.Mountpoint = self.Mountpoint

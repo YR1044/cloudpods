@@ -97,6 +97,8 @@ type CandidatePropertyGetter interface {
 	RunningMemorySize() int64
 	TotalMemorySize(useRsvd bool) int64
 	FreeMemorySize(useRsvd bool) int64
+	GetFreeCpuNuma() []*schedapi.SFreeNumaCpuMem
+	NumaAllocateEnabled() bool
 
 	StorageInfo() []*baremetal.BaremetalStorage
 	GetFreeStorageSizeOfType(storageType string, mediumType string, useRsvd bool, reqMaxSize int64) (int64, int64, error)
@@ -122,6 +124,7 @@ type CandidatePropertyGetter interface {
 	UnusedIsolatedDevicesByVendorModel(vendorModel string) []*IsolatedDeviceDesc
 	UnusedIsolatedDevicesByModel(model string) []*IsolatedDeviceDesc
 	UnusedIsolatedDevicesByModelAndWire(model, wire string) []*IsolatedDeviceDesc
+	UnusedIsolatedDevicesByDevicePath(devPath string) []*IsolatedDeviceDesc
 	GetIsolatedDevice(devID string) *IsolatedDeviceDesc
 	UnusedGpuDevices() []*IsolatedDeviceDesc
 	GetIsolatedDevices() []*IsolatedDeviceDesc
@@ -139,6 +142,8 @@ type Candidater interface {
 	GetSchedDesc() *jsonutils.JSONDict
 	GetGuestCount() int64
 	GetResourceType() string
+	AllocCpuNumaPin(vcpuCount, memSizeKB int, preferNumaNodes []int) []schedapi.SCpuNumaPin
+	AllocCpuNumaPinWithNodeCount(vcpuCount, memSizeKB, nodeCount int) []schedapi.SCpuNumaPin
 }
 
 // HostPriority represents the priority of scheduling to particular host, higher priority is better.
@@ -157,20 +162,47 @@ func (h HostPriorityList) Len() int {
 	return len(h)
 }
 
-func (h HostPriorityList) Less(i, j int) bool {
+func (h HostPriorityList) compareNormalScore(i, j int) bool {
 	s1 := h[i].Score.ScoreBucket
 	s2 := h[j].Score.ScoreBucket
-	preferScorei, preferScorej := s1.PreferScore()-s1.AvoidScore(), s2.PreferScore()-s1.AvoidScore()
-
-	if preferScorei != preferScorej {
-		return preferScorei < preferScorej
-	}
-
 	normalScorei, normalScorej := s1.NormalScore(), s2.NormalScore()
 	if normalScorei == normalScorej {
 		return h[i].Host < h[j].Host
 	}
 	return normalScorei < normalScorej
+}
+
+func (h HostPriorityList) Less(i, j int) bool {
+	si := h[i].Score.ScoreBucket
+	sj := h[j].Score.ScoreBucket
+
+	if si.PreferScore() > 0 || sj.PreferScore() > 0 {
+		if si.PreferScore() != 0 && sj.PreferScore() != 0 {
+			// both have prefer tags
+			return h.compareNormalScore(i, j)
+		}
+		if si.PreferScore() <= 0 {
+			return true
+		}
+		if sj.PreferScore() <= 0 {
+			return false
+		}
+	}
+
+	if si.AvoidScore() > 0 || sj.AvoidScore() > 0 {
+		if si.AvoidScore() != 0 && sj.AvoidScore() != 0 {
+			// both have avoid tags
+			return h.compareNormalScore(i, j)
+		}
+		if si.AvoidScore() > 0 {
+			return true
+		}
+		if sj.AvoidScore() > 0 {
+			return false
+		}
+	}
+
+	return h.compareNormalScore(i, j)
 }
 
 func (h HostPriorityList) Swap(i, j int) {
@@ -243,6 +275,7 @@ type IsolatedDeviceDesc struct {
 	Addr           string
 	VendorDeviceID string
 	WireId         string
+	DevicePath     string
 }
 
 func (i *IsolatedDeviceDesc) VendorID() string {

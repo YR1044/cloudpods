@@ -17,6 +17,7 @@ package esxi
 import (
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/property"
@@ -38,9 +39,11 @@ type SDatacenter struct {
 
 	ihosts       []cloudprovider.ICloudHost
 	istorages    []cloudprovider.ICloudStorage
-	inetworks    []IVMNetwork
+	inetworks    map[string]IVMNetwork
 	iresoucePool []cloudprovider.ICloudProject
 	clusters     []*SCluster
+
+	netLock sync.Mutex
 
 	Name string
 }
@@ -52,10 +55,7 @@ func newDatacenter(manager *SESXiClient, dc *mo.Datacenter) *SDatacenter {
 }
 
 func (dc *SDatacenter) isDefaultDc() bool {
-	if dc.object == &defaultDc {
-		return true
-	}
-	return false
+	return dc.object == &defaultDc
 }
 
 func (dc *SDatacenter) getDatacenter() *mo.Datacenter {
@@ -245,7 +245,7 @@ func (dc *SDatacenter) getDcObj() *object.Datacenter {
 	return object.NewDatacenter(dc.manager.client.Client, dc.object.Reference())
 }
 
-func (dc *SDatacenter) fetchMoVms(filter property.Filter, props []string) ([]mo.VirtualMachine, error) {
+func (dc *SDatacenter) fetchMoVms(filter property.Match, props []string) ([]mo.VirtualMachine, error) {
 	odc := dc.getObjectDatacenter()
 	root := odc.Reference()
 	var movms []mo.VirtualMachine
@@ -311,7 +311,7 @@ func (dc *SDatacenter) fetchVmsFromCache(vmRefs []types.ManagedObjectReference) 
 	for i := range ihosts {
 		ivms, err := ihosts[i].GetIVMs()
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrapf(err, "GetIVMs")
 		}
 		for i := range ivms {
 			vm := ivms[i].(*SVirtualMachine)
@@ -336,7 +336,7 @@ func (dc *SDatacenter) fetchVms(vmRefs []types.ManagedObjectReference, all bool)
 	return dc.moVms2Vm(movms, &all)
 }
 
-func (dc *SDatacenter) fetchHosts_(vmRefs []types.ManagedObjectReference, all bool) ([]*SHost, error) {
+func (dc *SDatacenter) fetchHostsInternal(vmRefs []types.ManagedObjectReference, all bool) ([]*SHost, error) {
 	var movms []mo.HostSystem
 	if vmRefs != nil {
 		err := dc.manager.references2Objects(vmRefs, VIRTUAL_MACHINE_PROPS, &movms)
@@ -356,17 +356,17 @@ func (dc *SDatacenter) fetchHosts_(vmRefs []types.ManagedObjectReference, all bo
 }
 
 func (dc *SDatacenter) FetchVMs() ([]*SVirtualMachine, error) {
-	return dc.fetchVMsWithFilter(property.Filter{})
+	return dc.fetchVMsWithFilter(property.Match{})
 }
 
 func (dc *SDatacenter) FetchNoTemplateVMs() ([]*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["config.template"] = false
 	return dc.fetchVMsWithFilter(filter)
 }
 
 func (dc *SDatacenter) FetchFakeTempateVMs(regex string) ([]*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["summary.runtime.powerState"] = types.VirtualMachinePowerStatePoweredOff
 	movms, err := dc.fetchMoVms(filter, []string{"name"})
 	if err != nil {
@@ -375,7 +375,7 @@ func (dc *SDatacenter) FetchFakeTempateVMs(regex string) ([]*SVirtualMachine, er
 	return dc.fetchFakeTemplateVMs(movms, regex)
 }
 
-func (dc *SDatacenter) fetchVMsWithFilter(filter property.Filter) ([]*SVirtualMachine, error) {
+func (dc *SDatacenter) fetchVMsWithFilter(filter property.Match) ([]*SVirtualMachine, error) {
 	movms, err := dc.fetchMoVms(filter, VIRTUAL_MACHINE_PROPS)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to fetch mo.VirtualMachines")
@@ -388,7 +388,7 @@ func (dc *SDatacenter) fetchVMsWithFilter(filter property.Filter) ([]*SVirtualMa
 }
 
 func (dc *SDatacenter) FetchNoTemplateVMEntityReferens() ([]types.ManagedObjectReference, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["config.template"] = false
 	odc := dc.getObjectDatacenter()
 	root := odc.Reference()
@@ -408,7 +408,7 @@ func (dc *SDatacenter) FetchNoTemplateVMEntityReferens() ([]types.ManagedObjectR
 }
 
 func (dc *SDatacenter) FetchNoTemplateHostEntityReferens() ([]types.ManagedObjectReference, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	odc := dc.getObjectDatacenter()
 	root := odc.Reference()
 	m := view.NewManager(dc.manager.client.Client)
@@ -426,7 +426,7 @@ func (dc *SDatacenter) FetchNoTemplateHostEntityReferens() ([]types.ManagedObjec
 	return objs, nil
 }
 
-func (dc *SDatacenter) fetchHosts(filter property.Filter) ([]*SHost, error) {
+func (dc *SDatacenter) fetchHosts(filter property.Match) ([]*SHost, error) {
 	odc := dc.getObjectDatacenter()
 	root := odc.Reference()
 	m := view.NewManager(dc.manager.client.Client)
@@ -441,18 +441,18 @@ func (dc *SDatacenter) fetchHosts(filter property.Filter) ([]*SHost, error) {
 	if err != nil {
 		return nil, err
 	}
-	hosts, err := dc.fetchHosts_(objs, false)
+	hosts, err := dc.fetchHostsInternal(objs, false)
 	return hosts, err
 }
 
 func (dc *SDatacenter) FetchTemplateVMs() ([]*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["config.template"] = true
 	return dc.fetchVMsWithFilter(filter)
 }
 
 func (dc *SDatacenter) FetchTemplateVMById(id string) (*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["config.template"] = true
 	filter["summary.config.uuid"] = id
 	vms, err := dc.fetchVMsWithFilter(filter)
@@ -466,7 +466,7 @@ func (dc *SDatacenter) FetchTemplateVMById(id string) (*SVirtualMachine, error) 
 }
 
 func (dc *SDatacenter) FetchVMById(id string) (*SVirtualMachine, error) {
-	filter := property.Filter{}
+	filter := property.Match{}
 	filter["summary.config.uuid"] = id
 	vms, err := dc.fetchVMsWithFilter(filter)
 	if err != nil {
@@ -496,6 +496,7 @@ func (dc *SDatacenter) fetchDatastores(datastoreRefs []types.ManagedObjectRefere
 
 func (dc *SDatacenter) scanNetworks() error {
 	if dc.inetworks == nil {
+		dc.inetworks = make(map[string]IVMNetwork)
 		if dc.isDefaultDc() {
 			return dc.scanDefaultNetworks()
 		} else {
@@ -506,7 +507,6 @@ func (dc *SDatacenter) scanNetworks() error {
 }
 
 func (dc *SDatacenter) scanDefaultNetworks() error {
-	dc.inetworks = make([]IVMNetwork, 0)
 	err := dc.scanAllDvPortgroups()
 	if err != nil {
 		return errors.Wrap(err, "dc.scanAllDvPortgroups")
@@ -525,9 +525,11 @@ func (dc *SDatacenter) scanAllDvPortgroups() error {
 	if err != nil {
 		return errors.Wrap(err, "dc.manager.scanAllMObjects mo.DistributedVirtualPortgroup")
 	}
+	dc.netLock.Lock()
+	defer dc.netLock.Unlock()
 	for i := range dvports {
 		net := NewDistributedVirtualPortgroup(dc.manager, &dvports[i], dc)
-		dc.inetworks = append(dc.inetworks, net)
+		dc.inetworks[net.GetName()] = net
 	}
 	return nil
 }
@@ -539,35 +541,39 @@ func (dc *SDatacenter) scanAllNetworks() error {
 	if err != nil {
 		return errors.Wrap(err, "dc.manager.scanAllMObjects mo.Network")
 	}
+	dc.netLock.Lock()
+	defer dc.netLock.Unlock()
 	for i := range nets {
 		net := NewNetwork(dc.manager, &nets[i], dc)
-		dc.inetworks = append(dc.inetworks, net)
+		dc.inetworks[net.GetName()] = net
 	}
 	return nil
 }
 
 func (dc *SDatacenter) scanDcNetworks() error {
-	dc.inetworks = make([]IVMNetwork, 0)
-
-	netMOBs := dc.getDatacenter().Network
-	for i := range netMOBs {
-		dvport := mo.DistributedVirtualPortgroup{}
-		err := dc.manager.reference2Object(netMOBs[i], DVPORTGROUP_PROPS, &dvport)
-		if err == nil {
-			net := NewDistributedVirtualPortgroup(dc.manager, &dvport, dc)
-			dc.inetworks = append(dc.inetworks, net)
-		} else {
-			net := mo.Network{}
-			err = dc.manager.reference2Object(netMOBs[i], NETWORK_PROPS, &net)
-			if err == nil {
-				vnet := NewNetwork(dc.manager, &net, dc)
-				dc.inetworks = append(dc.inetworks, vnet)
-			} else {
-				return errors.Wrap(err, "dc.manager.reference2Object")
-			}
-		}
+	nets, err := dc.resolveNetworks(dc.getDatacenter().Network)
+	if err != nil {
+		return errors.Wrap(err, "resolveNetworks")
+	}
+	dc.netLock.Lock()
+	defer dc.netLock.Unlock()
+	for i := range nets {
+		net := nets[i]
+		dc.inetworks[net.GetName()] = net
 	}
 	return nil
+}
+
+func (dc *SDatacenter) getNetworkByName(name string) (IVMNetwork, error) {
+	err := dc.scanNetworks()
+	if err != nil {
+		return nil, errors.Wrap(err, "dc.scanNetworks")
+	}
+	if net, ok := dc.inetworks[name]; !ok {
+		return nil, errors.Wrap(errors.ErrNotFound, name)
+	} else {
+		return net, nil
+	}
 }
 
 func (dc *SDatacenter) GetNetworks() ([]IVMNetwork, error) {
@@ -575,7 +581,11 @@ func (dc *SDatacenter) GetNetworks() ([]IVMNetwork, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "dc.scanNetworks")
 	}
-	return dc.inetworks, nil
+	nets := make([]IVMNetwork, 0, len(dc.inetworks))
+	for _, net := range dc.inetworks {
+		nets = append(nets, net)
+	}
+	return nets, nil
 }
 
 func (dc *SDatacenter) GetTemplateVMs() ([]*SVirtualMachine, error) {

@@ -77,6 +77,7 @@ func (self *SZStackGuestDriver) GetStorageTypes() []string {
 	return []string{
 		api.STORAGE_ZSTACK_LOCAL_STORAGE,
 		api.STORAGE_ZSTACK_CEPH,
+		api.STORAGE_ZSTACK_SHARED_BLOCK,
 	}
 }
 
@@ -85,7 +86,7 @@ func (self *SZStackGuestDriver) GetMaxSecurityGroupCount() int {
 }
 
 func (self *SZStackGuestDriver) ChooseHostStorage(host *models.SHost, guest *models.SGuest, diskConfig *api.DiskConfig, storageIds []string) (*models.SStorage, error) {
-	return self.chooseHostStorage(self, host, diskConfig.Backend, storageIds), nil
+	return chooseHostStorage(self, host, diskConfig.Backend, storageIds), nil
 }
 
 func (self *SZStackGuestDriver) GetDetachDiskStatus() ([]string, error) {

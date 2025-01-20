@@ -15,11 +15,12 @@
 package aliyun
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
-	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/utils"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -35,6 +36,8 @@ type SDomainRecords struct {
 
 // https://help.aliyun.com/document_detail/29777.html?spm=a2c4g.11186623.6.666.aa4832307YdopF
 type SDomainRecord struct {
+	domain *SDomain
+
 	DomainId   string `json:"DomainId"`
 	GroupId    string `json:"GroupId"`
 	GroupName  string `json:"GroupName"`
@@ -42,7 +45,7 @@ type SDomainRecord struct {
 	RR         string `json:"RR"`
 	Status     string `json:"Status"`
 	Value      string `json:"Value"`
-	RecordID   string `json:"RecordId"`
+	RecordId   string `json:"RecordId"`
 	Type       string `json:"Type"`
 	RequestID  string `json:"RequestId"`
 	DomainName string `json:"DomainName"`
@@ -125,6 +128,10 @@ func GetRecordLineLineType(policyinfo cloudprovider.TDnsPolicyValue) string {
 		return "drpeng"
 	case cloudprovider.DnsPolicyValueBtvn:
 		return "btvn"
+	case cloudprovider.DnsPolicyValueNAmerica:
+		return "os_namerica"
+	case cloudprovider.DnsPolicyValueEuro:
+		return "os_euro"
 
 	case cloudprovider.DnsPolicyValueBaidu:
 		return "baidu"
@@ -139,7 +146,7 @@ func GetRecordLineLineType(policyinfo cloudprovider.TDnsPolicyValue) string {
 	}
 }
 
-func (client *SAliyunClient) AddDomainRecord(domainName string, opts cloudprovider.DnsRecordSet) (string, error) {
+func (client *SAliyunClient) AddDomainRecord(domainName string, opts *cloudprovider.DnsRecord) (string, error) {
 	line := GetRecordLineLineType(opts.PolicyValue)
 	params := map[string]string{}
 	params["Action"] = "AddDomainRecord"
@@ -160,27 +167,6 @@ func (client *SAliyunClient) AddDomainRecord(domainName string, opts cloudprovid
 	return recordId, ret.Unmarshal(&recordId, "RecordId")
 }
 
-// line
-func (client *SAliyunClient) UpdateDomainRecord(opts cloudprovider.DnsRecordSet) error {
-	line := GetRecordLineLineType(opts.PolicyValue)
-	params := map[string]string{}
-	params["Action"] = "UpdateDomainRecord"
-	params["RR"] = opts.DnsName
-	params["RecordId"] = opts.ExternalId
-	params["Type"] = string(opts.DnsType)
-	params["Value"] = opts.DnsValue
-	params["TTL"] = strconv.FormatInt(opts.Ttl, 10)
-	params["Line"] = line
-	if opts.DnsType == cloudprovider.DnsTypeMX {
-		params["Priority"] = strconv.FormatInt(opts.MxPriority, 10)
-	}
-	_, err := client.alidnsRequest("UpdateDomainRecord", params)
-	if err != nil {
-		return errors.Wrap(err, "UpdateDomainRecord")
-	}
-	return nil
-}
-
 func (client *SAliyunClient) UpdateDomainRecordRemark(recordId string, remark string) error {
 	params := map[string]string{}
 	params["RecordId"] = recordId
@@ -198,7 +184,7 @@ func (client *SAliyunClient) SetDomainRecordStatus(recordId, status string) erro
 	params := map[string]string{}
 	params["Action"] = "SetDomainRecordStatus"
 	params["RecordId"] = recordId
-	params["Status"] = status
+	params["Status"] = strings.ToUpper(status)
 	_, err := client.alidnsRequest("SetDomainRecordStatus", params)
 	if err != nil {
 		return errors.Wrap(err, "SetDomainRecordStatus")
@@ -218,7 +204,7 @@ func (client *SAliyunClient) DeleteDomainRecord(recordId string) error {
 }
 
 func (self *SDomainRecord) GetGlobalId() string {
-	return self.RecordID
+	return self.RecordId
 }
 
 func (self *SDomainRecord) GetDnsName() string {
@@ -314,28 +300,101 @@ func (self *SDomainRecord) GetPolicyValue() cloudprovider.TDnsPolicyValue {
 	return cloudprovider.TDnsPolicyValue(self.Line)
 }
 
-func (self *SDomainRecord) GetPolicyOptions() *jsonutils.JSONDict {
-	return nil
+func (self *SDomainRecord) Delete() error {
+	return self.domain.client.DeleteDomainRecord(self.RecordId)
 }
 
-func (self *SDomainRecord) match(update cloudprovider.DnsRecordSet) bool {
-	if update.DnsName != self.GetDnsName() {
-		return false
+func (self *SDomainRecord) Update(opts *cloudprovider.DnsRecord) error {
+	if opts.Desc != self.Remark {
+		err := self.domain.client.UpdateDomainRecordRemark(self.RecordId, opts.Desc)
+		if err != nil {
+			return errors.Wrapf(err, "UpdateDomainRecordRemark")
+		}
 	}
-	if update.DnsType != self.GetDnsType() {
-		return false
+	return self.domain.client.UpdateDomainRecord(self.RecordId, opts)
+}
+
+func (self *SDomainRecord) Enable() error {
+	return self.domain.client.SetDomainRecordStatus(self.RecordId, "Enable")
+}
+
+func (self *SDomainRecord) Disable() error {
+	return self.domain.client.SetDomainRecordStatus(self.RecordId, "Disable")
+}
+
+func (self *SAliyunClient) GetDnsExtraAddresses(dnsValue string) ([]string, error) {
+	ret := []string{}
+	if !strings.HasPrefix(dnsValue, "gtm") {
+		return ret, nil
 	}
-	if update.DnsValue != self.GetDnsValue() {
-		return false
+	instances, err := self.DescribeDnsGtmInstances()
+	if err != nil {
+		return nil, errors.Wrapf(err, "DescribeDnsGtmInstances")
 	}
-	if update.PolicyType != self.GetPolicyType() {
-		return false
+	for _, instance := range instances {
+		if instance.Config.PublicZoneName == dnsValue {
+			pools, err := self.DescribeDnsGtmInstanceAddressPools(instance.InstanceId)
+			if err != nil {
+				return nil, errors.Wrapf(err, "DescribeDnsGtmInstanceAddressPools")
+			}
+			for _, pool := range pools {
+				address, err := self.DescribeDnsGtmInstanceAddressPool(pool.AddrPoolId)
+				if err != nil {
+					return nil, errors.Wrapf(err, "DescribeDnsGtmInstanceAddressPools")
+				}
+				for _, addr := range address.Addrs.Addr {
+					if !utils.IsInStringArray(addr.Addr, ret) {
+						ret = append(ret, addr.Addr)
+					}
+				}
+			}
+			return ret, nil
+		}
 	}
-	if update.PolicyValue != self.GetPolicyValue() {
-		return false
+	gtm3, err := self.ListCloudGtmInstanceConfigs()
+	if err != nil {
+		return nil, errors.Wrapf(err, "ListCloudGtmInstanceConfigs")
 	}
-	if update.Ttl != self.GetTTL() {
-		return false
+	for _, instance := range gtm3 {
+		if instance.ScheduleDomainName == dnsValue || dnsValue == fmt.Sprintf("%s.%s", instance.InstanceId, instance.ScheduleZoneName) {
+			for _, pool := range instance.AddressPools.AddressPool {
+				pool, err := self.DescribeCloudGtmAddressPool(pool.AddressPoolId)
+				if err != nil {
+					return nil, errors.Wrapf(err, "DescribeCloudGtmAddressPool")
+				}
+				for _, addr := range pool.Addresses.Address {
+					if !utils.IsInStringArray(addr.Address, ret) {
+						ret = append(ret, addr.Address)
+					}
+				}
+			}
+			return ret, nil
+		}
 	}
-	return true
+	return ret, nil
+}
+
+func (self *SDomainRecord) GetExtraAddresses() ([]string, error) {
+	return self.domain.client.GetDnsExtraAddresses(self.GetDnsValue())
+}
+
+// line
+func (client *SAliyunClient) UpdateDomainRecord(id string, opts *cloudprovider.DnsRecord) error {
+	line := GetRecordLineLineType(opts.PolicyValue)
+	params := map[string]string{}
+	params["Action"] = "UpdateDomainRecord"
+	params["RR"] = opts.DnsName
+	params["RecordId"] = id
+	params["Type"] = string(opts.DnsType)
+	params["Value"] = opts.DnsValue
+	params["TTL"] = strconv.FormatInt(opts.Ttl, 10)
+	params["Line"] = line
+	if opts.DnsType == cloudprovider.DnsTypeMX {
+		params["Priority"] = strconv.FormatInt(opts.MxPriority, 10)
+	}
+	_, err := client.alidnsRequest("UpdateDomainRecord", params)
+	if err != nil {
+		return errors.Wrap(err, "UpdateDomainRecord")
+	}
+	return nil
 }

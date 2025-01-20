@@ -44,7 +44,7 @@ type SEvent struct {
 	// 资源创建时间
 	CreatedAt time.Time `nullable:"false" created_at:"true" index:"true" get:"user" list:"user" json:"created_at"`
 
-	Message      string
+	Message      string `length:"medium"`
 	Event        string `width:"64" nullable:"true"`
 	ResourceType string `width:"64" nullable:"true"`
 	Action       string `width:"64" nullable:"true"`
@@ -69,6 +69,17 @@ func (e *SEventManager) CreateEvent(ctx context.Context, event, topicId, message
 }
 
 func (e *SEventManager) GetEvent(id string) (*SEvent, error) {
+	if len(id) == 0 {
+		return nil, nil
+	}
+	if consts.OpsLogWithClickhouse {
+		eventModel, err := e.FetchById(id)
+		if err != nil {
+			return nil, errors.Wrap(err, "fetch event by id")
+		}
+		event := eventModel.(*SEvent)
+		return event, nil
+	}
 	event := &SEvent{}
 	event.SetModelManager(EventManager, event)
 	eventId, err := strconv.Atoi(id)

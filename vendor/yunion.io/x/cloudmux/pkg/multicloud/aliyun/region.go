@@ -151,6 +151,19 @@ func (self *SRegion) wafRequest(apiName string, params map[string]string) (jsonu
 	return jsonRequest(client, endpoint, ALIYUN_WAF_API_VERSION, apiName, params, self.client.debug)
 }
 
+func (self *SRegion) wafv2Request(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	client, err := self.getSdkClient()
+	if err != nil {
+		return nil, err
+	}
+	if self.RegionId != "cn-hangzhou" && self.RegionId != "ap-southeast-1" {
+		return nil, cloudprovider.ErrNotSupported
+	}
+	params = self.client.SetResourceGropuId(params)
+	endpoint := fmt.Sprintf("wafopenapi.%s.aliyuncs.com", self.RegionId)
+	return jsonRequest(client, endpoint, ALIYUN_WAF_V2_API_VERSION, apiName, params, self.client.debug)
+}
+
 func (self *SRegion) esRequest(apiName string, params map[string]string, body interface{}) (jsonutils.JSONObject, error) {
 	client, err := self.getSdkClient()
 	if err != nil {
@@ -246,6 +259,15 @@ func (self *SRegion) kvsRequest(action string, params map[string]string) (jsonut
 	return jsonRequest(client, "r-kvstore.aliyuncs.com", ALIYUN_API_VERSION_KVS, action, params, self.client.debug)
 }
 
+func (self *SRegion) scRequest(apiName string, params map[string]string) (jsonutils.JSONObject, error) {
+	client, err := self.getSdkClient()
+	if err != nil {
+		return nil, err
+	}
+	domain := "cas.aliyuncs.com"
+	return jsonRequest(client, domain, ALIYUN_CAS_API_VERSION, apiName, params, self.client.debug)
+}
+
 type LBRegion struct {
 	RegionEndpoint string
 	RegionId       string
@@ -297,7 +319,7 @@ func (self *SRegion) _lbRequest(client *sdk.Client, apiName string, domain strin
 	return jsonRequest(client, domain, ALIYUN_API_VERSION_LB, apiName, params, self.client.debug)
 }
 
-/////////////////////////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////////////////////
 func (self *SRegion) GetId() string {
 	return self.RegionId
 }
@@ -863,47 +885,17 @@ func (self *SRegion) GetIEipById(eipId string) (cloudprovider.ICloudEIP, error) 
 }
 
 func (region *SRegion) GetISecurityGroupById(secgroupId string) (cloudprovider.ICloudSecurityGroup, error) {
-	secgroup, err := region.GetSecurityGroupDetails(secgroupId)
+	secgroup, err := region.GetSecurityGroup(secgroupId)
 	if err != nil {
 		return nil, err
 	}
 	return secgroup, nil
 }
 
-func (region *SRegion) GetISecurityGroupByName(opts *cloudprovider.SecurityGroupFilterOptions) (cloudprovider.ICloudSecurityGroup, error) {
-	secgroups, total, err := region.GetSecurityGroups(opts.VpcId, opts.Name, []string{}, 0, 0)
+func (region *SRegion) CreateISecurityGroup(opts *cloudprovider.SecurityGroupCreateInput) (cloudprovider.ICloudSecurityGroup, error) {
+	externalId, err := region.CreateSecurityGroup(opts)
 	if err != nil {
 		return nil, err
-	}
-	if total == 0 {
-		return nil, cloudprovider.ErrNotFound
-	}
-	if total > 1 {
-		return nil, cloudprovider.ErrDuplicateId
-	}
-	secgroups[0].region = region
-	return &secgroups[0], nil
-}
-
-func (region *SRegion) CreateISecurityGroup(conf *cloudprovider.SecurityGroupCreateInput) (cloudprovider.ICloudSecurityGroup, error) {
-	externalId, err := region.CreateSecurityGroup(conf.VpcId, conf.Name, conf.Desc, conf.ProjectId)
-	if err != nil {
-		return nil, err
-	}
-	if conf.OnCreated != nil {
-		conf.OnCreated(externalId)
-	}
-	outRules := conf.OutRules
-	if len(outRules) > 0 && outRules[0].String() == "out:allow any" {
-		outRules = outRules[1:]
-	}
-	rules := append(conf.InRules, outRules...)
-	for _, rule := range rules {
-		rule.Priority = 101 - rule.Priority
-		err = region.addSecurityGroupRule(externalId, rule)
-		if err != nil {
-			return nil, err
-		}
 	}
 	return region.GetISecurityGroupById(externalId)
 }
@@ -1249,4 +1241,16 @@ func (self *SRegion) trialRequest(apiName string, params map[string]string) (jso
 	}
 	domain := fmt.Sprintf("actiontrail.%s.aliyuncs.com", self.RegionId)
 	return jsonRequest(client, domain, ALIYUN_API_VERSION_TRIAL, apiName, params, self.client.debug)
+}
+
+func (self *SRegion) GetIVMs() ([]cloudprovider.ICloudVM, error) {
+	instances, err := self.GetInstances("", nil)
+	if err != nil {
+		return nil, err
+	}
+	ret := []cloudprovider.ICloudVM{}
+	for i := range instances {
+		ret = append(ret, &instances[i])
+	}
+	return ret, nil
 }

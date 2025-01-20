@@ -47,15 +47,15 @@ func NewInfrasResourceBaseManager(
 
 type SInfrasResourceBase struct {
 	SDomainLevelResourceBase
-	SSharableBaseResource `"is_public=>create":"domain_optional" "public_scope=>create":"domain_optional"`
+	SSharableBaseResource `"is_public->create":"domain_optional" "public_scope->create":"domain_optional"`
 }
 
 func (manager *SInfrasResourceBaseManager) GetIInfrasModelManager() IInfrasModelManager {
 	return manager.GetVirtualObject().(IInfrasModelManager)
 }
 
-func (manager *SInfrasResourceBaseManager) FilterByOwner(q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
-	return SharableManagerFilterByOwner(manager.GetIInfrasModelManager(), q, userCred, owner, scope)
+func (manager *SInfrasResourceBaseManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	return SharableManagerFilterByOwner(ctx, manager.GetIInfrasModelManager(), q, userCred, owner, scope)
 }
 
 func (model *SInfrasResourceBase) IsSharable(reqUsrId mcclient.IIdentityProvider) bool {
@@ -66,20 +66,12 @@ func (model *SInfrasResourceBase) IsShared() bool {
 	return SharableModelIsShared(model)
 }
 
-func (model *SInfrasResourceBase) AllowPerformPublic(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPublicDomainInput) bool {
-	return true
-}
-
 func (model *SInfrasResourceBase) PerformPublic(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPublicDomainInput) (jsonutils.JSONObject, error) {
 	err := SharablePerformPublic(model.GetIInfrasModel(), ctx, userCred, apis.PerformPublicProjectInput{PerformPublicDomainInput: input})
 	if err != nil {
 		return nil, errors.Wrap(err, "SharablePerformPublic")
 	}
 	return nil, nil
-}
-
-func (model *SInfrasResourceBase) AllowPerformPrivate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPrivateInput) bool {
-	return true
 }
 
 func (model *SInfrasResourceBase) PerformPrivate(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input apis.PerformPrivateInput) (jsonutils.JSONObject, error) {
@@ -203,7 +195,8 @@ func (model *SInfrasResourceBase) PerformChangeOwner(
 }
 
 func (model *SInfrasResourceBase) CustomizeCreate(ctx context.Context, userCred mcclient.TokenCredential, ownerId mcclient.IIdentityProvider, query jsonutils.JSONObject, data jsonutils.JSONObject) error {
-	SharableModelCustomizeCreate(model.GetIInfrasModel(), ctx, userCred, ownerId, query, data)
+	// 避免domain_id为空导致异常
+	defer SharableModelCustomizeCreate(model.GetIInfrasModel(), ctx, userCred, ownerId, query, data)
 	return model.SDomainLevelResourceBase.CustomizeCreate(ctx, userCred, ownerId, query, data)
 }
 

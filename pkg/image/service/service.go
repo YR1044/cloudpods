@@ -15,6 +15,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,7 +23,10 @@ import (
 	"time"
 
 	execlient "yunion.io/x/executor/client"
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
+	"yunion.io/x/pkg/util/qemuimgfmt"
+	"yunion.io/x/pkg/utils"
 	_ "yunion.io/x/sqlchemy/backends"
 
 	api "yunion.io/x/onecloud/pkg/apis/image"
@@ -30,14 +34,18 @@ import (
 	app_common "yunion.io/x/onecloud/pkg/cloudcommon/app"
 	"yunion.io/x/onecloud/pkg/cloudcommon/cronman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/cachesync"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	common_options "yunion.io/x/onecloud/pkg/cloudcommon/options"
 	"yunion.io/x/onecloud/pkg/hostman/hostdeployer/deployclient"
 	"yunion.io/x/onecloud/pkg/image/drivers/s3"
 	"yunion.io/x/onecloud/pkg/image/models"
 	"yunion.io/x/onecloud/pkg/image/options"
-	_ "yunion.io/x/onecloud/pkg/image/policy"
+	"yunion.io/x/onecloud/pkg/image/policy"
 	_ "yunion.io/x/onecloud/pkg/image/tasks"
 	"yunion.io/x/onecloud/pkg/image/torrent"
+	"yunion.io/x/onecloud/pkg/mcclient/auth"
+	"yunion.io/x/onecloud/pkg/mcclient/modules/compute"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
 )
@@ -48,12 +56,21 @@ func StartService() {
 	baseOpts := &opts.BaseOptions
 	dbOpts := &opts.DBOptions
 	common_options.ParseOptions(opts, os.Args, "glance-api.conf", api.SERVICE_TYPE)
+	policy.Init()
 
 	// no need to run glance as root any more
 	// isRoot := sysutils.IsRootPermission()
 	// if !isRoot {
 	// 	log.Fatalf("glance service must running with root permissions")
 	// }
+
+	app_common.InitAuth(commonOpts, func() {
+		log.Infof("Auth complete!!")
+	})
+
+	common_options.StartOptionManager(opts, opts.ConfigSyncPeriodSeconds, api.SERVICE_TYPE, api.SERVICE_VERSION, options.OnOptionsChange)
+
+	models.InitImageStreamWorkers()
 
 	if opts.PortV2 > 0 {
 		log.Infof("Port V2 %d is specified, use v2 port", opts.PortV2)
@@ -90,9 +107,17 @@ func StartService() {
 
 	log.Infof("Target image formats %#v", opts.TargetImageFormats)
 
-	app_common.InitAuth(commonOpts, func() {
-		log.Infof("Auth complete!!")
-	})
+	if ok, err := hasVmwareAccount(); err != nil {
+		log.Errorf("failed	get vmware cloudaccounts")
+	} else if ok {
+		if !utils.IsInStringArray(string(qemuimgfmt.VMDK), options.Options.TargetImageFormats) {
+			if err = models.UpdateImageConfigTargetImageFormats(context.Background(), auth.AdminCredential()); err != nil {
+				log.Errorf("failed update target_image_formats %s", err)
+			} else {
+				options.Options.TargetImageFormats = append(options.Options.TargetImageFormats, string(qemuimgfmt.VMDK))
+			}
+		}
+	}
 
 	trackers := torrent.GetTrackers()
 	if len(trackers) == 0 {
@@ -107,8 +132,6 @@ func StartService() {
 	InitHandlers(app)
 
 	db.EnsureAppSyncDB(app, dbOpts, models.InitDB)
-
-	common_options.StartOptionManager(opts, opts.ConfigSyncPeriodSeconds, api.SERVICE_TYPE, api.SERVICE_VERSION, options.OnOptionsChange)
 
 	models.Init(options.Options.StorageDriver)
 
@@ -125,6 +148,13 @@ func StartService() {
 	}
 
 	if !opts.IsSlaveNode {
+		err := taskman.TaskManager.InitializeData()
+		if err != nil {
+			log.Fatalf("TaskManager.InitializeData fail %s", err)
+		}
+
+		cachesync.StartTenantCacheSync(opts.TenantCacheExpireSeconds)
+
 		cron := cronman.InitCronJobManager(true, options.Options.CronJobWorkerCount)
 		cron.AddJobAtIntervals("CleanPendingDeleteImages", time.Duration(options.Options.PendingDeleteCheckSeconds)*time.Second, models.ImageManager.CleanPendingDeleteImages)
 		cron.AddJobAtIntervals("CalculateQuotaUsages", time.Duration(opts.CalculateQuotaUsageIntervalSeconds)*time.Second, models.QuotaManager.CalculateQuotaUsages)
@@ -132,6 +162,8 @@ func StartService() {
 			time.Duration(options.Options.PendingDeleteCheckSeconds)*time.Second, models.GuestImageManager.CleanPendingDeleteImages)
 
 		cron.AddJobEveryFewHour("AutoPurgeSplitable", 4, 30, 0, db.AutoPurgeSplitable, false)
+
+		cron.AddJobAtIntervals("TaskCleanupJob", time.Duration(options.Options.TaskArchiveIntervalHours)*time.Hour, taskman.TaskManager.TaskCleanupJob)
 
 		cron.Start()
 	}
@@ -148,6 +180,17 @@ func StartService() {
 			procutils.NewCommand("umount", options.Options.S3MountPoint).Run()
 		}
 	})
+}
+
+func hasVmwareAccount() (bool, error) {
+	q := jsonutils.NewDict()
+	q.Add(jsonutils.NewString("system"), "scope")
+	q.Add(jsonutils.NewString("brand"), "VMware")
+	res, err := compute.Cloudaccounts.List(auth.GetAdminSession(context.Background(), options.Options.Region), q)
+	if err != nil {
+		return false, err
+	}
+	return res.Total > 0, nil
 }
 
 func initS3() {

@@ -15,7 +15,6 @@
 package guestman
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"path"
@@ -131,17 +130,29 @@ func (s *SKVMGuestInstance) GetKernelVersion() string {
 	return s.manager.host.GetKernelVersion()
 }
 
-func (s *SKVMGuestInstance) HideKVM() bool {
-	if s.hasGPU() {
+func (s *SKVMGuestInstance) HideHypervisor() bool {
+	if s.IsRunning() && s.IsMonitorAlive() {
+		cmdline, _ := fileutils2.FileGetContents(path.Join("/proc", strconv.Itoa(s.GetPid()), "cmdline"))
+		if strings.Contains(cmdline, "hypervisor=off") {
+			return true
+		}
+	}
+	if s.hasGPU() && s.GetOsName() == OS_NAME_WINDOWS {
 		return true
 	}
+	return false
+}
+
+func (s *SKVMGuestInstance) HideKVM() bool {
 	if s.IsRunning() && s.IsMonitorAlive() {
 		cmdline, _ := fileutils2.FileGetContents(path.Join("/proc", strconv.Itoa(s.GetPid()), "cmdline"))
 		if strings.Contains(cmdline, "kvm=off") {
 			return true
 		}
 	}
-
+	if s.hasGPU() && s.GetOsName() != OS_NAME_WINDOWS {
+		return true
+	}
 	return false
 }
 
@@ -378,6 +389,11 @@ func (s *SKVMGuestInstance) generateStartScript(data *jsonutils.JSONDict) (strin
 		downscript := s.getNicDownScriptPath(nic)
 		cmd += fmt.Sprintf("%s %s\n", downscript, nic.Ifname)
 	}
+	traffic, err := guestManager.GetGuestTrafficRecord(s.Id)
+	if err != nil {
+		return "", errors.Wrap(err, "get guest traffic record")
+	}
+	input.NicTraffics = traffic
 
 	if input.HugepagesEnabled {
 		cmd += fmt.Sprintf("mkdir -p /dev/hugepages/%s\n", s.Desc.Uuid)
@@ -527,6 +543,7 @@ function nic_mtu() {
 			s.LiveMigrateUseTls = false
 		}
 	} else if s.Desc.IsSlave {
+		log.Infof("backup guest with dest port %v", s.LiveMigrateDestPort)
 		input.LiveMigratePort = uint(*s.LiveMigrateDestPort)
 	}
 
@@ -538,6 +555,12 @@ function nic_mtu() {
 		if err := s.slaveDiskPrepare(input, diskUri); err != nil {
 			return "", err
 		}
+	}
+
+	// set rescue flag to input
+	if s.Desc.LightMode {
+		input.RescueInitrdPath = s.getRescueInitrdPath()
+		input.RescueKernelPath = s.getRescueKernelPath()
 	}
 
 	qemuOpts, err := qemu.GenerateStartOptions(input)
@@ -552,6 +575,14 @@ function nic_mtu() {
 	return cmd, nil
 }
 
+func (s *SKVMGuestInstance) getRescueInitrdPath() string {
+	return path.Join(s.GetRescueDirPath(), api.GUEST_RESCUE_INITRAMFS)
+}
+
+func (s *SKVMGuestInstance) getRescueKernelPath() string {
+	return path.Join(s.GetRescueDirPath(), api.GUEST_RESCUE_KERNEL)
+}
+
 func (s *SKVMGuestInstance) slaveDiskPrepare(input *qemu.GenerateStartOptionsInput, diskUri string) error {
 	for i := 0; i < len(input.GuestDesc.Disks); i++ {
 		diskPath := input.GuestDesc.Disks[i].Path
@@ -559,12 +590,9 @@ func (s *SKVMGuestInstance) slaveDiskPrepare(input *qemu.GenerateStartOptionsInp
 		if err != nil {
 			return errors.Wrapf(err, "GetDiskByPath(%s)", diskPath)
 		}
-		if output, err := procutils.NewCommand("rm", "-f", diskPath).Output(); err != nil {
-			return errors.Errorf("failed delete slave top disk file %s %s", output, err)
-		}
-		diskUrl := fmt.Sprintf("%s/%s", diskUri, input.GuestDesc.Disks[i].DiskId)
-		if err := d.CreateFromImageFuse(context.Background(), diskUrl, 0, nil); err != nil {
-			return errors.Wrap(err, "failed create slave disk")
+		err = d.RebuildSlaveDisk(diskUri)
+		if err != nil {
+			return errors.Wrap(err, "RebuildSlaveDisk")
 		}
 	}
 	return nil
@@ -669,12 +697,12 @@ func (s *SKVMGuestInstance) generateStopScript(data *jsonutils.JSONDict) string 
 	cmd += "fi\n"
 
 	cmd += fmt.Sprintf("for d in $(ls -d /dev/hugepages/%s*)\n", uuid)
-	cmd += fmt.Sprintf("do\n")
-	cmd += fmt.Sprintf("  if [ -d $d ]; then\n")
-	cmd += fmt.Sprintf("    umount $d\n")
-	cmd += fmt.Sprintf("    rm -rf $d\n")
-	cmd += fmt.Sprintf("  fi\n")
-	cmd += fmt.Sprintf("done\n")
+	cmd += "do\n"
+	cmd += "  if [ -d $d ]; then\n"
+	cmd += "    umount $d\n"
+	cmd += "    rm -rf $d\n"
+	cmd += "  fi\n"
+	cmd += "done\n"
 
 	for _, nic := range nics {
 		if nic.Driver == api.NETWORK_DRIVER_VFIO {
@@ -776,6 +804,34 @@ func (s *SKVMGuestInstance) WriteMigrateCerts(certs map[string]string) error {
 	return nil
 }
 
+func (s *SKVMGuestInstance) SetNicDown(index int) error {
+	var nic *desc.SGuestNetwork
+	for i := range s.Desc.Nics {
+		if s.Desc.Nics[i].Index == index {
+			nic = s.Desc.Nics[i]
+			break
+		}
+	}
+	if nic == nil {
+		return errors.Errorf("guest %s has no nic index %d", s.GetName(), index)
+	}
+	scriptPath := s.getNicDownScriptPath(nic)
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("bash", scriptPath).Output()
+	if err != nil {
+		return errors.Wrapf(err, "failed run nic down script %s", out)
+	}
+	return nil
+}
+
+func (s *SKVMGuestInstance) SetNicUp(nic *desc.SGuestNetwork) error {
+	scriptPath := s.getNicUpScriptPath(nic)
+	out, err := procutils.NewRemoteCommandAsFarAsPossible("bash", scriptPath).Output()
+	if err != nil {
+		return errors.Wrapf(err, "failed run nic down script %s", out)
+	}
+	return nil
+}
+
 func (s *SKVMGuestInstance) startMemCleaner() error {
 	err := procutils.NewRemoteCommandAsFarAsPossible(
 		options.HostOptions.BinaryMemcleanPath,
@@ -826,13 +882,22 @@ func (s *SKVMGuestInstance) initCpuDesc(cpuMax uint) error {
 		return err
 	}
 	s.Desc.CpuDesc = cpuDesc
+
+	// if region not allocate cpu numa pin
+	if len(s.Desc.CpuNumaPin) == 0 {
+		err = s.allocGuestNumaCpuset()
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func (s *SKVMGuestInstance) initMemDesc(memSizeMB int64) {
+func (s *SKVMGuestInstance) initMemDesc(memSizeMB int64) error {
 	s.Desc.MemDesc = s.archMan.GenerateMemDesc()
 	s.Desc.MemDesc.SizeMB = memSizeMB
-	s.initDefaultMemObject(memSizeMB)
+
+	return s.initGuestMemObjects(memSizeMB)
 }
 
 func (s *SKVMGuestInstance) memObjectType() string {
@@ -845,24 +910,89 @@ func (s *SKVMGuestInstance) memObjectType() string {
 	}
 }
 
-func (s *SKVMGuestInstance) initDefaultMemObject(memSizeMB int64) {
-	s.Desc.MemDesc.Mem = desc.NewObject(s.memObjectType(), "mem")
+func (s *SKVMGuestInstance) initGuestMemObjects(memSizeMB int64) error {
+	if len(s.Desc.CpuNumaPin) == 0 {
+		s.initDefaultMemObject(memSizeMB)
+		return nil
+	}
+
+	var numaMems int64
+	var numaCpus = int(s.Desc.CpuDesc.MaxCpus) / len(s.Desc.CpuNumaPin)
+	var leastCpus = int(s.Desc.CpuDesc.MaxCpus) % len(s.Desc.CpuNumaPin)
+	var cpuStart = 0
+	var cpuEnd = numaCpus - 1
+
+	var mems = make([]desc.SMemDesc, 0)
+	for i := 0; i < len(s.Desc.CpuNumaPin); i++ {
+		if s.Desc.CpuNumaPin[i].SizeMB <= 0 {
+			continue
+		}
+
+		numaMems += s.Desc.CpuNumaPin[i].SizeMB
+		memId := "mem"
+		nodeId := uint16(i)
+		if i > 0 {
+			memId += strconv.Itoa(i - 1)
+		}
+
+		if i == 0 {
+			cpuEnd += leastCpus
+		}
+		vcpus := fmt.Sprintf("%d-%d", cpuStart, cpuEnd)
+
+		for j := range s.Desc.CpuNumaPin[i].VcpuPin {
+			s.Desc.CpuNumaPin[i].VcpuPin[j].Vcpu = cpuStart + j
+		}
+
+		cpuStart = cpuEnd + 1
+		cpuEnd = cpuStart + numaCpus - 1
+
+		if s.Desc.CpuNumaPin[i].Unregular {
+			continue
+		}
+		memDesc := desc.NewMemDesc(s.memObjectType(), memId, &nodeId, &vcpus)
+		memDesc.Options = s.getMemObjectOptions(s.Desc.CpuNumaPin[i].SizeMB, s.Desc.Uuid, s.Desc.CpuNumaPin[i].NodeId)
+		mems = append(mems, *memDesc)
+	}
+	if len(mems) == 0 {
+		// numa mems not regular
+		s.initDefaultMemObject(memSizeMB)
+		return nil
+	}
+
+	s.Desc.MemDesc.Mem = desc.NewMemsDesc(mems[0], mems[1:])
+	return nil
+}
+
+func (s *SKVMGuestInstance) getMemObjectOptions(memSizeMB int64, memPathSuffix string, hostNodes *uint16) map[string]string {
+	var opts map[string]string
 	if s.manager.host.IsHugepagesEnabled() {
-		s.Desc.MemDesc.Mem.Options = map[string]string{
-			"mem-path": fmt.Sprintf("/dev/hugepages/%s", s.Desc.Uuid),
+		opts = map[string]string{
+			"mem-path": fmt.Sprintf("/dev/hugepages/%s", memPathSuffix),
 			"size":     fmt.Sprintf("%dM", memSizeMB),
 			"share":    "on", "prealloc": "on",
 		}
+		if hostNodes != nil {
+			opts["host-nodes"] = fmt.Sprintf("%d", *hostNodes)
+			opts["policy"] = "bind"
+		}
 	} else if s.isMemcleanEnabled() {
-		s.Desc.MemDesc.Mem.Options = map[string]string{
+		opts = map[string]string{
 			"size":  fmt.Sprintf("%dM", memSizeMB),
 			"share": "on", "prealloc": "on",
 		}
 	} else {
-		s.Desc.MemDesc.Mem.Options = map[string]string{
+		opts = map[string]string{
 			"size": fmt.Sprintf("%dM", memSizeMB),
 		}
 	}
+	return opts
+}
+
+func (s *SKVMGuestInstance) initDefaultMemObject(memSizeMB int64) {
+	defaultDesc := desc.NewMemDesc(s.memObjectType(), "mem", nil, nil)
+	defaultDesc.Options = s.getMemObjectOptions(memSizeMB, s.Desc.Uuid, nil)
+	s.Desc.MemDesc.Mem = desc.NewMemsDesc(*defaultDesc, nil)
 }
 
 func (s *SKVMGuestInstance) defaultMemNodeHasObject(memDevs []monitor.Memdev) bool {
@@ -884,9 +1014,13 @@ func (s *SKVMGuestInstance) initMemDescFromMemoryInfo(
 			return errors.Errorf("unsupported memory device type %s", memoryDevicesInfoList[i].Type)
 		}
 		memSize -= (memoryDevicesInfoList[i].Data.Size / 1024 / 1024)
+		memObj := desc.NewMemDesc(s.memObjectType(), path.Base(memoryDevicesInfoList[i].Data.Memdev), nil, nil)
+		memObj.Options = map[string]string{
+			"size": fmt.Sprintf("%dM", memoryDevicesInfoList[i].Data.Size/1024/1024),
+		}
 		memSlots = append(memSlots, &desc.SMemSlot{
 			SizeMB: memoryDevicesInfoList[i].Data.Size / 1024 / 1024,
-			MemObj: desc.NewObject(s.memObjectType(), path.Base(memoryDevicesInfoList[i].Data.Memdev)),
+			MemObj: memObj,
 			MemDev: &desc.SMemDevice{
 				Type: "pc-dimm", Id: *memoryDevicesInfoList[i].Data.ID,
 			},
@@ -920,12 +1054,15 @@ func (s *SKVMGuestInstance) fixGuestMachineType() {
 }
 
 func (s *SKVMGuestInstance) initMachineDesc() {
+	if s.Desc.Machine == "" {
+		s.Desc.Machine = s.getMachine()
+	}
+
 	s.Desc.MachineDesc = s.archMan.GenerateMachineDesc(s.Desc.CpuDesc.Accel)
 	if options.HostOptions.NoHpet {
 		noHpet := true
 		s.Desc.NoHpet = &noHpet
 	}
-
 }
 
 func (s *SKVMGuestInstance) initQgaDesc() {
@@ -933,7 +1070,9 @@ func (s *SKVMGuestInstance) initQgaDesc() {
 }
 
 func (s *SKVMGuestInstance) initPvpanicDesc() {
-	s.Desc.Pvpanic = s.archMan.GeneratePvpanicDesc()
+	if !s.disablePvpanicDev() {
+		s.Desc.Pvpanic = s.archMan.GeneratePvpanicDesc()
+	}
 }
 
 func (s *SKVMGuestInstance) initIsaSerialDesc() {

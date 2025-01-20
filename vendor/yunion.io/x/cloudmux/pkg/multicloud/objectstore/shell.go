@@ -98,6 +98,101 @@ func S3Shell() {
 		return nil
 	})
 
+	type BucketCORSListOptions struct {
+		ID string
+	}
+	shellutils.R(&BucketCORSListOptions{}, "bucket-cors-list", "List all cors bucket", func(cli cloudprovider.ICloudRegion, args *BucketCORSListOptions) error {
+		bucket, err := cli.GetIBucketById(args.ID)
+		if err != nil {
+			return errors.Wrap(err, "GetIBucketById")
+		}
+		cors, err := bucket.GetCORSRules()
+		if err != nil {
+			return errors.Wrap(err, "GetCORSRules")
+		}
+		printObject(cors)
+		return nil
+	})
+
+	shellutils.R(&BucketCORSListOptions{}, "bucket-cors-delete", "delete all cors bucket", func(cli cloudprovider.ICloudRegion, args *BucketCORSListOptions) error {
+		bucket, err := cli.GetIBucketById("yunion12")
+		if err != nil {
+			return errors.Wrap(err, "GetIBucketById")
+		}
+		err = bucket.DeleteCORS()
+		if err != nil {
+			return errors.Wrap(err, "DeleteCORS")
+		}
+		return nil
+	})
+
+	shellutils.R(&BucketCORSListOptions{}, "bucket-policy-list", "List all cors bucket", func(cli cloudprovider.ICloudRegion, args *BucketCORSListOptions) error {
+		bucket, err := cli.GetIBucketById(args.ID)
+		if err != nil {
+			return errors.Wrap(err, "GetIBucketById")
+		}
+		policies, err := bucket.GetPolicy()
+		if err != nil {
+			return errors.Wrap(err, "GetPolicy")
+		}
+		printObject(policies)
+		return nil
+	})
+
+	type BucketCORSDeleteOptions struct {
+		ID    string
+		INDEX string
+	}
+	shellutils.R(&BucketCORSDeleteOptions{}, "bucket-policy-delete", "delete all policy bucket", func(cli cloudprovider.ICloudRegion, args *BucketCORSDeleteOptions) error {
+		bucket, err := cli.GetIBucketById(args.ID)
+		if err != nil {
+			return errors.Wrap(err, "GetIBucketById")
+		}
+		_, err = bucket.DeletePolicy([]string{args.INDEX})
+		if err != nil {
+			return errors.Wrap(err, "DeletePolicy")
+		}
+		return nil
+	})
+
+	type SetBucketPolicyInput struct {
+		ID           string
+		PrincipalId  string
+		CannedAction string
+		ResourcePath string
+		Effect       string
+	}
+	shellutils.R(&SetBucketPolicyInput{}, "bucket-policy-create", "create policy bucket", func(cli cloudprovider.ICloudRegion, args *SetBucketPolicyInput) error {
+		bucket, err := cli.GetIBucketById(args.ID)
+		if err != nil {
+			return errors.Wrap(err, "GetIBucketById")
+		}
+		err = bucket.SetPolicy(cloudprovider.SBucketPolicyStatementInput{
+			PrincipalId:  []string{args.PrincipalId},
+			Effect:       args.Effect,
+			CannedAction: args.CannedAction,
+			ResourcePath: []string{
+				args.ResourcePath},
+		})
+		if err != nil {
+			return errors.Wrap(err, "SetPolicy")
+		}
+		return nil
+	})
+
+	shellutils.R(&BucketCORSListOptions{}, "bucket-policy-list", "Show bucket detail", func(cli cloudprovider.ICloudRegion, args *BucketCORSListOptions) error {
+		bucket, err := cli.GetIBucketById(args.ID)
+		if err != nil {
+			return err
+		}
+		res, err := bucket.GetPolicy()
+		if err != nil {
+			return errors.Wrap(err, "GetPolicy")
+		}
+		printObject(res)
+		return nil
+	})
+
 	type BucketCreateOptions struct {
 		NAME         string `help:"name of bucket to create"`
 		Acl          string `help:"ACL string" choices:"private|public-read|public-read-write"`
@@ -740,6 +835,35 @@ func S3Shell() {
 		}
 		uplaods, err := bucket.ListMultipartUploads()
 		printList(uplaods, len(uplaods), 0, len(uplaods), nil)
+		return nil
+	})
+
+	type BucketObjectBatchDownloadOptions struct {
+		BUCKET string `help:"name of bucket"`
+		PREFIX string `help:"Prefix of object"`
+		Output string `help:"target output directory, default to current directory"`
+	}
+	shellutils.R(&BucketObjectBatchDownloadOptions{}, "batch-download", "Download objects recursively", func(cli cloudprovider.ICloudRegion, args *BucketObjectBatchDownloadOptions) error {
+		bucket, err := cli.GetIBucketById(args.BUCKET)
+		if err != nil {
+			return err
+		}
+		marker := ""
+		const maxCount = 1000
+		for {
+			results, err := bucket.ListObjects(args.PREFIX, marker, "", maxCount)
+			if err != nil {
+				return errors.Wrapf(err, "ListObjects prefix %s marker %s", args.PREFIX, marker)
+			}
+			for _, obj := range results.Objects {
+				fmt.Println(obj.GetKey())
+			}
+			if !results.IsTruncated {
+				break
+			} else {
+				marker = results.NextMarker
+			}
+		}
 		return nil
 	})
 

@@ -54,7 +54,10 @@ func (s *SKVMGuestInstance) initGuestDesc() error {
 	if err != nil {
 		return err
 	}
-	s.initMemDesc(s.Desc.Mem)
+	err = s.initMemDesc(s.Desc.Mem)
+	if err != nil {
+		return errors.Wrap(err, "initMemDesc")
+	}
 	s.initMachineDesc()
 
 	pciRoot, pciBridge := s.initGuestPciControllers(s.manager.host.IsKvmSupport())
@@ -104,12 +107,16 @@ func (s *SKVMGuestInstance) loadGuestPciAddresses() error {
 	if err != nil {
 		return errors.Wrap(err, "init guest pci addresses")
 	}
+
 	if err := s.initMachineDefaultAddresses(); err != nil {
 		return errors.Wrap(err, "init machine default devices")
 	}
 	err = s.ensurePciAddresses()
 	if err != nil {
 		return errors.Wrap(err, "load desc ensure pci address")
+	}
+	if err = SaveLiveDesc(s, s.Desc); err != nil {
+		return errors.Wrap(err, "loadGuestPciAddresses save desc")
 	}
 	return nil
 }
@@ -317,6 +324,8 @@ func (s *SKVMGuestInstance) initGuestNetworks(pciRoot, pciBridge *desc.PCIContro
 				s.Desc.Nics[i].Pci = desc.NewPCIDevice(cont.CType, "e1000-82545em", id)
 			case "vmxnet3":
 				s.Desc.Nics[i].Pci = desc.NewPCIDevice(cont.CType, "vmxnet3", id)
+			case "rtl8139":
+				s.Desc.Nics[i].Pci = desc.NewPCIDevice(cont.CType, "rtl8139", id)
 			}
 		}
 	}
@@ -408,14 +417,29 @@ func (s *SKVMGuestInstance) initGuestDisks(pciRoot, pciBridge *desc.PCIControlle
 	for i := 0; i < len(s.Desc.Disks); i++ {
 		devType := qemu.GetDiskDeviceModel(s.Desc.Disks[i].Driver)
 		id := fmt.Sprintf("drive_%d", s.Desc.Disks[i].Index)
+		if s.Desc.Disks[i].Pci != nil || s.Desc.Disks[i].Scsi != nil {
+			log.Infof("guest %s disk %v has been init", s.Desc.Uuid, s.Desc.Disks[i].Index)
+			continue
+		}
+
 		switch s.Desc.Disks[i].Driver {
 		case DISK_DRIVER_VIRTIO:
 			if s.Desc.Disks[i].Pci == nil {
 				s.Desc.Disks[i].Pci = desc.NewPCIDevice(cont.CType, devType, id)
 			}
 		case DISK_DRIVER_SCSI:
+			if s.Desc.VirtioScsi == nil {
+				s.Desc.VirtioScsi = &desc.SGuestVirtioScsi{
+					PCIDevice: desc.NewPCIDevice(pciRoot.CType, "virtio-scsi-pci", "scsi"),
+				}
+			}
 			s.Desc.Disks[i].Scsi = desc.NewScsiDevice(s.Desc.VirtioScsi.Id, devType, id)
 		case DISK_DRIVER_PVSCSI:
+			if s.Desc.PvScsi == nil {
+				s.Desc.PvScsi = &desc.SGuestPvScsi{
+					PCIDevice: desc.NewPCIDevice(pciRoot.CType, "pvscsi", "scsi"),
+				}
+			}
 			s.Desc.Disks[i].Scsi = desc.NewScsiDevice(s.Desc.PvScsi.Id, devType, id)
 		case DISK_DRIVER_IDE:
 			s.Desc.Disks[i].Ide = desc.NewIdeDevice(devType, id)
@@ -707,13 +731,71 @@ func (s *SKVMGuestInstance) ensurePciAddresses() error {
 		}
 	}
 
+	anonymousPCIDevs := s.Desc.AnonymousPCIDevs[:0]
 	for i := 0; i < len(s.Desc.AnonymousPCIDevs); i++ {
+		if s.isMachineDefaultAddress(s.Desc.AnonymousPCIDevs[i].PCIAddr) {
+			if _, inUse := s.pciAddrs.IsAddrInUse(s.Desc.AnonymousPCIDevs[i].PCIAddr); inUse {
+				log.Infof("guest %s anonymous dev addr %s in use", s.GetName(), s.Desc.AnonymousPCIDevs[i].String())
+				continue
+			}
+		}
 		err = s.ensureDevicePciAddress(s.Desc.AnonymousPCIDevs[i], -1, nil)
 		if err != nil {
 			return errors.Wrap(err, "ensure anonymous pci dev pci address")
 		}
+		anonymousPCIDevs = append(anonymousPCIDevs, s.Desc.AnonymousPCIDevs[i])
 	}
+	if len(anonymousPCIDevs) == 0 {
+		anonymousPCIDevs = nil
+	}
+	s.Desc.AnonymousPCIDevs = anonymousPCIDevs
 	return nil
+}
+
+func (s *SKVMGuestInstance) getNetdevOfThePciAddress(qtree string, addr *desc.PCIAddr) string {
+	var slotFunc = fmt.Sprintf("addr = %02x.%x", addr.Slot, addr.Function)
+	var addressFound = false
+	var lines = strings.Split(strings.TrimSuffix(qtree, "\r\n"), "\\r\\n")
+	var currentIndentLevel = -1
+	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine == "" {
+			continue
+		}
+
+		if currentIndentLevel > 0 {
+			newIndentLevel := len(line) - len(trimmedLine)
+			if newIndentLevel <= currentIndentLevel {
+				if addressFound {
+					break
+				}
+
+				currentIndentLevel = -1
+				continue
+			}
+
+			if strings.HasPrefix(trimmedLine, slotFunc) {
+				addressFound = true
+				continue
+			}
+
+			if strings.HasPrefix(trimmedLine, "netdev =") {
+				segs := strings.Split(trimmedLine, " ")
+				netdev := strings.Trim(segs[2], `\\"`)
+				log.Infof("found netdev %s: %s", netdev, trimmedLine)
+				return netdev
+			} else {
+				continue
+			}
+		}
+
+		if strings.HasPrefix(trimmedLine, "dev: virtio-net-pci") {
+			currentIndentLevel = len(line) - len(trimmedLine)
+		} else {
+			continue
+		}
+	}
+	return ""
 }
 
 // guests description no pci description before host-agent assign pci device address info
@@ -721,7 +803,7 @@ func (s *SKVMGuestInstance) ensurePciAddresses() error {
 func (s *SKVMGuestInstance) initGuestDescFromExistingGuest(
 	cpuList []monitor.HotpluggableCPU, pciInfoList []monitor.PCIInfo,
 	memoryDevicesInfoList []monitor.MemoryDeviceInfo, memDevs []monitor.Memdev,
-	scsiNumQueues int64,
+	scsiNumQueues int64, qtree string,
 ) error {
 	if len(pciInfoList) > 1 {
 		return errors.Errorf("unsupported pci info list with multi bus")
@@ -737,8 +819,13 @@ func (s *SKVMGuestInstance) initGuestDescFromExistingGuest(
 		return errors.Wrap(err, "init guest memory devices")
 	}
 	s.initMachineDesc()
+	if s.manager.host.IsX8664() && !s.hasHpet(qtree) {
+		noHpet := true
+		s.Desc.NoHpet = &noHpet
+	}
 
-	// TODO: pcie extend bus
+	// This code is designed to ensure compatibility with older guests.
+	// However, it is not recommended for new guests to generate a desc file from it
 	pciRoot, _ := s.initGuestPciControllers(false)
 	err = s.initGuestPciAddresses()
 	if err != nil {
@@ -790,7 +877,7 @@ func (s *SKVMGuestInstance) initGuestDescFromExistingGuest(
 					return errors.Wrap(err, "ensure pvscsi pci address")
 				}
 			}
-		case "video0":
+		case "video0", "video1":
 			if s.Desc.VgaDevice == nil {
 				s.initGuestVga(pciRoot)
 			}
@@ -976,6 +1063,24 @@ func (s *SKVMGuestInstance) initGuestDescFromExistingGuest(
 					err = s.ensureDevicePciAddress(s.Desc.VgaDevice.PCIDevice, -1, nil)
 					if err != nil {
 						return errors.Wrap(err, "ensure vga pci address")
+					}
+				case class == 512 && vendor == 6900 && device == 4096: // { 0x0200, "Ethernet controller", "ethernet"}, 1af4:1000  network device (legacy)
+					// virtio nics has no ids
+					ifname := s.getNetdevOfThePciAddress(qtree, pciAddr)
+
+					index := 0
+					for ; index < len(s.Desc.Nics); index++ {
+						if s.Desc.Nics[index].Ifname == ifname {
+							s.Desc.Nics[index].Pci.PCIAddr = pciAddr
+							err = s.ensureDevicePciAddress(s.Desc.Nics[index].Pci, -1, nil)
+							if err != nil {
+								return errors.Wrapf(err, "ensure nic %s pci address", s.Desc.Nics[index].Ifname)
+							}
+							break
+						}
+					}
+					if index >= len(s.Desc.Nics) {
+						return errors.Errorf("failed find nics ifname")
 					}
 				default:
 					unknownDevices = append(unknownDevices, pciInfoList[0].Devices[i])

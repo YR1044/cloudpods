@@ -68,7 +68,7 @@ type SHypervisor struct {
 	HypervisorType     string
 	HypervisorVersion  string
 	Id                 string
-	LocalGB            int
+	LocalGB            int64
 	LocalGbUsed        int
 	MemoryMB           int
 	MemoryMbUsed       int
@@ -93,7 +93,7 @@ func (host *SHypervisor) GetGlobalId() string {
 	return host.GetId()
 }
 
-func (host *SHypervisor) GetIWires() ([]cloudprovider.ICloudWire, error) {
+func (host *SHypervisor) getIWires() ([]cloudprovider.ICloudWire, error) {
 	vpcs, err := host.zone.region.GetIVpcs()
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetIVpc")
@@ -270,7 +270,7 @@ func (host *SHypervisor) GetMemSizeMB() int {
 	return host.MemoryMB
 }
 
-func (host *SHypervisor) GetStorageSizeMB() int {
+func (host *SHypervisor) GetStorageSizeMB() int64 {
 	return host.LocalGB * 1024
 }
 
@@ -292,7 +292,11 @@ func (host *SHypervisor) GetHostStatus() string {
 }
 
 func (host *SHypervisor) GetIHostNics() ([]cloudprovider.ICloudHostNetInterface, error) {
-	return nil, cloudprovider.ErrNotSupported
+	wires, err := host.getIWires()
+	if err != nil {
+		return nil, errors.Wrap(err, "GetIWires")
+	}
+	return cloudprovider.GetHostNetifs(host, wires), nil
 }
 
 func (host *SHypervisor) GetIsMaintenance() bool {

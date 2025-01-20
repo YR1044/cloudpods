@@ -40,14 +40,14 @@ func init() {
 
 func (self *InstanceBackupRecoveryTask) taskFailed(ctx context.Context, ib *models.SInstanceBackup, reason jsonutils.JSONObject) {
 	reasonStr, _ := reason.GetString()
-	ib.SetStatus(self.UserCred, compute.INSTANCE_BACKUP_STATUS_CREATE_FAILED, reasonStr)
+	ib.SetStatus(ctx, self.UserCred, compute.INSTANCE_BACKUP_STATUS_CREATE_FAILED, reasonStr)
 	logclient.AddActionLogWithStartable(self, ib, logclient.ACT_RECOVERY, reason, self.UserCred, false)
 	db.OpsLog.LogEvent(ib, db.ACT_RECOVERY_FAIL, ib.GetShortDesc(ctx), self.GetUserCred())
 	self.SetStageFailed(ctx, reason)
 }
 
 func (self *InstanceBackupRecoveryTask) taskSuccess(ctx context.Context, ib *models.SInstanceBackup) {
-	ib.SetStatus(self.UserCred, compute.INSTANCE_BACKUP_STATUS_READY, "")
+	ib.SetStatus(ctx, self.UserCred, compute.INSTANCE_BACKUP_STATUS_READY, "")
 	logclient.AddActionLogWithStartable(self, ib, logclient.ACT_RECOVERY, nil, self.UserCred, true)
 	db.OpsLog.LogEvent(ib, db.ACT_RECOVERY, ib.GetShortDesc(ctx), self.GetUserCred())
 	self.SetStageComplete(ctx, nil)
@@ -106,7 +106,7 @@ func (self *InstanceBackupRecoveryTask) OnInit(ctx context.Context, obj db.IStan
 	params.Set("guest_id", jsonutils.NewString(guest.Id))
 	self.SetStage("OnCreateGuest", params)
 	params.Set("parent_task_id", jsonutils.NewString(self.GetTaskId()))
-	models.GuestManager.OnCreateComplete(ctx, []db.IModel{guest}, self.UserCred, ownerId, nil, params)
+	models.GuestManager.OnCreateComplete(ctx, []db.IModel{guest}, self.UserCred, ownerId, nil, []jsonutils.JSONObject{params})
 }
 
 func (self *InstanceBackupRecoveryTask) OnCreateGuest(ctx context.Context, ib *models.SInstanceBackup, data jsonutils.JSONObject) {

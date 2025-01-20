@@ -40,7 +40,7 @@ func init() {
 func (self *InstanceSnapshotAndCloneTask) taskFailed(
 	ctx context.Context, isp *models.SInstanceSnapshot, reason jsonutils.JSONObject) {
 	guest := models.GuestManager.FetchGuestById(isp.GuestId)
-	guest.SetStatus(self.UserCred, compute.VM_SNAPSHOT_AND_CLONE_FAILED, reason.String())
+	guest.SetStatus(ctx, self.UserCred, compute.VM_SNAPSHOT_AND_CLONE_FAILED, reason.String())
 	logclient.AddActionLogWithContext(
 		ctx, guest, logclient.ACT_VM_SNAPSHOT_AND_CLONE, reason, self.UserCred, false,
 	)
@@ -129,7 +129,7 @@ func (self *InstanceSnapshotAndCloneTask) doGuestCreate(
 			continue
 		}
 		isp.AddRefCount(ctx)
-		models.GuestManager.OnCreateComplete(ctx, []db.IModel{newGuest}, self.UserCred, self.UserCred, nil, params)
+		models.GuestManager.OnCreateComplete(ctx, []db.IModel{newGuest}, self.UserCred, self.UserCred, nil, []jsonutils.JSONObject{params})
 	}
 	if len(errStr) > 0 {
 		return fmt.Errorf(errStr)

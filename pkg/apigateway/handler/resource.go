@@ -311,7 +311,7 @@ func (f *ResourceHandlers) getSpecHandler(ctx context.Context, w http.ResponseWr
 	query := req.Query()
 
 	module2, e := modulebase.GetModule(session, req.Spec())
-	if e != nil {
+	if e != nil || module.GetSpecificMethods().Has(req.Spec()) {
 		obj, e := module.GetSpecific(session, req.ResID(), req.Spec(), query)
 		if e != nil {
 			httperrors.GeneralServerError(ctx, w, e)
@@ -644,12 +644,13 @@ func (f *ResourceHandlers) updateJointHandler(ctx context.Context, w http.Respon
 	session := req.Session()
 	module := req.Mod1()
 	module2 := req.Mod2()
+	query := req.Query()
 	body := req.Body()
 
 	jmod, e := modulebase.GetJointModule2(session, module, module2)
 	var obj jsonutils.JSONObject
 	if e == nil { // update joint
-		obj, e = jmod.Update(session, req.ResID(), req.ResID2(), nil, body)
+		obj, e = jmod.Update(session, req.ResID(), req.ResID2(), query, body)
 	} else { // update in context
 		obj, e = module2.PutInContext(session, req.ResID2(), body, module, req.ResID())
 	}
@@ -669,12 +670,13 @@ func (f *ResourceHandlers) patchJointHandler(ctx context.Context, w http.Respons
 	session := req.Session()
 	module := req.Mod1()
 	module2 := req.Mod2()
+	query := req.Query()
 	body := req.Body()
 
 	jmod, e := modulebase.GetJointModule2(session, module, module2)
 	var obj jsonutils.JSONObject
 	if e == nil { // update joint
-		obj, e = jmod.Patch(session, req.ResID(), req.ResID2(), nil, body)
+		obj, e = jmod.Patch(session, req.ResID(), req.ResID2(), query, body)
 	} else { // update in context
 		obj, e = module2.PatchInContext(session, req.ResID2(), body, module, req.ResID())
 	}

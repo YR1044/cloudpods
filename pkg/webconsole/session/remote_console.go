@@ -15,12 +15,14 @@
 package session
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os/exec"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/onecloud/pkg/apis/webconsole"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -30,22 +32,26 @@ import (
 )
 
 const (
-	VNC       = api.VNC
-	ALIYUN    = api.ALIYUN
-	QCLOUD    = api.QCLOUD
-	OPENSTACK = api.OPENSTACK
-	SPICE     = api.SPICE
-	WMKS      = api.WMKS
-	WS        = api.WS
-	VMRC      = api.VMRC
-	ZSTACK    = api.ZSTACK
-	CTYUN     = api.CTYUN
-	HUAWEI    = api.HUAWEI
-	HCS       = api.HCS
-	APSARA    = api.APSARA
-	JDCLOUD   = api.JDCLOUD
-	CLOUDPODS = api.CLOUDPODS
-	PROXMOX   = api.PROXMOX
+	VNC        = api.VNC
+	RDP        = api.RDP
+	ALIYUN     = api.ALIYUN
+	QCLOUD     = api.QCLOUD
+	OPENSTACK  = api.OPENSTACK
+	SPICE      = api.SPICE
+	WMKS       = api.WMKS
+	WS         = api.WS
+	VMRC       = api.VMRC
+	ZSTACK     = api.ZSTACK
+	CTYUN      = api.CTYUN
+	HUAWEI     = api.HUAWEI
+	HCS        = api.HCS
+	APSARA     = api.APSARA
+	JDCLOUD    = api.JDCLOUD
+	CLOUDPODS  = api.CLOUDPODS
+	PROXMOX    = api.PROXMOX
+	VOLCENGINE = api.VOLC_ENGINE
+	BAIDU      = api.BAIDU
+	SANGFOR    = api.SANGFOR
 )
 
 type RemoteConsoleInfo struct {
@@ -124,8 +130,10 @@ func (info *RemoteConsoleInfo) GetConnectParams() (string, error) {
 		return info.getQcloudURL()
 	case CLOUDPODS:
 		return info.getCloudpodsURL()
-	case OPENSTACK, VMRC, ZSTACK, CTYUN, HUAWEI, HCS, JDCLOUD, PROXMOX:
+	case OPENSTACK, VMRC, ZSTACK, CTYUN, HUAWEI, HCS, JDCLOUD, PROXMOX, SANGFOR, BAIDU:
 		return info.Url, nil
+	case VOLCENGINE:
+		return info.getVolcEngineURL()
 	default:
 		return "", fmt.Errorf("Can't convert protocol %s to connect params", info.Protocol)
 	}
@@ -161,14 +169,13 @@ func (info *RemoteConsoleInfo) getAliyunURL() (string, error) {
 	if info.OsName == "Windows" {
 		isWindows = "true"
 	}
-	base := fmt.Sprintf("https://g.alicdn.com/aliyun/ecs-console-vnc2/%s/index.html", options.Options.AliyunVncVersion)
 	params := url.Values{
 		"vncUrl":     {info.Url},
 		"instanceId": {info.InstanceId},
 		"isWindows":  {isWindows},
 		"password":   {info.Password},
 	}
-	return info.getConnParamsURL(base, params), nil
+	return info.getConnParamsURL(options.Options.AliyunConsoleAddr, params), nil
 }
 
 func (info *RemoteConsoleInfo) getCloudpodsURL() (string, error) {
@@ -177,6 +184,16 @@ func (info *RemoteConsoleInfo) getCloudpodsURL() (string, error) {
 		"data":         {info.ConnectParams},
 		"instanceId":   {info.InstanceId},
 		"instanceName": {info.InstanceName},
+	}
+	return info.getConnParamsURL(base, params), nil
+}
+
+func (info *RemoteConsoleInfo) getVolcEngineURL() (string, error) {
+	base := "https://console.volcengine.com/ecs/connect/vnc/"
+	params := url.Values{
+		"host":   {info.Url},
+		"Region": {info.Region},
+		"name":   {info.InstanceName},
 	}
 	return info.getConnParamsURL(base, params), nil
 }
@@ -197,4 +214,20 @@ func (info *RemoteConsoleInfo) getApsaraURL() (string, error) {
 
 func (info *RemoteConsoleInfo) GetRecordObject() *recorder.Object {
 	return nil
+}
+
+func (info *RemoteConsoleInfo) GetDisplayInfo(ctx context.Context) (*SDisplayInfo, error) {
+	userInfo, err := fetchUserInfo(ctx, info.GetClientSession())
+	if err != nil {
+		return nil, errors.Wrap(err, "fetchUserInfo")
+	}
+	guestDetails, err := FetchServerInfo(ctx, info.GetClientSession(), info.Id)
+	if err != nil {
+		return nil, errors.Wrap(err, "FetchServerInfo")
+	}
+
+	dispInfo := SDisplayInfo{}
+	dispInfo.WaterMark = fetchWaterMark(userInfo)
+	dispInfo.fetchGuestInfo(guestDetails)
+	return &dispInfo, nil
 }

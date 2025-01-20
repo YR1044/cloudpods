@@ -24,8 +24,8 @@ import (
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
-	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/cloudcommon/tsdb"
 	"yunion.io/x/onecloud/pkg/cloudmon/options"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
 	"yunion.io/x/onecloud/pkg/util/influxdb"
@@ -94,7 +94,7 @@ func (self *SBaseCollectDriver) CollectStorageMetrics(ctx context.Context, manag
 
 func (self *SBaseCollectDriver) sendMetrics(ctx context.Context, manager api.CloudproviderDetails, resName string, resCnt int, metrics []influxdb.SMetricData) error {
 	s := auth.GetAdminSession(ctx, options.Options.Region)
-	urls, err := s.GetServiceURLs(apis.SERVICE_TYPE_INFLUXDB, options.Options.SessionEndpointType)
+	urls, err := tsdb.GetDefaultServiceSourceURLs(s, options.Options.SessionEndpointType)
 	if err != nil {
 		return errors.Wrap(err, "GetServiceURLs")
 	}
@@ -146,6 +146,7 @@ func (self *SCollectByResourceIdDriver) CollectDBInstanceMetrics(ctx context.Con
 				EndTime:      end,
 			}
 			opts.ResourceId = rds.ExternalId
+			opts.RegionExtId = rds.RegionExtId
 			opts.Engine = rds.Engine
 
 			tags := []influxdb.SKeyValue{}
@@ -195,7 +196,11 @@ func (self *SCollectByResourceIdDriver) CollectDBInstanceMetrics(ctx context.Con
 }
 
 func (self *SCollectByResourceIdDriver) CollectServerMetrics(ctx context.Context, manager api.CloudproviderDetails, provider cloudprovider.ICloudProvider, res map[string]api.ServerDetails, start, end time.Time) error {
-	ch := make(chan struct{}, options.Options.CloudResourceCollectMetricsBatchCount)
+	cnt := options.Options.CloudResourceCollectMetricsBatchCount
+	if manager.Provider == api.CLOUD_PROVIDER_ORACLE { // oracle 限速
+		cnt = options.Options.OracleCloudResourceCollectMetricsBatchCount
+	}
+	ch := make(chan struct{}, cnt)
 	defer close(ch)
 	metrics := []influxdb.SMetricData{}
 	var wg sync.WaitGroup
@@ -601,6 +606,7 @@ func (self *SCollectByResourceIdDriver) CollectLoadbalancerMetrics(ctx context.C
 				EndTime:      end,
 			}
 			opts.ResourceId = lb.ExternalId
+			opts.RegionExtId = lb.RegionExtId
 
 			tags := []influxdb.SKeyValue{}
 			for k, v := range lb.GetMetricTags() {
@@ -1094,4 +1100,71 @@ func (self *SCollectByMetricTypeDriver) CollectK8sMetrics(ctx context.Context, m
 	wg.Wait()
 
 	return self.sendMetrics(ctx, manager, "k8s", len(res), metrics)
+}
+
+func (driver *SCollectByMetricTypeDriver) CollectLoadbalancerMetrics(ctx context.Context, manager api.CloudproviderDetails, provider cloudprovider.ICloudProvider, res map[string]api.LoadbalancerDetails, start, end time.Time) error {
+	metrics := []influxdb.SMetricData{}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, _metricType := range cloudprovider.ALL_LB_METRIC_TYPES {
+		wg.Add(1)
+		go func(metricType cloudprovider.TMetricType) {
+			defer func() {
+				wg.Done()
+			}()
+			opts := &cloudprovider.MetricListOptions{
+				ResourceType: cloudprovider.METRIC_RESOURCE_TYPE_LB,
+				MetricType:   metricType,
+				StartTime:    start,
+				EndTime:      end,
+			}
+			data, err := provider.GetMetrics(opts)
+			if err != nil {
+				if errors.Cause(err) != cloudprovider.ErrNotImplemented && errors.Cause(err) != cloudprovider.ErrNotSupported {
+					log.Errorf("get slb %s(%s) %s error: %v", manager.Name, manager.Id, metricType, err)
+					return
+				}
+				return
+			}
+			for _, value := range data {
+				slb, ok := res[value.Id]
+				if !ok {
+					continue
+				}
+				tags := []influxdb.SKeyValue{}
+				for k, v := range slb.GetMetricTags() {
+					tags = append(tags, influxdb.SKeyValue{
+						Key:   k,
+						Value: v,
+					})
+				}
+				for _, v := range value.Values {
+					metric := influxdb.SMetricData{
+						Name:      value.MetricType.Name(),
+						Timestamp: v.Timestamp,
+						Tags:      []influxdb.SKeyValue{},
+						Metrics: []influxdb.SKeyValue{
+							{
+								Key:   value.MetricType.Key(),
+								Value: strconv.FormatFloat(v.Value, 'E', -1, 64),
+							},
+						},
+					}
+					for k, v := range v.Tags {
+						metric.Tags = append(metric.Tags, influxdb.SKeyValue{
+							Key:   k,
+							Value: v,
+						})
+					}
+					metric.Tags = append(metric.Tags, tags...)
+					mu.Lock()
+					metrics = append(metrics, metric)
+					mu.Unlock()
+				}
+			}
+		}(_metricType)
+	}
+	wg.Wait()
+
+	return driver.sendMetrics(ctx, manager, "slb", len(res), metrics)
 }

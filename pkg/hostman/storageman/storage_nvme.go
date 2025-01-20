@@ -1,3 +1,17 @@
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package storageman
 
 import (
@@ -24,7 +38,7 @@ func (s *SNVMEStorage) GetAvailSizeMb() int {
 	return s.sizeMB
 }
 
-func (s *SNVMEStorage) GetCapacity() int {
+func (s *SNVMEStorage) GetCapacityMb() int {
 	return s.GetAvailSizeMb()
 }
 
@@ -92,6 +106,10 @@ func (s *SNVMEStorage) DeleteSnapshots(ctx context.Context, params interface{}) 
 	return nil, errors.Errorf("unsupported operation")
 }
 
+func (s *SNVMEStorage) DeleteSnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
+	return nil, errors.Errorf("unsupported operation")
+}
+
 func (s *SNVMEStorage) IsSnapshotExist(diskId, snapshotId string) (bool, error) {
 	return false, errors.Errorf("unsupported operation")
 }
@@ -128,8 +146,8 @@ func (s *SNVMEStorage) SaveToGlance(context.Context, interface{}) (jsonutils.JSO
 	return nil, errors.Errorf("unsupported operation")
 }
 
-func (s *SNVMEStorage) CreateDiskFromSnapshot(context.Context, IDisk, *SDiskCreateByDiskinfo) error {
-	return errors.Errorf("unsupported operation")
+func (s *SNVMEStorage) CreateDiskFromSnapshot(context.Context, IDisk, *SDiskCreateByDiskinfo) (jsonutils.JSONObject, error) {
+	return nil, errors.Errorf("unsupported operation")
 }
 
 func (s *SNVMEStorage) CreateDiskFromExistingPath(context.Context, IDisk, *SDiskCreateByDiskinfo) error {
@@ -179,4 +197,8 @@ func (s *SNVMEStorage) GetComposedName() string {
 	p := strings.ReplaceAll(s.Path, ".", "_")
 	p = strings.ReplaceAll(s.Path, ":", "_")
 	return fmt.Sprintf("host_%s_%s_storage_%s", s.Manager.host.GetMasterIp(), s.StorageType(), p)
+}
+
+func (s *SNVMEStorage) CleanRecycleDiskfiles(ctx context.Context) {
+	log.Infof("SNVMEStorage CleanRecycleDiskfiles do nothing!")
 }

@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/etcd/msg"
@@ -31,30 +30,26 @@ import (
 	"github.com/coredns/coredns/request"
 	"github.com/mholt/caddy"
 	"github.com/miekg/dns"
-	v1 "k8s.io/api/core/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/kubernetes"
 
-	ylog "yunion.io/x/log"
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/utils"
 	"yunion.io/x/sqlchemy"
 	_ "yunion.io/x/sqlchemy/backends"
 
+	api "yunion.io/x/onecloud/pkg/apis/compute"
+	identity_api "yunion.io/x/onecloud/pkg/apis/identity"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/compute/models"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
-	"yunion.io/x/onecloud/pkg/util/k8s"
 )
 
 const (
 	PluginName string = "yunion"
 
 	// defaultTTL to apply to all answers
-	defaultTTL           = 10
+	defaultTTL           = 300
 	defaultDbMaxOpenConn = 32
 	defaultDbMaxIdleConn = 32
 )
@@ -83,11 +78,18 @@ type SRegionDNS struct {
 	AuthUrl       string
 	AdminProject  string
 	AdminUser     string
+	AdminDomain   string
 	AdminPassword string
 	Region        string
-	K8sSkip       bool
 
-	K8sManager            *k8s.SKubeClusterManager
+	AdminProjectDomain string
+
+	InCloudOnly bool
+
+	// K8sSkip bool
+
+	// K8sManager *k8s.SKubeClusterManager
+
 	primaryZoneLabelCount int
 }
 
@@ -117,18 +119,23 @@ func (r *SRegionDNS) initDB(c *caddy.Controller) error {
 	return nil
 }
 
-func (r *SRegionDNS) initK8s() {
-	r.initAuth()
+/*func (r *SRegionDNS) initK8s() {
 	r.K8sManager = k8s.NewKubeClusterManager(r.Region, 30*time.Second)
 	r.K8sManager.Start()
-}
+}*/
 
 func (r *SRegionDNS) getAdminSession(ctx context.Context) *mcclient.ClientSession {
 	return auth.GetAdminSession(ctx, r.Region)
 }
 
 func (r *SRegionDNS) initAuth() {
-	authInfo := auth.NewAuthInfo(r.AuthUrl, "", r.AdminUser, r.AdminPassword, r.AdminProject, "")
+	if len(r.AdminDomain) == 0 {
+		r.AdminDomain = identity_api.DEFAULT_DOMAIN_NAME
+	}
+	if len(r.AdminProjectDomain) == 0 {
+		r.AdminProjectDomain = identity_api.DEFAULT_DOMAIN_NAME
+	}
+	authInfo := auth.NewAuthInfo(r.AuthUrl, r.AdminDomain, r.AdminUser, r.AdminPassword, r.AdminProject, r.AdminProjectDomain)
 	auth.Init(authInfo, false, true, "", "")
 }
 
@@ -146,7 +153,6 @@ func (r *SRegionDNS) ServeDNS(ctx context.Context, w dns.ResponseWriter, rmsg *d
 	case dns.TypeA:
 		records, err = plugin.A(r, zone, state, nil, opt)
 	case dns.TypeAAAA:
-		// TODO fallthrough to next
 		records, err = plugin.AAAA(r, zone, state, nil, opt)
 	case dns.TypeTXT:
 		records, err = plugin.TXT(r, zone, state, opt)
@@ -167,7 +173,7 @@ func (r *SRegionDNS) ServeDNS(ctx context.Context, w dns.ResponseWriter, rmsg *d
 		}
 		fallthrough
 	default:
-		ylog.Warningf("Not processed state: %#v", state)
+		log.Warningf("Not processed state: %#v", state)
 		// Do a fake A lookup, so we can distinguish between NODATA and NXDOMAIN
 		_, err = plugin.A(r, zone, state, nil, opt)
 	}
@@ -206,7 +212,20 @@ var (
 )
 
 // Services implements the ServiceBackend interface
-func (r *SRegionDNS) Services(state request.Request, exact bool, opt plugin.Options) (services []msg.Service, err error) {
+func (r *SRegionDNS) Services(state request.Request, exact bool, opt plugin.Options) ([]msg.Service, error) {
+	var services []msg.Service
+	var err error
+
+	defer func() {
+		if len(services) == 0 {
+			log.Infof(`%s:%s %s - %d "%s %s empty response"`, state.RemoteAddr(), state.Port(), state.Proto(), state.Len(), state.Type(), state.Name())
+			return
+		}
+		for _, service := range services {
+			log.Infof(`%s:%s %s - %d "%s IN %s %s"`, state.RemoteAddr(), state.Port(), state.Proto(), state.Len(), state.Type(), state.Name(), jsonutils.Marshal(service).String())
+		}
+	}()
+
 	switch state.QType() {
 	case dns.TypeTXT:
 		t, _ := dnsutil.TrimZone(state.Name(), state.Zone)
@@ -219,11 +238,13 @@ func (r *SRegionDNS) Services(state request.Request, exact bool, opt plugin.Opti
 			return nil, nil
 		}
 		svc := msg.Service{Text: "0.0.1", TTL: 28800, Key: msg.Path(state.QName(), "coredns")}
-		return []msg.Service{svc}, nil
+		services = []msg.Service{svc}
+		return services, nil
 	case dns.TypeNS:
 		ns := r.nsAddr()
 		svc := msg.Service{Host: ns.A.String(), Key: msg.Path(state.QName(), "coredns")}
-		return []msg.Service{svc}, nil
+		services = []msg.Service{svc}
+		return services, nil
 	}
 
 	if state.QType() == dns.TypeA && isDefaultNS(state.Name(), state.Zone) {
@@ -231,11 +252,20 @@ func (r *SRegionDNS) Services(state request.Request, exact bool, opt plugin.Opti
 		// SOA records always use this hardcoded name
 		ns := r.nsAddr()
 		svc := msg.Service{Host: ns.A.String(), Key: msg.Path(state.QName(), "coredns")}
-		return []msg.Service{svc}, nil
+		services = []msg.Service{svc}
+		return services, nil
+	}
+
+	if _, ok := DNSTypeMap[state.QType()]; !ok {
+		return nil, errRefused
 	}
 
 	services, err = r.Records(state, false)
-	return
+	if err != nil {
+		// log.Errorf("Records %s fail: %s", state.Name(), err)
+		return nil, err
+	}
+	return services, nil
 }
 
 // Lookup implements the ServiceBackend interface
@@ -250,16 +280,23 @@ func (r *SRegionDNS) IsNameError(err error) bool {
 
 // Records looks up records in region mysql
 func (r *SRegionDNS) Records(state request.Request, exact bool) ([]msg.Service, error) {
-	req, e := parseRequest(state)
-	if e != nil {
-		return nil, e
+	req := parseRequest(state)
+
+	if r.InCloudOnly && !req.srcInCloud {
+		// deny external request
+		return nil, errRefused
 	}
 	return r.findRecords(req)
 }
 
 func (r *SRegionDNS) getHostIpWithName(req *recordRequest) string {
+	if req.Type() != "A" {
+		return ""
+	}
 	name := req.QueryName()
-	host, _ := models.HostManager.FetchByName(nil, name)
+	name = strings.TrimSuffix(name, ".")
+	ctx := context.Background()
+	host, _ := models.HostManager.FetchByName(ctx, nil, name)
 	if host == nil {
 		return ""
 	}
@@ -267,16 +304,27 @@ func (r *SRegionDNS) getHostIpWithName(req *recordRequest) string {
 	return ip
 }
 
-func (r *SRegionDNS) getGuestIpWithName(req *recordRequest) []string {
+func (r *SRegionDNS) getGuestIpsWithName(req *recordRequest) []string {
 	ips := []string{}
 	name := req.QueryName()
 	projectId := req.ProjectId()
 	wantOnlyExit := false
-	ips = models.GuestManager.GetIpInProjectWithName(projectId, name, wantOnlyExit)
+	if req.Type() == "A" {
+		ip4s := models.GuestManager.GetIpsInProjectWithName(projectId, name, wantOnlyExit, api.AddressTypeIPv4)
+		if len(ip4s) > 0 {
+			ips = append(ips, ip4s...)
+		}
+	}
+	if req.Type() == "AAAA" {
+		ip6s := models.GuestManager.GetIpsInProjectWithName(projectId, name, wantOnlyExit, api.AddressTypeIPv6)
+		if len(ip6s) > 0 {
+			ips = append(ips, ip6s...)
+		}
+	}
 	return ips
 }
 
-func getK8sServiceBackends(cli *kubernetes.Clientset, req *recordRequest) ([]string, error) {
+/*func getK8sServiceBackends(cli *kubernetes.Clientset, req *recordRequest) ([]string, error) {
 	queryInfo := req.GetK8sQueryInfo()
 	pods, err := getK8sServicePods(cli, queryInfo.Namespace, queryInfo.ServiceName)
 	if err != nil {
@@ -293,13 +341,13 @@ func getK8sServiceBackends(cli *kubernetes.Clientset, req *recordRequest) ([]str
 		}
 	}
 	return ips, nil
-}
+}*/
 
-func (r *SRegionDNS) getK8sClient() (*kubernetes.Clientset, error) {
+/*func (r *SRegionDNS) getK8sClient() (*kubernetes.Clientset, error) {
 	return r.K8sManager.GetK8sClient()
-}
+}*/
 
-func getK8sServicePods(cli *kubernetes.Clientset, namespace, name string) ([]v1.Pod, error) {
+/*func getK8sServicePods(cli *kubernetes.Clientset, namespace, name string) ([]v1.Pod, error) {
 	svc, err := cli.CoreV1().Services(namespace).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
@@ -313,96 +361,79 @@ func getK8sServicePods(cli *kubernetes.Clientset, namespace, name string) ([]v1.
 		return nil, err
 	}
 	return pods.Items, nil
-}
+}*/
 
 func (r *SRegionDNS) Name() string {
 	return PluginName
 }
 
-func (r *SRegionDNS) queryLocalDnsRecords(req *recordRequest) (recs []msg.Service) {
+func (r *SRegionDNS) queryLocalDnsRecords(req *recordRequest) []msg.Service {
 	var (
 		projId = req.ProjectId()
-		name   = req.Name()
-		getTtl = func(ttl int) uint32 {
+		getTtl = func(ttl int64) uint32 {
 			if ttl == 0 {
 				return defaultTTL
 			}
 			return uint32(ttl)
 		}
-		rec = models.DnsRecordManager.QueryDns(projId, name)
 	)
-
-	if rec == nil {
-		return
-	}
-	if req.state.QType() != dns.TypeCNAME && rec.IsCNAME() {
-		name = rec.GetCNAME()
-		recs = append(recs, msg.Service{
-			Host: name,
-			TTL:  getTtl(rec.Ttl),
-		})
-		// github.com/coredns/coredns/plugin.{A,AAAA} will call
-		// Services again later for these CNAME
-		return recs
+	recs := make([]msg.Service, 0)
+	records, err := models.DnsRecordManager.QueryDns(projId, req.Name(), req.Type())
+	if err != nil {
+		log.Errorf("QueryDns %s %s error: %v", req.Type(), req.Name(), err)
+		return nil
 	}
 
-	var (
-		qtype   = req.Type()
-		pref    = qtype + ":"
-		prefLen = len(pref)
-	)
-	for _, recStr := range rec.GetInfo() {
-		if !strings.HasPrefix(recStr, pref) {
-			continue
-		}
-		val := recStr[prefLen:]
-		if req.IsSRV() {
-			parts := strings.SplitN(val, ":", 4)
-			if len(parts) < 2 {
-				ylog.Errorf("Invalid SRV records: %q", val)
-				continue
+	if req.IsSRV() {
+		for i := range records {
+			rec := records[i]
+			// priority weight port host
+			parts := strings.SplitN(rec.DnsValue, " ", 4)
+			if len(parts) != 4 {
+				log.Errorf("Invalid SRV records: %q", rec.DnsValue)
+				return nil
 			}
-			host := parts[0]
-			port, err := strconv.Atoi(parts[1])
+			_priority, _weight, _port, host := parts[0], parts[1], parts[2], parts[3]
+			priority, err := strconv.Atoi(_priority)
 			if err != nil {
-				ylog.Errorf("SRV: invalid port: %s", val)
-				continue
+				log.Errorf("SRV: invalid priority: %s", _priority)
+				return nil
 			}
-			priority := 0
-			weight := 100
-			if len(parts) >= 3 {
-				var err error
-				weight, err = strconv.Atoi(parts[2])
-				if err != nil {
-					ylog.Errorf("SRV: invalid weight: %s", val)
-					continue
-				}
-				if len(parts) >= 4 {
-					priority, err = strconv.Atoi(parts[3])
-					if err != nil {
-						ylog.Errorf("SRV: invalid priority: %s", val)
-						continue
-					}
-				}
+			weight, err := strconv.Atoi(_weight)
+			if err != nil {
+				log.Errorf("SRV: invalid weight: %s", _weight)
+				return nil
+			}
+			port, err := strconv.Atoi(_port)
+			if err != nil {
+				log.Errorf("SRV: invalid port: %s", _port)
+				return nil
 			}
 			recs = append(recs, msg.Service{
 				Host:     host,
 				Port:     port,
 				Weight:   weight,
 				Priority: priority,
-				TTL:      getTtl(rec.Ttl),
+				TTL:      getTtl(rec.TTL),
 			})
-		} else {
+		}
+	} else {
+		for i := range records {
+			rec := records[i]
 			recs = append(recs, msg.Service{
-				Host: val,
-				TTL:  getTtl(rec.Ttl),
+				Host: rec.DnsValue,
+				TTL:  getTtl(rec.TTL),
 			})
 		}
 	}
-	return
+
+	return recs
 }
 
 func (r *SRegionDNS) isMyDomain(req *recordRequest) bool {
+	if r.PrimaryZone == "" {
+		return false
+	}
 	qname := req.state.Name()
 	qnameLabelCount := dns.CountLabel(qname)
 	if qnameLabelCount <= r.primaryZoneLabelCount {
@@ -417,13 +448,16 @@ func (r *SRegionDNS) isMyDomain(req *recordRequest) bool {
 
 func (r *SRegionDNS) findRecords(req *recordRequest) ([]msg.Service, error) {
 	// 1. try local dns records table
-	rrs := r.queryLocalDnsRecords(req)
-	if len(rrs) > 0 {
-		return rrs, nil
+	if !r.isMyDomain(req) {
+		rrs := r.queryLocalDnsRecords(req)
+		if len(rrs) > 0 {
+			return rrs, nil
+		}
 	}
 
 	isPlainName := req.IsPlainName()
 	isMyDomain := r.isMyDomain(req)
+
 	if isPlainName {
 		isCloudIp := req.SrcInCloud()
 		if isCloudIp {
@@ -450,33 +484,35 @@ func (r *SRegionDNS) findRecords(req *recordRequest) ([]msg.Service, error) {
 
 func (r *SRegionDNS) findInternalRecordIps(req *recordRequest) []string {
 	{
-		// 1. try host table
-		ip := r.getHostIpWithName(req)
-		if len(ip) > 0 {
-			return []string{ip}
-		}
-	}
-	{
-		// 2. try guest table
-		ips := r.getGuestIpWithName(req)
+		// 1. try guest table
+		ips := r.getGuestIpsWithName(req)
 		if len(ips) > 0 {
 			return ips
 		}
 	}
 
-	if !r.K8sSkip {
+	{
+		// 2. try host table
+		ip := r.getHostIpWithName(req)
+		if len(ip) > 0 {
+			return []string{ip}
+		}
+	}
+
+	/*if !r.K8sSkip {
 		k8sCli, err := r.getK8sClient()
 		if err != nil {
-			ylog.Warningf("Get k8s client error: %v, skip it.", err)
+			log.Warningf("Get k8s client error: %v, skip it.", err)
 			return nil
 		}
 		// 3. try k8s service backends
 		ips, err := getK8sServiceBackends(k8sCli, req)
 		if err != nil {
-			ylog.Errorf("Get k8s service backends error: %v", err)
+			log.Errorf("Get k8s service backends error: %v", err)
 		}
 		return ips
-	}
+	}*/
+
 	return nil
 }
 

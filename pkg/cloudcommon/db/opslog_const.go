@@ -74,6 +74,8 @@ const (
 	ACT_MIGRATE      = "migrate"
 	ACT_MIGRATE_FAIL = "migrate_fail"
 
+	ACT_RESET_CPU_NUMA_PIN = "reset_cpu_numa_pin"
+
 	ACT_VM_CONVERT      = "vm_convert"
 	ACT_VM_CONVERTING   = "vm_converting"
 	ACT_VM_CONVERT_FAIL = "vm_convert_fail"
@@ -162,6 +164,9 @@ const (
 
 	ACT_SET_USER_PASSWORD      = "set_user_password"
 	ACT_SET_USER_PASSWORD_FAIL = "set_user_password_fail"
+
+	ACT_SYNC_OS_INFO      = "sync_os_info"
+	ACT_SYNC_OS_INFO_FAIL = "sync_os_info_fail"
 
 	ACT_VM_IO_THROTTLE      = "io_throttle"
 	ACT_VM_IO_THROTTLE_FAIL = "io_throttle_fail"
@@ -317,6 +322,23 @@ const (
 	ACT_ENCRYPT_FAIL  = "encrypt_fail"
 	ACT_ENCRYPT_DONE  = "encrypted"
 
-	ACT_BIND   = "bind"
-	ACT_UNBIND = "unbind"
+	ACT_SYNC_TRAFFIC_LIMIT      = "sync_traffic_limit"
+	ACT_SYNC_TRAFFIC_LIMIT_FAIL = "sync_traffic_limit_fail"
+	ACT_BIND                    = "bind"
+	ACT_UNBIND                  = "unbind"
+
+	ACT_START_RESCUE        = "start_rescue"
+	ACT_STOP_RESCUE         = "stop_rescue"
+	ACT_START_RESCUE_FAILED = "start_rescue_failed"
+	ACT_STOP_RESCUE_FAILED  = "stop_rescue_failed"
+
+	ACT_RE_BILLING = "re_billing"
+
+	ACT_CLONE        = "clone"
+	ACT_CLONE_FAILED = "clone_failed"
+
+	ACT_REBUILD        = "rebuild"
+	ACT_REBUILD_FAILED = "rebuild_failed"
+
+	ACT_SET_COMMIT_BOUND = "set_commit_bound"
 )

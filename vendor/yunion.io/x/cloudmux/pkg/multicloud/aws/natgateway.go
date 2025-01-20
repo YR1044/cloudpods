@@ -93,6 +93,13 @@ func (self *SNatGateway) GetStatus() string {
 	}
 }
 
+func (self *SNatGateway) GetNetworkType() string {
+	if self.ConnectivityType == "public" {
+		return api.NAT_NETWORK_TYPE_INTERNET
+	}
+	return api.NAT_NETWORK_TYPE_INTRANET
+}
+
 func (self *SNatGateway) GetNatSpec() string {
 	return ""
 }
@@ -126,11 +133,11 @@ func (self *SNatGateway) GetINatSTable() ([]cloudprovider.ICloudNatSEntry, error
 	return []cloudprovider.ICloudNatSEntry{}, nil
 }
 
-func (self *SNatGateway) GetINatDEntryByID(id string) (cloudprovider.ICloudNatDEntry, error) {
+func (self *SNatGateway) GetINatDEntryById(id string) (cloudprovider.ICloudNatDEntry, error) {
 	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
 }
 
-func (self *SNatGateway) GetINatSEntryByID(id string) (cloudprovider.ICloudNatSEntry, error) {
+func (self *SNatGateway) GetINatSEntryById(id string) (cloudprovider.ICloudNatSEntry, error) {
 	return nil, errors.Wrapf(cloudprovider.ErrNotFound, id)
 }
 
@@ -241,4 +248,94 @@ func (self *SVpc) GetINatGateways() ([]cloudprovider.ICloudNatGateway, error) {
 		ret = append(ret, &nats[i])
 	}
 	return ret, nil
+}
+
+func (self *SRegion) DescribeTags(resType, instanceId string) (map[string]string, error) {
+	params := map[string]string{
+		"Filter.1.Name":    "resource-id",
+		"Filter.1.Value.1": instanceId,
+		"Filter.2.Name":    "resource-type",
+		"Filter.2.Value.1": resType,
+	}
+	ret := struct {
+		NextToken string
+		AwsTags
+	}{}
+	err := self.ec2Request("DescribeTags", params, &ret)
+	if err != nil {
+		return nil, err
+	}
+	return ret.GetTags()
+}
+
+func (self *SRegion) DeleteTags(instanceId string, tags map[string]string) error {
+	params := map[string]string{
+		"ResourceId.1": instanceId,
+	}
+	idx := 1
+	for k, v := range tags {
+		params[fmt.Sprintf("Tag.%d.Key", idx)] = k
+		params[fmt.Sprintf("Tag.%d.Value", idx)] = v
+		idx++
+	}
+	ret := struct {
+	}{}
+	return self.ec2Request("DeleteTags", params, &ret)
+}
+
+func (self *SRegion) CreateTags(instanceId string, tags map[string]string) error {
+	params := map[string]string{
+		"ResourceId.1": instanceId,
+	}
+	idx := 1
+	for k, v := range tags {
+		params[fmt.Sprintf("Tag.%d.Key", idx)] = k
+		params[fmt.Sprintf("Tag.%d.Value", idx)] = v
+		idx++
+	}
+	ret := struct {
+	}{}
+	return self.ec2Request("CreateTags", params, &ret)
+}
+
+func (self *SRegion) setTags(resType, resId string, tags map[string]string, replace bool) error {
+	oldTags, err := self.DescribeTags(resType, resId)
+	if err != nil {
+		return errors.Wrapf(err, "DescribeTags")
+	}
+	added, removed := map[string]string{}, map[string]string{}
+	for k, v := range tags {
+		oldValue, ok := oldTags[k]
+		if !ok {
+			added[k] = v
+		} else if oldValue != v {
+			removed[k] = oldValue
+			added[k] = v
+		}
+	}
+	if replace {
+		for k, v := range oldTags {
+			newValue, ok := tags[k]
+			if !ok {
+				removed[k] = v
+			} else if v != newValue {
+				added[k] = newValue
+				removed[k] = v
+			}
+		}
+	}
+	if len(removed) > 0 {
+		err = self.DeleteTags(resId, removed)
+		if err != nil {
+			return errors.Wrapf(err, "DeleteTags %s", removed)
+		}
+	}
+	if len(added) > 0 {
+		return self.CreateTags(resId, added)
+	}
+	return nil
+}
+
+func (self *SNatGateway) SetTags(tags map[string]string, replace bool) error {
+	return self.region.setTags("natgateway", self.NatGatewayId, tags, replace)
 }

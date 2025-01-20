@@ -37,7 +37,7 @@ func init() {
 }
 
 func (self *NatGatewayRemoteUpdateTask) taskFail(ctx context.Context, nat *models.SNatGateway, err error) {
-	nat.SetStatus(self.UserCred, apis.STATUS_UPDATE_TAGS_FAILED, err.Error())
+	nat.SetStatus(ctx, self.UserCred, apis.STATUS_UPDATE_TAGS_FAILED, err.Error())
 	self.SetStageFailed(ctx, jsonutils.NewString(err.Error()))
 }
 
@@ -79,7 +79,7 @@ func (self *NatGatewayRemoteUpdateTask) OnInit(ctx context.Context, obj db.IStan
 			return
 		}
 		logclient.AddActionLogWithStartable(self, nat, logclient.ACT_UPDATE_TAGS, err, self.GetUserCred(), false)
-		self.SetStageFailed(ctx, jsonutils.NewString(err.Error()))
+		self.taskFail(ctx, nat, err)
 		return
 	}
 	logclient.AddActionLogWithStartable(self, nat, logclient.ACT_UPDATE_TAGS, tagsUpdateInfo, self.GetUserCred(), true)

@@ -23,6 +23,7 @@ import (
 	"yunion.io/x/pkg/utils"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
+	"yunion.io/x/onecloud/pkg/appsrv"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
 	"yunion.io/x/onecloud/pkg/compute/models"
@@ -30,16 +31,21 @@ import (
 	"yunion.io/x/onecloud/pkg/util/logclient"
 )
 
+var (
+	SkuSyncWorkerManager *appsrv.SWorkerManager
+)
+
 type CloudAccountSyncSkusTask struct {
 	taskman.STask
 }
 
 func init() {
-	taskman.RegisterTask(CloudAccountSyncSkusTask{})
+	SkuSyncWorkerManager = appsrv.NewWorkerManager("SkuSyncWorkerManager", 8, 1024, false)
+	taskman.RegisterTaskAndWorker(CloudAccountSyncSkusTask{}, SkuSyncWorkerManager)
 }
 
 func (self *CloudAccountSyncSkusTask) taskFailed(ctx context.Context, account *models.SCloudaccount, err error) {
-	account.SetStatus(self.UserCred, api.CLOUD_PROVIDER_SYNC_STATUS_ERROR, err.Error())
+	account.SetStatus(ctx, self.UserCred, api.CLOUD_PROVIDER_SYNC_STATUS_ERROR, err.Error())
 	db.OpsLog.LogEvent(account, db.ACT_SYNC_CLOUD_SKUS, err.Error(), self.GetUserCred())
 	logclient.AddActionLogWithStartable(self, account, logclient.ACT_CLOUD_SYNC, err, self.UserCred, false)
 	self.SetStageFailed(ctx, jsonutils.NewString(err.Error()))

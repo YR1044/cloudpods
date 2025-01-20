@@ -131,7 +131,7 @@ func (instance *SInstance) GetName() string {
 }
 
 func (instance *SInstance) GetHostname() string {
-	return instance.Name
+	return ""
 }
 
 func (instance *SInstance) GetGlobalId() string {
@@ -354,10 +354,10 @@ func (instance *SInstance) GetVNCInfo(input *cloudprovider.ServerVncInput) (*clo
 	return ret, nil
 }
 
-func (instance *SInstance) UpdateVM(ctx context.Context, name string) error {
+func (instance *SInstance) UpdateVM(ctx context.Context, input cloudprovider.SInstanceUpdateOptions) error {
 	params := map[string]interface{}{
 		"updateVmInstance": map[string]string{
-			"name": name,
+			"name": input.NAME,
 		},
 	}
 	return instance.host.zone.region.UpdateVM(instance.UUID, jsonutils.Marshal(params))
@@ -368,24 +368,12 @@ func (region *SRegion) UpdateVM(instanceId string, params jsonutils.JSONObject) 
 	return err
 }
 
-func (instance *SInstance) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
-	if instance.Name != name || instance.Description != description {
-		params := map[string]interface{}{
-			"updateVmInstance": map[string]string{
-				"name":        name,
-				"description": description,
-			},
-		}
-		err := instance.host.zone.region.UpdateVM(instance.UUID, jsonutils.Marshal(params))
-		if err != nil {
-			return err
-		}
-	}
-	if len(password) > 0 {
+func (instance *SInstance) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
+	if len(opts.Password) > 0 {
 		params := map[string]interface{}{
 			"changeVmPassword": map[string]string{
-				"account":  username,
-				"password": password,
+				"account":  opts.Username,
+				"password": opts.Password,
 			},
 		}
 		err := instance.host.zone.region.UpdateVM(instance.UUID, jsonutils.Marshal(params))
@@ -393,10 +381,10 @@ func (instance *SInstance) DeployVM(ctx context.Context, name string, username s
 			return err
 		}
 	}
-	if len(publicKey) > 0 {
+	if len(opts.PublicKey) > 0 {
 		params := map[string]interface{}{
 			"setVmSshKey": map[string]string{
-				"SshKey": publicKey,
+				"SshKey": opts.PublicKey,
 			},
 		}
 		err := instance.host.zone.region.UpdateVM(instance.UUID, jsonutils.Marshal(params))
@@ -404,7 +392,7 @@ func (instance *SInstance) DeployVM(ctx context.Context, name string, username s
 			return err
 		}
 	}
-	if deleteKeypair {
+	if opts.DeleteKeypair {
 		err := instance.host.zone.region.client.delete("vm-instances", fmt.Sprintf("%s/ssh-keys", instance.UUID), "")
 		if err != nil {
 			return err
@@ -550,10 +538,6 @@ func (instance *SInstance) GetIEIP() (cloudprovider.ICloudEIP, error) {
 		return &eips[0], nil
 	}
 	return nil, cloudprovider.ErrDuplicateId
-}
-
-func (instance *SInstance) AssignSecurityGroup(secgroupId string) error {
-	return instance.host.zone.region.AssignSecurityGroup(instance.UUID, secgroupId)
 }
 
 func (instance *SInstance) SetSecurityGroups(secgroupIds []string) error {

@@ -17,7 +17,6 @@ package apihelper
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -38,10 +37,6 @@ func (o GetDBModelsOptions) IncludeOtherCloudEnv() bool {
 
 func (o GetDBModelsOptions) GetModelSet() IModelSet {
 	return o.modelOptions.ModelSet
-}
-
-func (o GetDBModelsOptions) GetMinUpdatedAt() time.Time {
-	return o.modelOptions.MinUpdatedAt
 }
 
 func (o GetDBModelsOptions) IncludeDetails() bool {
@@ -78,10 +73,11 @@ func GetDBModels(opts *GetDBModelsOptions) error {
 	}
 	if !opts.InCludeOtherCloudEnv() {
 		listOptions.Filter = append(listOptions.Filter,
-			"manager_id.isnullorempty()",  // len(manager_id) > 0 is for pubcloud objects
-			"external_id.isnullorempty()", // len(external_id) > 0 is for pubcloud objects
+			"manager_id.isnullorempty()", // len(manager_id) > 0 is for pubcloud objects
+			// "external_id.isnullorempty()", // len(external_id) > 0 is for pubcloud objects
 		)
 		listOptions.CloudEnv = "onpremise"
+		// listOptions.Provider = []string{"OneCloud"}
 	}
 	if inter, ok := opts.GetModelSet().(IModelSetFilter); ok {
 		filter := inter.ModelFilter()

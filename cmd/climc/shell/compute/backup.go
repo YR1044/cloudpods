@@ -26,6 +26,7 @@ func init() {
 	bsCmd.List(&compute.BackupStorageListOptions{})
 	bsCmd.Show(&compute.BackupStorageIdOptions{})
 	bsCmd.Create(&compute.BackupStorageCreateOptions{})
+	bsCmd.Update(&compute.BackupStorageUpdateOptions{})
 	bsCmd.Delete(&compute.BackupStorageIdOptions{})
 	bsCmd.Perform("public", &options.BasePublicOptions{})
 	bsCmd.Perform("private", &options.BaseIdOptions{})
@@ -49,4 +50,10 @@ func init() {
 	ibCmd.Create(&compute.InstanceBackupManagerCreateFromPackageOptions{})
 	ibCmd.Perform("syncstatus", &compute.DiskBackupSyncstatusOptions{})
 	ibCmd.Perform("set-class-metadata", &options.ResourceMetadataOptions{})
+
+	hbsCmd := shell.NewJointCmd(&modules.HostBackupstorages)
+	hbsCmd.List(&compute.HostBackupStorageListOptions{})
+	hbsCmd.Show(&compute.HostBackupStorageJoinOptions{})
+	hbsCmd.Attach(&compute.HostBackupStorageJoinOptions{})
+	hbsCmd.Detach(&compute.HostBackupStorageJoinOptions{})
 }

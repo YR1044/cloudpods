@@ -17,7 +17,7 @@ package misc
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"time"
 
@@ -30,6 +30,7 @@ import (
 
 	"yunion.io/x/onecloud/pkg/apis"
 	api "yunion.io/x/onecloud/pkg/apis/identity"
+	"yunion.io/x/onecloud/pkg/cloudcommon/tsdb"
 	"yunion.io/x/onecloud/pkg/cloudmon/options"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/mcclient/auth"
@@ -73,7 +74,12 @@ func CollectServiceMetrics(ctx context.Context, userCred mcclient.TokenCredentia
 		}
 		metrics := []influxdb.SMetricData{}
 		for _, ep := range endpoints {
-			if utils.IsInStringArray(ep.ServiceType, apis.NO_RESOURCE_SERVICES) {
+			if utils.IsInStringArray(ep.ServiceType, apis.NO_RESOURCE_SERVICES) || utils.IsInStringArray(ep.ServiceType, []string{
+				apis.SERVICE_TYPE_IMAGE,
+				apis.SERVICE_TYPE_MONITOR,
+				apis.SERVICE_TYPE_VICTORIA_METRICS,
+				"k8s",
+			}) {
 				continue
 			}
 			url := httputils.JoinPath(ep.Url, "version")
@@ -89,7 +95,7 @@ func CollectServiceMetrics(ctx context.Context, userCred mcclient.TokenCredentia
 				continue
 			}
 			defer resp.Body.Close()
-			version, _ := ioutil.ReadAll(resp.Body)
+			version, _ := io.ReadAll(resp.Body)
 			if len(version) == 0 {
 				continue
 			}
@@ -100,7 +106,7 @@ func CollectServiceMetrics(ctx context.Context, userCred mcclient.TokenCredentia
 			}
 			metrics = append(metrics, part...)
 		}
-		urls, err := s.GetServiceURLs(apis.SERVICE_TYPE_INFLUXDB, options.Options.SessionEndpointType)
+		urls, err := tsdb.GetDefaultServiceSourceURLs(s, options.Options.SessionEndpointType)
 		if err != nil {
 			return errors.Wrap(err, "GetServiceURLs")
 		}

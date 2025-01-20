@@ -18,6 +18,7 @@ import (
 	"yunion.io/x/pkg/util/rbacscope"
 
 	api "yunion.io/x/onecloud/pkg/apis/image"
+	"yunion.io/x/onecloud/pkg/cloudcommon/consts"
 	common_policy "yunion.io/x/onecloud/pkg/cloudcommon/policy"
 	"yunion.io/x/onecloud/pkg/util/rbacutils"
 )
@@ -46,31 +47,6 @@ var (
 					Action:   PolicyActionList,
 					Result:   rbacutils.Allow,
 				},
-				/*{
-					Service:  api.SERVICE_TYPE,
-					Resource: "images",
-					Action:   PolicyActionList,
-					Result:   rbacutils.Allow,
-				},
-				{
-					Service:  api.SERVICE_TYPE,
-					Resource: "images",
-					Action:   PolicyActionGet,
-					Result:   rbacutils.Allow,
-				},
-				{
-					Service:  api.SERVICE_TYPE,
-					Resource: "guestimages",
-					Action:   PolicyActionList,
-					Result:   rbacutils.Allow,
-				},
-				{
-					Service:  api.SERVICE_TYPE,
-					Resource: "guestimages",
-					Action:   PolicyActionGet,
-					Result:   rbacutils.Allow,
-				},
-				*/
 			},
 		},
 		{
@@ -90,6 +66,8 @@ var (
 	}
 )
 
-func init() {
-	common_policy.AppendDefaultPolicies(predefinedDefaultPolicies)
+func Init() {
+	if consts.IsEnableDefaultPolicy() {
+		common_policy.AppendDefaultPolicies(predefinedDefaultPolicies)
+	}
 }

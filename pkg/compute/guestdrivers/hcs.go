@@ -78,12 +78,12 @@ func (self *SHCSGuestDriver) GetMinimalSysDiskSizeGb() int {
 }
 
 func (self *SHCSGuestDriver) GetStorageTypes() []string {
-	storages, _ := models.StorageManager.GetStorageTypesByHostType(api.HYPERVISOR_HOSTTYPE[self.GetHypervisor()])
+	storages, _ := models.StorageManager.GetStorageTypesByProvider(self.GetProvider())
 	return storages
 }
 
 func (self *SHCSGuestDriver) ChooseHostStorage(host *models.SHost, guest *models.SGuest, diskConfig *api.DiskConfig, storageIds []string) (*models.SStorage, error) {
-	return self.chooseHostStorage(self, host, diskConfig.Backend, storageIds), nil
+	return chooseHostStorage(self, host, diskConfig.Backend, storageIds), nil
 }
 
 func (self *SHCSGuestDriver) GetDetachDiskStatus() ([]string, error) {

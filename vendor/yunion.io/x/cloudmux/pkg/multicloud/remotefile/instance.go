@@ -34,6 +34,7 @@ type SInstance struct {
 	Hostname         string
 	SecurityGroupIds []string
 	VcpuCount        int
+	CpuSockets       int
 	VmemSizeMb       int
 	BootOrder        string
 	Vga              string
@@ -54,10 +55,6 @@ type SInstance struct {
 
 func (self *SInstance) GetSecurityGroupIds() ([]string, error) {
 	return self.SecurityGroupIds, nil
-}
-
-func (self *SInstance) AssignSecurityGroup(secgroupId string) error {
-	return cloudprovider.ErrNotSupported
 }
 
 func (self *SInstance) SetSecurityGroups(secgroupIds []string) error {
@@ -100,7 +97,7 @@ func (self *SInstance) DeleteVM(ctx context.Context) error {
 	return cloudprovider.ErrNotSupported
 }
 
-func (self *SInstance) UpdateVM(ctx context.Context, name string) error {
+func (self *SInstance) UpdateVM(ctx context.Context, input cloudprovider.SInstanceUpdateOptions) error {
 	return cloudprovider.ErrNotSupported
 }
 
@@ -112,7 +109,7 @@ func (self *SInstance) RebuildRoot(ctx context.Context, config *cloudprovider.SM
 	return "", cloudprovider.ErrNotSupported
 }
 
-func (self *SInstance) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
+func (self *SInstance) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
 	return cloudprovider.ErrNotSupported
 }
 
@@ -170,6 +167,10 @@ func (self *SInstance) SaveImage(opts *cloudprovider.SaveImageOptions) (cloudpro
 
 func (self *SInstance) AllocatePublicIpAddress() (string, error) {
 	return "", cloudprovider.ErrNotSupported
+}
+
+func (self *SInstance) GetCpuSockets() int {
+	return self.CpuSockets
 }
 
 func (self *SInstance) GetVcpuCount() int {
@@ -282,4 +283,8 @@ func (self *SInstance) GetPowerStates() string {
 		return api.VM_POWER_STATES_ON
 	}
 	return api.VM_POWER_STATES_OFF
+}
+
+func (self *SInstance) GetIsolateDeviceIds() ([]string, error) {
+	return nil, cloudprovider.ErrNotSupported
 }

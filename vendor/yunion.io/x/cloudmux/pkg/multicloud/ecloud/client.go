@@ -104,7 +104,7 @@ func (ec *SEcloudClient) fetchRegions() {
 }
 
 func (ec *SEcloudClient) TryConnect() error {
-	iregions := ec.GetIRegions()
+	iregions, _ := ec.GetIRegions()
 	if len(iregions) == 0 {
 		return fmt.Errorf("no invalid region for ecloud")
 	}
@@ -115,15 +115,18 @@ func (ec *SEcloudClient) TryConnect() error {
 	return nil
 }
 
-func (ec *SEcloudClient) GetIRegions() []cloudprovider.ICloudRegion {
+func (ec *SEcloudClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	if ec.iregions == nil {
 		ec.fetchRegions()
 	}
-	return ec.iregions
+	return ec.iregions, nil
 }
 
 func (ec *SEcloudClient) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
-	iregions := ec.GetIRegions()
+	iregions, err := ec.GetIRegions()
+	if err != nil {
+		return nil, err
+	}
 	for i := range iregions {
 		if iregions[i].GetGlobalId() == id {
 			return iregions[i], nil
@@ -133,7 +136,10 @@ func (ec *SEcloudClient) GetIRegionById(id string) (cloudprovider.ICloudRegion, 
 }
 
 func (ec *SEcloudClient) GetRegionById(id string) (*SRegion, error) {
-	iregions := ec.GetIRegions()
+	iregions, err := ec.GetIRegions()
+	if err != nil {
+		return nil, err
+	}
 	for i := range iregions {
 		if iregions[i].GetId() == id {
 			return iregions[i].(*SRegion), nil
@@ -153,6 +159,7 @@ func (ec *SEcloudClient) GetCapabilities() []string {
 
 func (ec *SEcloudClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 	subAccount := cloudprovider.SSubAccount{}
+	subAccount.Id = ec.GetAccountId()
 	subAccount.Name = ec.cpcfg.Name
 	subAccount.Account = ec.signer.GetAccessKeyId()
 	subAccount.HealthStatus = api.CLOUD_PROVIDER_HEALTH_NORMAL

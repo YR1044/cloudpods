@@ -33,13 +33,14 @@ type KeypairCreateInput struct {
 	Fingerprint string
 
 	// 秘钥类型
-	// enum: RSA
+	// enum: ["RSA"]
 	// default: RSA
 	Scheme string `json:"scheme"`
 }
 
 type KeypairDetails struct {
 	apis.UserResourceDetails
+	apis.SharableResourceBaseInfo
 	SKeypair
 
 	// 私钥长度

@@ -33,6 +33,8 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/quotas"
+	"yunion.io/x/onecloud/pkg/cloudcommon/db/taskman"
+	"yunion.io/x/onecloud/pkg/cloudcommon/notifyclient"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/keystone/options"
 	"yunion.io/x/onecloud/pkg/mcclient"
@@ -58,6 +60,7 @@ func init() {
 		),
 	}
 	ProjectManager.SetVirtualObject(ProjectManager)
+	notifyclient.AddNotifyDBHookResources(ProjectManager.KeywordPlural(), ProjectManager.AliasPlural())
 }
 
 /*
@@ -155,6 +158,10 @@ func (project *SProject) resetAdminUser(ctx context.Context, userCred mcclient.T
 	return nil
 }
 
+func (manager *SProjectManager) NewQuery(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, useRawQuery bool) *sqlchemy.SQuery {
+	return manager.Query()
+}
+
 func (manager *SProjectManager) Query(fields ...string) *sqlchemy.SQuery {
 	return manager.SIdentityBaseResourceManager.Query(fields...).IsFalse("is_domain")
 }
@@ -217,6 +224,7 @@ func (manager *SProjectManager) FetchProject(projectId, projectName string, doma
 	return nil, fmt.Errorf("no project Id or name provided")
 }
 
+// +onecloud:model-api-gen
 type SProjectExtended struct {
 	SProject
 
@@ -256,7 +264,7 @@ func (manager *SProjectManager) ListItemFilter(
 	if !query.PolicyProjectTags.IsEmpty() {
 		policyFilters := tagutils.STagFilters{}
 		policyFilters.AddFilters(query.PolicyProjectTags)
-		q = db.ObjectIdQueryWithTagFilters(q, "id", "project", policyFilters)
+		q = db.ObjectIdQueryWithTagFilters(ctx, q, "id", "project", policyFilters)
 	}
 
 	userStr := query.UserId
@@ -281,6 +289,17 @@ func (manager *SProjectManager) ListItemFilter(
 		} else {
 			q = q.In("id", subq.SubQuery())
 		}
+	}
+
+	if len(query.AdminId) > 0 {
+		sq := UserManager.Query("id")
+		sq = sq.Filter(
+			sqlchemy.OR(
+				sqlchemy.In(sq.Field("id"), query.AdminId),
+				sqlchemy.In(sq.Field("name"), query.AdminId),
+			),
+		)
+		q = q.In("admin_id", sq.SubQuery())
 	}
 
 	groupStr := query.GroupId
@@ -308,7 +327,7 @@ func (manager *SProjectManager) ListItemFilter(
 	}
 
 	if len(query.IdpId) > 0 {
-		idpObj, err := IdentityProviderManager.FetchByIdOrName(userCred, query.IdpId)
+		idpObj, err := IdentityProviderManager.FetchByIdOrName(ctx, userCred, query.IdpId)
 		if err != nil {
 			if errors.Cause(err) == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(IdentityProviderManager.Keyword(), query.IdpId)
@@ -347,6 +366,14 @@ func (manager *SProjectManager) QueryDistinctExtraField(q *sqlchemy.SQuery, fiel
 		return q, nil
 	}
 
+	if field == "admin" {
+		userQuery := UserManager.Query("name", "id").Distinct().SubQuery()
+		q.AppendField(userQuery.Field("name", field))
+		q = q.Join(userQuery, sqlchemy.Equals(q.Field("admin_id"), userQuery.Field("id")))
+		q.GroupBy(userQuery.Field("name"))
+		return q, nil
+	}
+
 	return q, httperrors.ErrNotFound
 }
 
@@ -370,9 +397,9 @@ func (proj *SProject) ValidateDeleteCondition(ctx context.Context, info *api.Pro
 	if proj.IsAdminProject() {
 		return httperrors.NewForbiddenError("cannot delete system project")
 	}
-	if len(info.ExtResource) > 0 {
+	/*if len(info.ExtResource) > 0 {
 		return httperrors.NewNotEmptyError("project contains external resources")
-	}
+	}*/
 	if info.UserCount > 0 {
 		return httperrors.NewNotEmptyError("project contains user")
 	}
@@ -380,6 +407,18 @@ func (proj *SProject) ValidateDeleteCondition(ctx context.Context, info *api.Pro
 		return httperrors.NewNotEmptyError("project contains group")
 	}
 	return proj.SIdentityBaseResource.ValidateDeleteCondition(ctx, nil)
+}
+
+func (proj *SProject) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
+	err := proj.SIdentityBaseResource.Delete(ctx, userCred)
+	if err != nil {
+		return errors.Wrap(err, "project delete")
+	}
+	notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
+		Obj:    proj,
+		Action: notifyclient.ActionDelete,
+	})
+	return nil
 }
 
 func (proj *SProject) IsAdminProject() bool {
@@ -551,6 +590,10 @@ func (project *SProject) PostCreate(
 	if err != nil {
 		log.Errorf("CancelPendingUsage fail %s", err)
 	}
+	notifyclient.EventNotify(ctx, userCred, notifyclient.SEventNotifyParam{
+		Obj:    project,
+		Action: notifyclient.ActionCreate,
+	})
 }
 
 func threeMemberSystemValidatePolicies(userCred mcclient.TokenCredential, projectId string, assignPolicies rbacutils.TPolicyGroup) error {
@@ -607,19 +650,15 @@ func validateAssignPolicies(userCred mcclient.TokenCredential, projectId string,
 }
 
 func validateJoinProject(userCred mcclient.TokenCredential, project *SProject, roleIds []string) error {
-	_, assignPolicies, err := RolePolicyManager.GetMatchPolicyGroup2(false, roleIds, project.Id, "", time.Time{}, false)
+	return ValidateJoinProjectRoles(userCred, project.Id, roleIds)
+}
+
+func ValidateJoinProjectRoles(userCred mcclient.TokenCredential, projectId string, roleIds []string) error {
+	_, assignPolicies, err := RolePolicyManager.GetMatchPolicyGroup2(false, roleIds, projectId, "", time.Time{}, false)
 	if err != nil {
 		return errors.Wrap(err, "RolePolicyManager.GetMatchPolicyGroup2")
 	}
-	return validateAssignPolicies(userCred, project.Id, assignPolicies)
-}
-
-func (project *SProject) AllowPerformJoin(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	input api.SProjectAddUserGroupInput,
-) bool {
-	return db.IsAdminAllowPerform(ctx, userCred, project, "join")
+	return validateAssignPolicies(userCred, projectId, assignPolicies)
 }
 
 // 将用户或组加入项目
@@ -637,7 +676,7 @@ func (project *SProject) PerformJoin(
 	roleIds := make([]string, 0)
 	roles := make([]*SRole, 0)
 	for i := range input.Roles {
-		obj, err := RoleManager.FetchByIdOrName(userCred, input.Roles[i])
+		obj, err := RoleManager.FetchByIdOrName(ctx, userCred, input.Roles[i])
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(RoleManager.Keyword(), input.Roles[i])
@@ -657,7 +696,7 @@ func (project *SProject) PerformJoin(
 
 	users := make([]*SUser, 0)
 	for i := range input.Users {
-		obj, err := UserManager.FetchByIdOrName(userCred, input.Users[i])
+		obj, err := UserManager.FetchByIdOrName(ctx, userCred, input.Users[i])
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(UserManager.Keyword(), input.Users[i])
@@ -669,7 +708,7 @@ func (project *SProject) PerformJoin(
 	}
 	groups := make([]*SGroup, 0)
 	for i := range input.Groups {
-		obj, err := GroupManager.FetchByIdOrName(userCred, input.Groups[i])
+		obj, err := GroupManager.FetchByIdOrName(ctx, userCred, input.Groups[i])
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(GroupManager.Keyword(), input.Groups[i])
@@ -697,15 +736,13 @@ func (project *SProject) PerformJoin(
 		}
 	}
 
-	return nil, nil
-}
+	if input.EnableAllUsers {
+		for i := range users {
+			db.EnabledPerformEnable(users[i], ctx, userCred, true)
+		}
+	}
 
-func (project *SProject) AllowPerformLeave(ctx context.Context,
-	userCred mcclient.TokenCredential,
-	query jsonutils.JSONObject,
-	data jsonutils.JSONObject,
-) bool {
-	return db.IsAdminAllowPerform(ctx, userCred, project, "leave")
+	return nil, nil
 }
 
 // 将用户或组移出项目
@@ -721,7 +758,7 @@ func (project *SProject) PerformLeave(
 	}
 
 	for i := range input.UserRoles {
-		userObj, err := UserManager.FetchByIdOrName(userCred, input.UserRoles[i].User)
+		userObj, err := UserManager.FetchByIdOrName(ctx, userCred, input.UserRoles[i].User)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(UserManager.Keyword(), input.UserRoles[i].User)
@@ -729,7 +766,7 @@ func (project *SProject) PerformLeave(
 				return nil, httperrors.NewGeneralError(err)
 			}
 		}
-		roleObj, err := RoleManager.FetchByIdOrName(userCred, input.UserRoles[i].Role)
+		roleObj, err := RoleManager.FetchByIdOrName(ctx, userCred, input.UserRoles[i].Role)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(RoleManager.Keyword(), input.UserRoles[i].Role)
@@ -743,7 +780,7 @@ func (project *SProject) PerformLeave(
 		}
 	}
 	for i := range input.GroupRoles {
-		groupObj, err := GroupManager.FetchByIdOrName(userCred, input.GroupRoles[i].Group)
+		groupObj, err := GroupManager.FetchByIdOrName(ctx, userCred, input.GroupRoles[i].Group)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(GroupManager.Keyword(), input.GroupRoles[i].Group)
@@ -751,7 +788,7 @@ func (project *SProject) PerformLeave(
 				return nil, httperrors.NewGeneralError(err)
 			}
 		}
-		roleObj, err := RoleManager.FetchByIdOrName(userCred, input.GroupRoles[i].Role)
+		roleObj, err := RoleManager.FetchByIdOrName(ctx, userCred, input.GroupRoles[i].Role)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(RoleManager.Keyword(), input.GroupRoles[i].Role)
@@ -815,11 +852,16 @@ func (project *SProject) PerformSetAdmin(
 	query jsonutils.JSONObject,
 	input api.SProjectSetAdminInput,
 ) (jsonutils.JSONObject, error) {
+	// unset admin
+	if len(input.UserId) == 0 {
+		return nil, project.setAdminId(ctx, userCred, input.UserId)
+	}
+
 	var user *SUser
 	var role *SRole
 
 	{
-		obj, err := UserManager.FetchByIdOrName(userCred, input.UserId)
+		obj, err := UserManager.FetchByIdOrName(ctx, userCred, input.UserId)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(UserManager.Keyword(), input.UserId)
@@ -831,7 +873,7 @@ func (project *SProject) PerformSetAdmin(
 	}
 
 	{
-		obj, err := RoleManager.FetchByIdOrName(userCred, options.Options.ProjectAdminRole)
+		obj, err := RoleManager.FetchByIdOrName(ctx, userCred, options.Options.ProjectAdminRole)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, httperrors.NewResourceNotFoundError2(RoleManager.Keyword(), options.Options.ProjectAdminRole)
@@ -905,4 +947,61 @@ func (project *SProject) matchOrganizationNodes() (*api.SProjectOrganization, er
 		return nil, errors.Wrap(err, "getProjectOrganization")
 	}
 	return projOrg, nil
+}
+
+func (manager *SProjectManager) FilterByOwner(ctx context.Context, q *sqlchemy.SQuery, man db.FilterByOwnerProvider, userCred mcclient.TokenCredential, owner mcclient.IIdentityProvider, scope rbacscope.TRbacScope) *sqlchemy.SQuery {
+	if userCred != nil && scope != rbacscope.ScopeSystem && scope != rbacscope.ScopeDomain {
+		q = q.Equals("id", owner.GetProjectId())
+	}
+	return manager.SIdentityBaseResourceManager.FilterByOwner(ctx, q, man, userCred, owner, scope)
+}
+
+func (manager *SProjectManager) GetSystemProject() (*SProject, error) {
+	q := manager.Query().Equals("name", api.SystemAdminProject)
+	ret := &SProject{}
+	ret.SetModelManager(manager, ret)
+	err := q.First(ret)
+	if err != nil {
+		return nil, err
+	}
+	return ret, nil
+}
+
+func (self *SProject) StartProjectCleanTask(ctx context.Context, userCred mcclient.TokenCredential) error {
+	task, err := taskman.TaskManager.NewTask(ctx, "ProjectCleanTask", self, userCred, nil, "", "", nil)
+	if err != nil {
+		return err
+	}
+	return task.ScheduleRun(nil)
+}
+
+func (self *SProject) GetEmptyProjects() ([]SProject, error) {
+	q := ProjectManager.Query().IsFalse("pending_deleted").NotEquals("name", api.SystemAdminProject)
+	scopes := []SScopeResource{}
+	ScopeResourceManager.Query().GT("count", 0).All(&scopes)
+	ids := []string{}
+	for _, scope := range scopes {
+		ids = append(ids, scope.ProjectId)
+	}
+	projects := []SProject{}
+	if len(ids) == 0 {
+		return projects, nil
+	}
+	q = q.Filter(sqlchemy.NotIn(q.Field("id"), ids))
+	err := db.FetchModelObjects(ProjectManager, q, &projects)
+	if err != nil {
+		return nil, err
+	}
+	return projects, nil
+}
+
+func (manager *SProjectManager) PerformClean(ctx context.Context, userCred mcclient.TokenCredential, query jsonutils.JSONObject, input *api.ProjectCleanInput) (jsonutils.JSONObject, error) {
+	if !userCred.HasSystemAdminPrivilege() {
+		return nil, httperrors.NewForbiddenError("not allow clean projects")
+	}
+	system, err := manager.GetSystemProject()
+	if err != nil {
+		return nil, err
+	}
+	return nil, system.StartProjectCleanTask(ctx, userCred)
 }

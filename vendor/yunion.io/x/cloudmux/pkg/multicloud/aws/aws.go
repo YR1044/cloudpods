@@ -21,8 +21,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	sdk "github.com/aws/aws-sdk-go/aws"
@@ -30,7 +28,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/s3"
 
 	"yunion.io/x/log"
@@ -111,27 +108,18 @@ type SAwsClient struct {
 	ownerId   string
 	ownerName string
 
-	iregions []cloudprovider.ICloudRegion
+	regions  []SRegion
 	iBuckets []cloudprovider.ICloudBucket
-
-	//sessions map[string]map[bool]*session.Session
-	sessions sync.Map // map[string]map[bool]*session.Session
 }
 
 func NewAwsClient(cfg *AwsClientConfig) (*SAwsClient, error) {
 	client := SAwsClient{
 		AwsClientConfig: cfg,
 	}
-	_, err := client.fetchRegions()
+	var err error
+	client.regions, err = client.GetRegions()
 	if err != nil {
-		return nil, err
-	}
-	err = client.fetchOwnerId()
-	if err != nil {
-		return nil, errors.Wrap(err, "fetchOwnerId")
-	}
-	if client.debug {
-		log.Debugf("ownerId: %s ownerName: %s", client.ownerId, client.ownerName)
+		return nil, errors.Wrapf(err, "GetRegions")
 	}
 	return &client, nil
 }
@@ -142,15 +130,6 @@ func (cli *SAwsClient) getIamArn(arn string) string {
 		return AWS_GLOBAL_ARN_PREFIX + arn
 	default:
 		return AWS_CHINA_ARN_PREFIX + arn
-	}
-}
-
-func (cli *SAwsClient) getIamCommonArn(arn string) string {
-	switch cli.GetAccessEnv() {
-	case api.CLOUD_ACCESS_ENV_AWS_GLOBAL:
-		return strings.TrimPrefix(arn, AWS_GLOBAL_ARN_PREFIX)
-	default:
-		return strings.TrimPrefix(arn, AWS_CHINA_ARN_PREFIX)
 	}
 }
 
@@ -175,68 +154,38 @@ func (client *SAwsClient) getDefaultSession(assumeRole bool) (*session.Session, 
 }
 
 func (client *SAwsClient) GetAccountId() string {
+	err := client.fetchOwnerId()
+	if err != nil {
+		return ""
+	}
 	return client.ownerId
 }
 
-var (
-	// cache for describeRegions
-	describeRegionResult        sync.Map //map[string]*ec2.DescribeRegionsOutput = map[string]*ec2.DescribeRegionsOutput{}
-	describeRegionResultCacheAt sync.Map // map[string]time.Time                  = map[string]time.Time{}
-)
+func (self *SAwsClient) ec2Request(regionId string, apiName string, params map[string]string, retval interface{}, assumeRole bool) error {
+	return self.request(regionId, EC2_SERVICE_NAME, EC2_SERVICE_ID, "2016-11-15", apiName, params, retval, assumeRole)
+}
 
-const (
-	describeRegionExpireHours = 2
-)
+// Amazon Elastic Container Service
+func (self *SAwsClient) ecsRequest(regionId string, apiName string, params map[string]interface{}, retval interface{}, assumeRole bool) error {
+	return self.invoke(regionId, ECS_SERVICE_NAME, ECS_SERVICE_ID, "2014-11-13", apiName, "", params, retval, assumeRole)
+}
 
-// 用于初始化region信息
-func (self *SAwsClient) fetchRegions() ([]SRegion, error) {
-	cacheTime, _ := describeRegionResultCacheAt.Load(self.accessUrl)
-	if _, ok := describeRegionResult.Load(self.accessUrl); !ok || cacheTime.(time.Time).IsZero() || time.Now().After(cacheTime.(time.Time).Add(time.Hour*describeRegionExpireHours)) {
-		s, err := self.getDefaultSession(false)
-		if err != nil {
-			return nil, errors.Wrap(err, "getDefaultSession")
-		}
-		svc := ec2.New(s)
-		// https://docs.aws.amazon.com/sdk-for-go/api/service/ec2/#EC2.DescribeRegions
-		input := &ec2.DescribeRegionsInput{}
-		input.SetAllRegions(true)
-		result, err := svc.DescribeRegions(input)
-		if err != nil {
-			if e, ok := err.(awserr.Error); ok && e.Code() == "AuthFailure" {
-				return nil, errors.Wrap(cloudprovider.ErrInvalidAccessKey, err.Error())
-			}
-			return nil, errors.Wrap(err, "DescribeRegions")
-		}
-		describeRegionResult.Store(self.accessUrl, result)
-		describeRegionResultCacheAt.Store(self.accessUrl, time.Now())
-	}
+func (self *SAwsClient) lambdaRequest(regionId string, apiName, path string, params map[string]interface{}, retval interface{}, assumeRole bool) error {
+	return self.invoke(regionId, LAMBDA_SERVICE_NAME, LAMBDA_SERVICE_ID, "2015-03-31", apiName, path, params, retval, assumeRole)
+}
 
-	self.iregions = []cloudprovider.ICloudRegion{}
-	regions := make([]SRegion, 0)
-	descRegions, _ := describeRegionResult.Load(self.accessUrl)
-	for _, region := range descRegions.(*ec2.DescribeRegionsOutput).Regions {
-		name := *region.RegionName
-		endpoint := *region.Endpoint
-		sregion := SRegion{client: self, RegionId: name, RegionEndpoint: endpoint}
-		// 初始化region client
-		// sregion.getEc2Client()
-		regions = append(regions, sregion)
-		self.iregions = append(self.iregions, &sregion)
-	}
+func (self *SAwsClient) kinesisRequest(regionId string, apiName, path string, params map[string]interface{}, retval interface{}, assumeRole bool) error {
+	return self.invoke(regionId, KINESIS_SERVICE_NAME, KINESIS_SERVICE_ID, "2013-12-02", apiName, path, params, retval, assumeRole)
+}
 
-	return regions, nil
+func (self *SAwsClient) cfRequest(apiName string, params map[string]string, retval interface{}, assumeRole bool) error {
+	return self.request("", CDN_SERVICE_NAME, CDN_SERVICE_ID, "2020-05-31", apiName, params, retval, assumeRole)
 }
 
 func (client *SAwsClient) getAwsSession(regionId string, assumeRole bool) (*session.Session, error) {
-	client.sessions.LoadOrStore(regionId, map[bool]*session.Session{})
-	if sess, ok := client.sessions.Load(regionId); ok {
-		if ret, ok := sess.(map[bool]*session.Session)[assumeRole]; ok {
-			return ret, nil
-		}
-	}
 	httpClient := client.cpcfg.AdaptiveTimeoutHttpClient()
 	transport, _ := httpClient.Transport.(*http.Transport)
-	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response), error) {
+	httpClient.Transport = cloudprovider.GetCheckTransport(transport, func(req *http.Request) (func(resp *http.Response) error, error) {
 		var action string
 		if req.ContentLength > 0 && !strings.Contains(req.URL.Host, ".s3.") {
 			body, err := ioutil.ReadAll(req.Body)
@@ -253,7 +202,7 @@ func (client *SAwsClient) getAwsSession(regionId string, assumeRole bool) (*sess
 
 		service := strings.Split(req.URL.Host, ".")[0]
 		method, path := req.Method, req.URL.Path
-		respCheck := func(resp *http.Response) {
+		respCheck := func(resp *http.Response) error {
 			if resp.StatusCode == 403 {
 				if client.cpcfg.UpdatePermission != nil {
 					if len(action) > 0 {
@@ -263,6 +212,7 @@ func (client *SAwsClient) getAwsSession(regionId string, assumeRole bool) (*sess
 					}
 				}
 			}
+			return nil
 		}
 
 		if client.cpcfg.ReadOnly {
@@ -316,17 +266,7 @@ func (client *SAwsClient) getAwsSession(regionId string, assumeRole bool) (*sess
 		s.Config.LogLevel = &logLevel
 	}
 
-	client.sessions.Store(regionId, map[bool]*session.Session{assumeRole: s})
 	return s, nil
-}
-
-func (client *SAwsClient) getAwsRoute53Session() (*session.Session, error) {
-	session, err := client.getDefaultSession(true)
-	if err != nil {
-		return nil, errors.Wrap(err, "client.getDefaultSession()")
-	}
-	session.ClientConfig(ROUTE53_SERVICE_NAME)
-	return session, nil
 }
 
 func (self *SAwsClient) invalidateIBuckets() {
@@ -360,6 +300,9 @@ func (client *SAwsClient) fetchBuckets() error {
 	s3cli := s3.New(s)
 	output, err := s3cli.ListBuckets(&s3.ListBucketsInput{})
 	if err != nil {
+		if e, ok := err.(awserr.Error); ok && e.Code() == "AccessDenied" {
+			return errors.Wrapf(cloudprovider.ErrForbidden, e.Message())
+		}
 		return errors.Wrap(err, "ListBuckets")
 	}
 
@@ -389,7 +332,7 @@ func (client *SAwsClient) fetchBuckets() error {
 			// Buckets in Region us-east-1 have a LocationConstraint of null.
 			location = DEFAULT_S3_REGION_ID
 		}
-		region, err := client.getIRegionByRegionId(location)
+		region, err := client.GetIRegionById(location)
 		if err != nil {
 			log.Errorf("client.getIRegionByRegionId %s fail %s", location, err)
 			continue
@@ -410,17 +353,35 @@ func (client *SAwsClient) fetchBuckets() error {
 
 // 只是使用fetchRegions初始化好的self.iregions. 本身并不从云服务器厂商拉取region信息
 func (self *SAwsClient) GetRegions() ([]SRegion, error) {
-	return self.fetchRegions()
+	params := map[string]string{
+		"AllRegions": "true",
+	}
+	ret := struct {
+		RegionInfo []SRegion `xml:"regionInfo>item"`
+	}{}
+	err := self.ec2Request("", "DescribeRegions", params, &ret, false)
+	if err != nil {
+		if e, ok := err.(*sAwsError); ok && e.Errors.Code == "AuthFailure" {
+			return nil, errors.Wrap(cloudprovider.ErrInvalidAccessKey, err.Error())
+		}
+		return nil, errors.Wrapf(err, "DescribeRegions")
+	}
+	return ret.RegionInfo, nil
 }
 
-func (self *SAwsClient) GetIRegions() []cloudprovider.ICloudRegion {
-	return self.iregions
+func (self *SAwsClient) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
+	ret := []cloudprovider.ICloudRegion{}
+	for i := range self.regions {
+		self.regions[i].client = self
+		ret = append(ret, &self.regions[i])
+	}
+	return ret, nil
 }
 
 func (self *SAwsClient) GetRegion(regionId string) (*SRegion, error) {
-	regions, err := self.fetchRegions()
+	regions, err := self.GetRegions()
 	if err != nil {
-		return nil, errors.Wrapf(err, "fetchRegions")
+		return nil, errors.Wrapf(err, "GetRegions")
 	}
 
 	if len(regionId) == 0 {
@@ -434,6 +395,7 @@ func (self *SAwsClient) GetRegion(regionId string) (*SRegion, error) {
 	}
 	for i := 0; i < len(regions); i += 1 {
 		if regions[i].GetId() == regionId {
+			regions[i].client = self
 			return &regions[i], nil
 		}
 	}
@@ -444,27 +406,19 @@ func (self *SAwsClient) getDefaultRegion() (*SRegion, error) {
 	return self.GetRegion("")
 }
 
-func (self *SAwsClient) getIRegionByRegionId(id string) (cloudprovider.ICloudRegion, error) {
-	for i := 0; i < len(self.iregions); i += 1 {
-		if self.iregions[i].GetId() == id {
-			return self.iregions[i], nil
-		}
-	}
-	return nil, errors.Wrap(cloudprovider.ErrNotFound, "getIRegionByRegionId")
-}
-
 func (self *SAwsClient) GetIRegionById(id string) (cloudprovider.ICloudRegion, error) {
-	for i := 0; i < len(self.iregions); i += 1 {
-		if self.iregions[i].GetGlobalId() == id {
-			return self.iregions[i], nil
+	for i := range self.regions {
+		self.regions[i].client = self
+		if self.regions[i].GetId() == id || self.regions[i].GetGlobalId() == id {
+			return &self.regions[i], nil
 		}
 	}
-	return nil, errors.Wrap(cloudprovider.ErrNotFound, "GetIRegionById")
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "GetIRegionById(%s)", id)
 }
 
 func (self *SAwsClient) GetIHostById(id string) (cloudprovider.ICloudHost, error) {
-	for i := 0; i < len(self.iregions); i += 1 {
-		ihost, err := self.iregions[i].GetIHostById(id)
+	for i := 0; i < len(self.regions); i += 1 {
+		ihost, err := self.regions[i].GetIHostById(id)
 		if err == nil {
 			return ihost, nil
 		} else if errors.Cause(err) != cloudprovider.ErrNotFound {
@@ -476,8 +430,8 @@ func (self *SAwsClient) GetIHostById(id string) (cloudprovider.ICloudHost, error
 }
 
 func (self *SAwsClient) GetIVpcById(id string) (cloudprovider.ICloudVpc, error) {
-	for i := 0; i < len(self.iregions); i += 1 {
-		ihost, err := self.iregions[i].GetIVpcById(id)
+	for i := 0; i < len(self.regions); i += 1 {
+		ihost, err := self.regions[i].GetIVpcById(id)
 		if err == nil {
 			return ihost, nil
 		} else if errors.Cause(err) != cloudprovider.ErrNotFound {
@@ -489,8 +443,8 @@ func (self *SAwsClient) GetIVpcById(id string) (cloudprovider.ICloudVpc, error) 
 }
 
 func (self *SAwsClient) GetIStorageById(id string) (cloudprovider.ICloudStorage, error) {
-	for i := 0; i < len(self.iregions); i += 1 {
-		ihost, err := self.iregions[i].GetIStorageById(id)
+	for i := 0; i < len(self.regions); i += 1 {
+		ihost, err := self.regions[i].GetIStorageById(id)
 		if err == nil {
 			return ihost, nil
 		} else if errors.Cause(err) != cloudprovider.ErrNotFound {
@@ -499,6 +453,35 @@ func (self *SAwsClient) GetIStorageById(id string) (cloudprovider.ICloudStorage,
 		}
 	}
 	return nil, errors.Wrap(cloudprovider.ErrNotFound, "GetIStorageById")
+}
+
+func (self *SAwsClient) cdnList(marker string, pageSize int64) ([]SCdnDomain, string, error) {
+	input := map[string]string{
+		"Marker":   marker,
+		"MaxItems": fmt.Sprintf("%d", pageSize),
+	}
+	ret := &struct {
+		Items      []SCdnDomain `xml:"Items>DistributionSummary"`
+		NextMarker string       `xml:"NextMarker,omitempty"`
+	}{}
+	err := self.cfRequest("ListDistributions2020_05_31", input, ret, true)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "cdnList")
+	}
+	return ret.Items, ret.NextMarker, err
+}
+
+func (self *SAwsClient) cdnGet(id string) (*SCdnDomain, error) {
+	input := map[string]string{
+		"Id": id,
+	}
+	var ret SCdnDomain
+	err := self.cfRequest("GetDistribution2020_05_31", input, &ret, true)
+	if err != nil {
+		return nil, errors.Wrap(err, "cdnGet")
+	}
+
+	return &ret, err
 }
 
 type SAccountBalance struct {
@@ -532,6 +515,10 @@ func (self *SAwsClient) iamRequest(apiName string, params map[string]string, ret
 	return self.request("", IAM_SERVICE_NAME, IAM_SERVICE_ID, "2010-05-08", apiName, params, retval, true)
 }
 
+func (self *SAwsClient) dnsRequest(apiName string, params map[string]string, retval interface{}) error {
+	return self.request("", ROUTE53_SERVICE_NAME, ROUTE53_SERVICE_ID, "2013-04-01", apiName, params, retval, true)
+}
+
 func (self *SAwsClient) stsRequest(apiName string, params map[string]string, retval interface{}) error {
 	return self.request("", STS_SERVICE_NAME, STS_SERVICE_ID, "2011-06-15", apiName, params, retval, false)
 }
@@ -540,6 +527,7 @@ func (self *SAwsClient) GetCapabilities() []string {
 	caps := []string{
 		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK,
+		cloudprovider.CLOUD_CAPABILITY_SECURITY_GROUP,
 		cloudprovider.CLOUD_CAPABILITY_EIP,
 		cloudprovider.CLOUD_CAPABILITY_LOADBALANCER,
 		cloudprovider.CLOUD_CAPABILITY_OBJECTSTORE,
@@ -553,6 +541,7 @@ func (self *SAwsClient) GetCapabilities() []string {
 		cloudprovider.CLOUD_CAPABILITY_WAF,
 		cloudprovider.CLOUD_CAPABILITY_VPC_PEER,
 		cloudprovider.CLOUD_CAPABILITY_CONTAINER,
+		cloudprovider.CLOUD_CAPABILITY_CDN + cloudprovider.READ_ONLY_SUFFIX,
 	}
 	return caps
 }

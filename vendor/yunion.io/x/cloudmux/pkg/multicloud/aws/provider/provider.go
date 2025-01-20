@@ -54,18 +54,6 @@ func (self *SAwsProviderFactory) IsSupportPrepaidResources() bool {
 	return false
 }
 
-func (self *SAwsProviderFactory) IsSupportCloudIdService() bool {
-	return true
-}
-
-func (self *SAwsProviderFactory) IsSupportCreateCloudgroup() bool {
-	return true
-}
-
-func (factory *SAwsProviderFactory) IsSystemCloudpolicyUnified() bool {
-	return false
-}
-
 func (factory *SAwsProviderFactory) IsSupportSAMLAuth() bool {
 	return true
 }
@@ -79,7 +67,7 @@ func (self *SAwsProviderFactory) GetSupportedDnsZoneTypes() []cloudprovider.TDns
 
 func (self *SAwsProviderFactory) GetSupportedDnsTypes() map[cloudprovider.TDnsZoneType][]cloudprovider.TDnsType {
 	return map[cloudprovider.TDnsZoneType][]cloudprovider.TDnsType{
-		cloudprovider.PublicZone: []cloudprovider.TDnsType{
+		cloudprovider.PublicZone: {
 			cloudprovider.DnsTypeA,
 			cloudprovider.DnsTypeAAAA,
 			cloudprovider.DnsTypeCAA,
@@ -93,7 +81,7 @@ func (self *SAwsProviderFactory) GetSupportedDnsTypes() map[cloudprovider.TDnsZo
 			cloudprovider.DnsTypeNAPTR,
 			cloudprovider.DnsTypeSPF,
 		},
-		cloudprovider.PrivateZone: []cloudprovider.TDnsType{
+		cloudprovider.PrivateZone: {
 			cloudprovider.DnsTypeA,
 			cloudprovider.DnsTypeAAAA,
 			cloudprovider.DnsTypeCAA,
@@ -112,7 +100,7 @@ func (self *SAwsProviderFactory) GetSupportedDnsTypes() map[cloudprovider.TDnsZo
 
 func (self *SAwsProviderFactory) GetSupportedDnsPolicyTypes() map[cloudprovider.TDnsZoneType][]cloudprovider.TDnsPolicyType {
 	return map[cloudprovider.TDnsZoneType][]cloudprovider.TDnsPolicyType{
-		cloudprovider.PublicZone: []cloudprovider.TDnsPolicyType{
+		cloudprovider.PublicZone: {
 			cloudprovider.DnsPolicyTypeSimple,
 			cloudprovider.DnsPolicyTypeByGeoLocation,
 			cloudprovider.DnsPolicyTypeWeighted,
@@ -120,7 +108,7 @@ func (self *SAwsProviderFactory) GetSupportedDnsPolicyTypes() map[cloudprovider.
 			cloudprovider.DnsPolicyTypeMultiValueAnswer,
 			cloudprovider.DnsPolicyTypeLatency,
 		},
-		cloudprovider.PrivateZone: []cloudprovider.TDnsPolicyType{
+		cloudprovider.PrivateZone: {
 			cloudprovider.DnsPolicyTypeSimple,
 			cloudprovider.DnsPolicyTypeWeighted,
 			cloudprovider.DnsPolicyTypeFailover,
@@ -251,12 +239,12 @@ func (self *SAwsProvider) GetIamLoginUrl() string {
 	return self.client.GetIamLoginUrl()
 }
 
-func (self *SAwsProvider) GetIRegions() []cloudprovider.ICloudRegion {
+func (self *SAwsProvider) GetIRegions() ([]cloudprovider.ICloudRegion, error) {
 	return self.client.GetIRegions()
 }
 
 func (self *SAwsProvider) GetSysInfo() (jsonutils.JSONObject, error) {
-	regions := self.client.GetIRegions()
+	regions, _ := self.client.GetIRegions()
 	info := jsonutils.NewDict()
 	info.Add(jsonutils.NewInt(int64(len(regions))), "region_count")
 	info.Add(jsonutils.NewString(aws.AWS_API_VERSION), "api_version")
@@ -334,12 +322,8 @@ func (self *SAwsProvider) CreateICloudgroup(name, desc string) (cloudprovider.IC
 	return self.client.CreateICloudgroup(name, desc)
 }
 
-func (self *SAwsProvider) GetISystemCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetISystemCloudpolicies()
-}
-
-func (self *SAwsProvider) GetICustomCloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
-	return self.client.GetICustomCloudpolicies()
+func (self *SAwsProvider) GetICloudpolicies() ([]cloudprovider.ICloudpolicy, error) {
+	return self.client.GetICloudpolicies()
 }
 
 func (self *SAwsProvider) GetIClouduserByName(name string) (cloudprovider.IClouduser, error) {
@@ -359,11 +343,15 @@ func (self *SAwsProvider) GetICloudDnsZones() ([]cloudprovider.ICloudDnsZone, er
 }
 
 func (self *SAwsProvider) GetICloudDnsZoneById(id string) (cloudprovider.ICloudDnsZone, error) {
-	return self.client.GetHostedZoneById(id)
+	zone, err := self.client.GetDnsZone(id)
+	if err != nil {
+		return nil, err
+	}
+	return &zone.HostedZone, nil
 }
 
 func (self *SAwsProvider) CreateICloudDnsZone(opts *cloudprovider.SDnsZoneCreateOptions) (cloudprovider.ICloudDnsZone, error) {
-	return self.client.CreateHostedZone(opts)
+	return self.client.CreateDnsZone(opts)
 }
 
 func (self *SAwsProvider) GetICloudSAMLProviders() ([]cloudprovider.ICloudSAMLProvider, error) {
@@ -413,4 +401,12 @@ func (self *SAwsProvider) CreateICloudrole(opts *cloudprovider.SRoleCreateOption
 
 func (self *SAwsProvider) GetMetrics(opts *cloudprovider.MetricListOptions) ([]cloudprovider.MetricValues, error) {
 	return self.client.GetMetrics(opts)
+}
+
+func (self *SAwsProvider) GetICloudCDNDomains() ([]cloudprovider.ICloudCDNDomain, error) {
+	return self.client.GetICloudCDNDomains()
+}
+
+func (self *SAwsProvider) GetICloudCDNDomainByName(name string) (cloudprovider.ICloudCDNDomain, error) {
+	return self.client.GetICloudCDNDomainByName(name)
 }

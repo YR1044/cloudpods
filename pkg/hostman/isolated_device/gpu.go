@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -29,7 +30,6 @@ import (
 	"yunion.io/x/pkg/utils"
 
 	api "yunion.io/x/onecloud/pkg/apis/compute"
-	"yunion.io/x/onecloud/pkg/hostman/guestman/desc"
 	o "yunion.io/x/onecloud/pkg/hostman/options"
 	"yunion.io/x/onecloud/pkg/util/fileutils2"
 	"yunion.io/x/onecloud/pkg/util/procutils"
@@ -40,6 +40,16 @@ import (
 const (
 	CLASS_CODE_VGA = "0300"
 	CLASS_CODE_3D  = "0302"
+
+	CLASS_CODE_DISP = "0380"
+)
+
+var (
+	GpuClassCodes = []string{
+		CLASS_CODE_VGA,
+		CLASS_CODE_3D,
+		CLASS_CODE_DISP,
+	}
 )
 
 const (
@@ -56,42 +66,99 @@ const (
 	DEFAULT_CPU_CMD = "host,kvm=off"
 )
 
-func getPassthroughGPUS() ([]*PCIDevice, error) {
-	gpus, err := detectGPUS()
-	if err != nil {
-		return nil, err
+func isInWhitelistModels(models []IsolatedDeviceModel, dev *PCIDevice) bool {
+	for _, model := range models {
+		if model.VendorId == dev.VendorId && model.DeviceId == dev.DeviceId {
+			return true
+		}
 	}
+	return false
+}
+
+func getPassthroughGPUs(filteredAddrs []string, enableWhitelist bool, whitelistModels []IsolatedDeviceModel) ([]*PCIDevice, error, []error) {
+	lines, err := getGPUPCIStr()
+	if err != nil {
+		return nil, err, nil
+	}
+
+	warns := make([]error, 0)
+	devs := []*PCIDevice{}
+	log.Infof("filter address %v, enableWhiteList: %v", filteredAddrs, enableWhitelist)
+	for _, line := range lines {
+		if len(line) == 0 {
+			continue
+		}
+		dev := NewPCIDevice2(line)
+		if utils.IsInStringArray(dev.Addr, filteredAddrs) {
+			continue
+		}
+		if !utils.IsInArray(dev.ClassCode, GpuClassCodes) {
+			continue
+		}
+		if o.HostOptions.BootVgaPciAddr != "" {
+			if dev.Addr == o.HostOptions.BootVgaPciAddr && !o.HostOptions.UseBootVga {
+				continue
+			}
+		} else {
+			if ok, err := dev.IsBootVGA(); err != nil {
+				return nil, err, nil
+			} else if ok && !o.HostOptions.UseBootVga {
+				continue
+			}
+		}
+
+		if dev.ClassCode == CLASS_CODE_DISP && !utils.IsInStringArray(dev.VendorId, []string{api.NVIDIA_VENDOR_ID, api.AMD_VENDOR_ID}) {
+			log.Infof("Skip add device %s vendor is unsupport", dev.Addr)
+			continue
+		}
+
+		if enableWhitelist {
+			if !isInWhitelistModels(whitelistModels, dev) {
+				log.Infof("skip add device %s cause of not in isolated_device_models", dev.String())
+				continue
+			}
+		}
+		if err := dev.checkSameIOMMUGroupDevice(); err != nil {
+			warns = append(warns, errors.Wrapf(err, "get dev %s iommu group devices", dev.Addr))
+			continue
+		}
+
+		if isBootVga, err := dev.IsBootVGA(); err != nil {
+			warns = append(warns, errors.Wrapf(err, "check dev %s is boot vga devices", dev.Addr))
+			continue
+		} else if isBootVga && !o.HostOptions.UseBootVga {
+			log.Infof("skip boot vga device %s", dev.Addr)
+			continue
+		}
+
+		if err := dev.forceBindVFIOPCIDriver(o.HostOptions.UseBootVga, o.HostOptions.BootVgaPciAddr); err != nil {
+			warns = append(warns, errors.Wrapf(err, "force bind vfio-pci driver %s", dev.Addr))
+			continue
+		}
+		devs = append(devs, dev)
+	}
+
 	ret := []*PCIDevice{}
-	for _, dev := range gpus {
+	for _, dev := range devs {
 		if drv, err := dev.getKernelDriver(); err != nil {
-			log.Errorf("Device %#v get kernel driver error: %v", dev, err)
+			log.Errorf("Device %s get kernel driver error: %s", dev.Addr, err.Error())
+			warns = append(warns, fmt.Errorf("Device %s get kernel driver error: %s", dev.Addr, err.Error()))
 		} else if drv == "" || drv == VFIO_PCI_KERNEL_DRIVER {
 			ret = append(ret, dev)
 		} else {
 			log.Warningf("GPU %v use kernel driver %q, skip it", dev, drv)
+			warns = append(warns, fmt.Errorf("GPU %s use kernel driver %s, skip it", dev.Addr, drv))
 		}
 	}
-	return ret, nil
+	return ret, nil, warns
 }
 
-func detectGPUS() ([]*PCIDevice, error) {
-	lines, err := getGPUPCIStr()
-	if err != nil {
-		return nil, err
+func GetPCIStrByAddr(addr string) ([]string, error) {
+	cmd := "lspci -nnmm"
+	if addr != "" {
+		cmd = fmt.Sprintf("%s -s %s", cmd, addr)
 	}
-	devs := []*PCIDevice{}
-	for _, line := range lines {
-		dev, err := NewPCIDevice(line)
-		if err != nil {
-			return nil, err
-		}
-		devs = append(devs, dev)
-	}
-	return devs, nil
-}
-
-func getGPUPCIStr() ([]string, error) {
-	ret, err := bashOutput("lspci -nnmm | egrep '3D|VGA'")
+	ret, err := bashOutput(cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -102,6 +169,26 @@ func getGPUPCIStr() ([]string, error) {
 		}
 	}
 	return lines, err
+}
+
+func getGPUPCIStr() ([]string, error) {
+	return GetPCIStrByAddr("")
+}
+
+type IExecutor interface {
+	RunCmd(cmd string) ([]string, error)
+}
+
+var defaultExecutor IExecutor = new(SDefaultExecutor)
+
+func GetDefaultExecutor() IExecutor {
+	return defaultExecutor
+}
+
+type SDefaultExecutor struct{}
+
+func (*SDefaultExecutor) RunCmd(cmd string) ([]string, error) {
+	return bashOutput(cmd)
 }
 
 type PCIDevice struct {
@@ -118,31 +205,58 @@ type PCIDevice struct {
 	SubdeviceId   string `json:"subdevice_id"`
 	ModelName     string `json:"model_name"`
 
-	RestIOMMUGroupDevs []*PCIDevice `json:"-"`
+	RestIOMMUGroupDevs []*PCIDevice                `json:"-"`
+	PCIEInfo           *api.IsolatedDevicePCIEInfo `json:"pcie_info"`
 }
 
-func NewPCIDevice(line string) (*PCIDevice, error) {
-	dev := parseLspci(line)
+func NewPCIDevice(addr string, executors ...IExecutor) (*PCIDevice, error) {
+	if len(addr) == 0 {
+		return nil, errors.Errorf("input line is empty")
+	}
+
+	var executor IExecutor
+	if len(executors) == 0 {
+		executor = GetDefaultExecutor()
+	} else {
+		executor = executors[0]
+	}
+	ret, err := executor.RunCmd(fmt.Sprintf("lspci -nnmm -s %s", addr))
+	if err != nil {
+		return nil, errors.Wrapf(err, "run lspci -nnmm -s %s", addr)
+	}
+
+	dev := NewPCIDevice2(strings.Join(ret, ""))
 	if err := dev.checkSameIOMMUGroupDevice(); err != nil {
 		return nil, err
 	}
-	if err := dev.forceBindVFIOPCIDriver(o.HostOptions.UseBootVga); err != nil {
+	if err := dev.forceBindVFIOPCIDriver(o.HostOptions.UseBootVga, o.HostOptions.BootVgaPciAddr); err != nil {
 		return nil, fmt.Errorf("Force bind vfio-pci driver: %v", err)
 	}
 	return dev, nil
 }
 
-func NewPCIDevice2(line string) *PCIDevice {
-	return parseLspci(line)
+func NewPCIDevice2(line string, executors ...IExecutor) *PCIDevice {
+	var executor IExecutor
+	if len(executors) == 0 {
+		executor = GetDefaultExecutor()
+	} else {
+		executor = executors[0]
+	}
+
+	dev := parseLspci(line)
+	if err := dev.fillPCIEInfo(executor); err != nil {
+		log.Warningf("fillPCIEInfo for line: %q, device: %s, error: %v", line, dev.String(), err)
+	}
+	return dev
 }
 
 type sGPUBaseDevice struct {
-	*sBaseDevice
+	*SBaseDevice
 }
 
 func newGPUBaseDevice(dev *PCIDevice, devType string) *sGPUBaseDevice {
 	return &sGPUBaseDevice{
-		sBaseDevice: newBaseDevice(dev, devType),
+		SBaseDevice: NewBaseDevice(dev, devType),
 	}
 }
 
@@ -209,53 +323,6 @@ func (dev *sGPUBaseDevice) GetQemuId() string {
 	return fmt.Sprintf("dev_%s", strings.ReplaceAll(dev.GetAddr(), ":", "_"))
 }
 
-func (dev *sGPUBaseDevice) GetHotPlugOptions(isolatedDev *desc.SGuestIsolatedDevice) ([]*HotPlugOption, error) {
-	ret := make([]*HotPlugOption, 0)
-
-	var masterDevOpt *HotPlugOption
-	for i := 0; i < len(isolatedDev.VfioDevs); i++ {
-		cmd := isolatedDev.VfioDevs[i].HostAddr
-		if optCmd := isolatedDev.VfioDevs[i].OptionsStr(); len(optCmd) > 0 {
-			cmd += fmt.Sprintf(",%s", optCmd)
-		}
-		opts := map[string]string{
-			"host": cmd,
-			"id":   isolatedDev.VfioDevs[i].Id,
-		}
-		if isolatedDev.VfioDevs[i].XVga {
-			opts["x-vga"] = "on"
-		}
-		devOpt := &HotPlugOption{
-			Device:  isolatedDev.VfioDevs[i].DevType,
-			Options: opts,
-		}
-		if isolatedDev.VfioDevs[i].Function == 0 {
-			masterDevOpt = devOpt
-		} else {
-			ret = append(ret, devOpt)
-		}
-	}
-	// if PCI slot function 0 already assigned, qemu will reject hotplug function
-	// so put function 0 at the enda
-	if masterDevOpt == nil {
-		return nil, errors.Errorf("GPU Device no function 0 found")
-	}
-	ret = append(ret, masterDevOpt)
-	return ret, nil
-}
-
-func (dev *sGPUBaseDevice) GetHotUnplugOptions(isolatedDev *desc.SGuestIsolatedDevice) ([]*HotUnplugOption, error) {
-	if len(isolatedDev.VfioDevs) == 0 {
-		return nil, errors.Errorf("device %s no pci ids", isolatedDev.Id)
-	}
-
-	return []*HotUnplugOption{
-		{
-			Id: isolatedDev.VfioDevs[0].Id,
-		},
-	}, nil
-}
-
 func getGuestAddr(index int) string {
 	vAddr := fmt.Sprintf("0x%x", 21+index) // from 0x15 above
 	return vAddr
@@ -275,32 +342,6 @@ func NewGPUHPCDevice(dev *PCIDevice) *sGPUHPCDevice {
 func (gpu *sGPUHPCDevice) GetPassthroughCmd(index int) string {
 	// vAddr := getGuestAddr(index)
 	return fmt.Sprintf(" -device vfio-pci,host=%s,multifunction=on", gpu.GetAddr())
-}
-
-func gpuPCIString() ([]string, error) {
-	lines, err := bashOutput("lspci -nnmm | egrep '3D|VGA'")
-	if err != nil {
-		return nil, fmt.Errorf("Get GPU PCI: %v", err)
-	}
-	ret := []string{}
-	for _, line := range lines {
-		if len(line) != 0 {
-			ret = append(ret, line)
-		}
-	}
-	return ret, nil
-}
-
-func gpuPCIAddr() ([]string, error) {
-	lines, err := gpuPCIString()
-	if err != nil {
-		return nil, err
-	}
-	addrs := []string{}
-	for _, line := range lines {
-		addrs = append(addrs, strings.Split(line, " ")[0])
-	}
-	return addrs, nil
 }
 
 // parseLspci parse one line output of `lspci -nnmm`
@@ -325,7 +366,7 @@ func (d *PCIDevice) GetVendorDeviceId() string {
 	return fmt.Sprintf("%s:%s", d.VendorId, d.DeviceId)
 }
 
-// checkSameIOMMUGroupDevice check related device like Audio in same iommu group
+// checkSameIOMMUGroupDevice checks related device like Audio in same iommu group
 // e.g.
 // 41:00.0 VGA compatible controller [0300]: NVIDIA Corporation GP107 [GeForce GTX 1050 Ti] [10de:1c82] (rev a1)
 // 41:00.1 Audio device [0403]: NVIDIA Corporation GP107GL High Definition Audio Controller [10de:0fb9] (rev a1)
@@ -340,6 +381,10 @@ func (d *PCIDevice) checkSameIOMMUGroupDevice() error {
 
 func (d *PCIDevice) IsBootVGA() (bool, error) {
 	addr := d.Addr
+	if addr == "" {
+		log.Warningf("device address is empty: %#v", d)
+		return false, nil
+	}
 	output, err := procutils.NewCommand("find", "/sys/devices", "-name", "boot_vga").Output()
 	if err != nil {
 		if exiterr, ok := err.(*exec.ExitError); ok {
@@ -369,18 +414,27 @@ func (d *PCIDevice) IsBootVGA() (bool, error) {
 	return false, nil
 }
 
-func (d *PCIDevice) forceBindVFIOPCIDriver(useBootVGA bool) error {
-	if !utils.IsInStringArray(d.ClassCode, []string{CLASS_CODE_VGA, CLASS_CODE_VGA}) {
+func (d *PCIDevice) forceBindVFIOPCIDriver(useBootVGA bool, bootVgaPciAddr string) error {
+	if !utils.IsInStringArray(d.ClassCode, []string{CLASS_CODE_VGA, CLASS_CODE_3D}) {
 		return nil
 	}
-	isBootVGA, err := d.IsBootVGA()
-	if err != nil {
-		return err
+
+	if !useBootVGA && bootVgaPciAddr != "" {
+		if d.Addr == bootVgaPciAddr {
+			log.Infof("device %#v is specific boot vga addr, skip it", d)
+			return nil
+		}
+	} else {
+		isBootVGA, err := d.IsBootVGA()
+		if err != nil {
+			return err
+		}
+		if !useBootVGA && isBootVGA {
+			log.Infof("%#v is boot vga card, skip it", d)
+			return nil
+		}
 	}
-	if !useBootVGA && isBootVGA {
-		log.Infof("%#v is boot vga card, skip it", d)
-		return nil
-	}
+
 	if d.IsVFIOPCIDriverUsed() {
 		log.Infof("%s already use vfio-pci driver", d)
 		return nil
@@ -390,6 +444,10 @@ func (d *PCIDevice) forceBindVFIOPCIDriver(useBootVGA bool) error {
 	devs = append(devs, d.RestIOMMUGroupDevs...)
 	devs = append(devs, d)
 	for _, dev := range devs {
+		if dev.IsVFIOPCIDriverUsed() {
+			log.Infof("%s already use vfio-pci driver", d.Addr)
+			continue
+		}
 		if err := dev.bindAddrVFIOPCI(); err != nil {
 			return fmt.Errorf("bind %s vfio-pci driver: %v", dev, err)
 		}
@@ -424,11 +482,58 @@ func (d *PCIDevice) unbindDriver() error {
 
 func (d *PCIDevice) bindDriver() error {
 	vendorDevId := fmt.Sprintf("%s %s", d.VendorId, d.DeviceId)
-	return fileutils2.FilePutContents(
+	err := fileutils2.FilePutContents(
 		"/sys/bus/pci/drivers/vfio-pci/new_id",
 		fmt.Sprintf("%s\n", vendorDevId),
 		false,
 	)
+	if err != nil {
+		log.Errorf("failed write %s to %s, try bind addr", vendorDevId, "/sys/bus/pci/drivers/vfio-pci/new_id")
+	} else {
+		return nil
+	}
+	if err := fileutils2.FilePutContents("/sys/bus/pci/drivers/vfio-pci/bind", fmt.Sprintf("0000:%s", d.Addr), false); err != nil {
+		return fmt.Errorf("bind driver %s : %v", d.Addr, err)
+	}
+	return nil
+}
+
+func (d *PCIDevice) fillPCIEInfo(executor IExecutor) error {
+	if d.Addr == "" {
+		return errors.Errorf("device address is empty: %s", d.String())
+	}
+
+	cmd := fmt.Sprintf("lspci -vvv -s %s", d.Addr)
+	lines, err := executor.RunCmd(cmd)
+	if err != nil {
+		return errors.Wrapf(err, "execute cmd: %s", cmd)
+	}
+	linkCapKey := "LnkCap:"
+	for _, line := range lines {
+		if strings.Contains(line, linkCapKey) {
+			info, err := parsePCIELinkCap(line)
+			if err != nil {
+				return errors.Wrapf(err, "parsePCIELinkCap")
+			}
+			d.PCIEInfo = info
+			return nil
+		}
+	}
+	return nil
+}
+
+func parsePCIELinkCap(line string) (*api.IsolatedDevicePCIEInfo, error) {
+	// e.g. parse following line
+	//                 LnkCap: Port #0, Speed 8GT/s, Width x16, ASPM L0s L1, Exit Latency L0s <1us, L1 <4us
+
+	lnkCapExp := `\s*LnkCap:.*Speed\s(?P<speed>((\d*[.])?\d+GT/s)),\sWidth\sx(?P<lane_width>(\d{1,})),.*`
+	ret := regutils2.SubGroupMatch(lnkCapExp, line)
+	if len(ret) == 0 {
+		return nil, errors.Errorf("can't parse line: %q", line)
+	}
+	laneWidthStr := ret["lane_width"]
+	laneWidth, _ := strconv.Atoi(laneWidthStr)
+	return api.NewIsolatedDevicePCIEInfo(ret["speed"], laneWidth)
 }
 
 func (d *PCIDevice) String() string {
@@ -539,11 +644,7 @@ func (g *IOMMUGroup) String() string {
 }
 
 func detectPCIDevByAddr(addr string) (*PCIDevice, error) {
-	ret, err := bashOutput(fmt.Sprintf("lspci -nnmm -s %s", addr))
-	if err != nil {
-		return nil, err
-	}
-	return NewPCIDevice(strings.Join(ret, ""))
+	return NewPCIDevice(addr)
 }
 
 func detectPCIDevByAddrWithoutIOMMUGroup(addr string) (*PCIDevice, error) {
@@ -551,7 +652,11 @@ func detectPCIDevByAddrWithoutIOMMUGroup(addr string) (*PCIDevice, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewPCIDevice2(strings.Join(ret, "")), nil
+	line := strings.Join(ret, "")
+	if line == "" {
+		return nil, nil
+	}
+	return NewPCIDevice2(line), nil
 }
 
 func getDeviceCmd(dev IDevice, index int) string {

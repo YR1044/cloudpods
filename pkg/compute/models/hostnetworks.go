@@ -28,6 +28,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 )
 
+// +onecloud:swagger-gen-ignore
 type SHostnetworkManager struct {
 	SHostJointsManager
 	SNetworkResourceBaseManager
@@ -51,6 +52,7 @@ func init() {
 	})
 }
 
+// +onecloud:model-api-gen
 type SHostnetwork struct {
 	SHostJointsBase
 
@@ -294,4 +296,22 @@ func (manager *SHostnetworkManager) ListItemExportKeys(ctx context.Context,
 	}
 
 	return q, nil
+}
+
+func (manager *SHostnetworkManager) fetchHostnetworks(filter func(q *sqlchemy.SQuery) *sqlchemy.SQuery) ([]SHostnetwork, error) {
+	q := manager.Query()
+	q = filter(q)
+	ret := make([]SHostnetwork, 0)
+	err := db.FetchModelObjects(manager, q, &ret)
+	if err != nil {
+		return nil, errors.Wrap(err, "FetchModelObjects")
+	}
+	return ret, nil
+}
+
+func (manager *SHostnetworkManager) fetchHostnetworksByNetwork(netId string) ([]SHostnetwork, error) {
+	return manager.fetchHostnetworks(func(q *sqlchemy.SQuery) *sqlchemy.SQuery {
+		q = q.Equals("network_id", netId)
+		return q
+	})
 }

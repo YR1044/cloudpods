@@ -34,6 +34,8 @@ import (
 	"yunion.io/x/onecloud/pkg/util/seclib2"
 )
 
+var _ IDisk = (*SRBDDisk)(nil)
+
 type SRBDDisk struct {
 	SBaseDisk
 }
@@ -79,9 +81,8 @@ func (d *SRBDDisk) GetSnapshotDir() string {
 
 func (d *SRBDDisk) GetDiskDesc() jsonutils.JSONObject {
 	storage := d.Storage.(*SRbdStorage)
-	storageConf := d.Storage.GetStorageConf()
-	pool, _ := storageConf.GetString("pool")
-	sizeMb, _ := storage.getImageSizeMb(pool, d.Id)
+
+	sizeMb, _ := storage.getImageSizeMb(d.Id)
 	desc := map[string]interface{}{
 		"disk_id":     d.Id,
 		"disk_format": "raw",
@@ -102,9 +103,8 @@ func (d *SRBDDisk) DeleteAllSnapshot(skipRecycle bool) error {
 func (d *SRBDDisk) Delete(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
 	p := params.(api.DiskDeleteInput)
 	storage := d.Storage.(*SRbdStorage)
-	storageConf := d.Storage.GetStorageConf()
-	pool, _ := storageConf.GetString("pool")
-	return nil, storage.deleteImage(pool, d.Id, p.SkipRecycle != nil && *p.SkipRecycle)
+
+	return nil, storage.deleteImage(d.Id, p.SkipRecycle != nil && *p.SkipRecycle)
 }
 
 func (d *SRBDDisk) OnRebuildRoot(ctx context.Context, params api.DiskAllocateInput) error {
@@ -124,10 +124,8 @@ func (d *SRBDDisk) Resize(ctx context.Context, params interface{}) (jsonutils.JS
 		return nil, hostutils.ParamsError
 	}
 	storage := d.Storage.(*SRbdStorage)
-	storageConf := d.Storage.GetStorageConf()
-	pool, _ := storageConf.GetString("pool")
 	sizeMb, _ := diskInfo.Int("size")
-	if err := storage.resizeImage(pool, d.Id, uint64(sizeMb)); err != nil {
+	if err := storage.resizeImage(d.Id, uint64(sizeMb)); err != nil {
 		return nil, err
 	}
 
@@ -135,7 +133,8 @@ func (d *SRBDDisk) Resize(ctx context.Context, params interface{}) (jsonutils.JS
 		Path: d.GetPath(),
 	}
 	if err := d.ResizeFs(resizeFsInfo); err != nil {
-		return nil, errors.Wrapf(err, "resize fs %s", d.GetPath())
+		log.Errorf("Resize fs %s fail %s", d.GetPath(), err)
+		// return nil, errors.Wrapf(err, "resize fs %s", d.GetPath())
 	}
 
 	return d.GetDiskDesc(), nil
@@ -161,8 +160,7 @@ func (d *SRBDDisk) PrepareSaveToGlance(ctx context.Context, params interface{}) 
 
 func (d *SRBDDisk) CleanupSnapshots(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
 	storage := d.Storage.(*SRbdStorage)
-	pool, _ := storage.StorageConf.GetString("pool")
-	return nil, storage.deleteSnapshot(pool, d.Id, "")
+	return nil, storage.deleteSnapshot(d.Id, "")
 }
 
 func (d *SRBDDisk) PrepareMigrate(liveMigrate bool) ([]string, string, bool, error) {
@@ -203,9 +201,9 @@ func (d *SRBDDisk) createFromTemplate(ctx context.Context, imageId, format strin
 	defer imageCacheManager.ReleaseImage(ctx, imageId)
 
 	storage := d.Storage.(*SRbdStorage)
-	destPool, _ := storage.StorageConf.GetString("pool")
-	storage.deleteImage(destPool, d.Id, false) //重装系统时，需要删除以前的系统盘
-	err = storage.cloneImage(ctx, imageCacheManager.GetPath(), imageCache.GetName(), destPool, d.Id)
+
+	storage.deleteImage(d.Id, false) //重装系统时，需要删除以前的系统盘
+	err = storage.cloneImage(ctx, imageCacheManager.GetPath(), imageCache.GetName(), storage.Pool, d.Id)
 	if err != nil {
 		return nil, errors.Wrapf(err, "cloneImage(%s)", imageCache.GetName())
 	}
@@ -216,13 +214,13 @@ func (d *SRBDDisk) CreateFromImageFuse(ctx context.Context, url string, size int
 	return fmt.Errorf("Not support")
 }
 
-func (d *SRBDDisk) CreateRaw(ctx context.Context, sizeMb int, diskFromat string, fsFormat string, encryptInfo *apis.SEncryptInfo, diskId string, back string) (jsonutils.JSONObject, error) {
+func (d *SRBDDisk) CreateRaw(ctx context.Context, sizeMb int, diskFormat string, fsFormat string, fsFeatures *api.DiskFsFeatures, encryptInfo *apis.SEncryptInfo, diskId string, back string) (jsonutils.JSONObject, error) {
 	if encryptInfo != nil {
 		return nil, errors.Wrap(httperrors.ErrNotSupported, "rbd not support encryptInfo")
 	}
 	storage := d.Storage.(*SRbdStorage)
-	pool, _ := storage.StorageConf.GetString("pool")
-	if err := storage.createImage(pool, diskId, uint64(sizeMb)); err != nil {
+
+	if err := storage.createImage(diskId, uint64(sizeMb)); err != nil {
 		return nil, err
 	}
 
@@ -230,7 +228,7 @@ func (d *SRBDDisk) CreateRaw(ctx context.Context, sizeMb int, diskFromat string,
 		Path: d.GetPath(),
 	}
 	if utils.IsInStringArray(fsFormat, []string{"swap", "ext2", "ext3", "ext4", "xfs"}) {
-		d.FormatFs(fsFormat, diskId, diskInfo)
+		d.FormatFs(fsFormat, nil, diskId, diskInfo)
 	}
 
 	return d.GetDiskDesc(), nil
@@ -241,10 +239,10 @@ func (d *SRBDDisk) PostCreateFromImageFuse() {
 }
 
 func (d *SRBDDisk) DiskBackup(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
-	diskBackup := params.(*SDiskBakcup)
+	diskBackup := params.(*SDiskBackup)
 	storage := d.Storage.(*SRbdStorage)
-	pool, _ := storage.StorageConf.GetString("pool")
-	sizeMb, err := storage.createBackup(pool, d.Id, diskBackup.SnapshotId, diskBackup.BackupId, diskBackup.BackupStorageId, diskBackup.BackupStorageAccessInfo)
+
+	sizeMb, err := storage.createBackup(ctx, d.Id, diskBackup)
 	if err != nil {
 		return nil, err
 	}
@@ -255,14 +253,16 @@ func (d *SRBDDisk) DiskBackup(ctx context.Context, params interface{}) (jsonutil
 
 func (d *SRBDDisk) CreateSnapshot(snapshotId string, encryptKey string, encFormat qemuimg.TEncryptFormat, encAlg seclib2.TSymEncAlg) error {
 	storage := d.Storage.(*SRbdStorage)
-	pool, _ := storage.StorageConf.GetString("pool")
-	return storage.createSnapshot(pool, d.Id, snapshotId)
+	return storage.createSnapshot(d.Id, snapshotId)
 }
 
-func (d *SRBDDisk) DeleteSnapshot(snapshotId, convertSnapshot string, pendingDelete bool) error {
+func (d *SRBDDisk) ConvertSnapshot(convertSnapshotId string, encryptInfo apis.SEncryptInfo) error {
+	return nil
+}
+
+func (d *SRBDDisk) DeleteSnapshot(snapshotId, convertSnapshot string, blockStream bool, encryptInfo apis.SEncryptInfo) error {
 	storage := d.Storage.(*SRbdStorage)
-	pool, _ := storage.StorageConf.GetString("pool")
-	return storage.deleteSnapshot(pool, d.Id, snapshotId)
+	return storage.deleteSnapshot(d.Id, snapshotId)
 }
 
 func (d *SRBDDisk) DiskSnapshot(ctx context.Context, params interface{}) (jsonutils.JSONObject, error) {
@@ -278,7 +278,7 @@ func (d *SRBDDisk) DiskDeleteSnapshot(ctx context.Context, params interface{}) (
 	if !ok {
 		return nil, hostutils.ParamsError
 	}
-	err := d.DeleteSnapshot(snapshotId, "", false)
+	err := d.DeleteSnapshot(snapshotId, "", false, apis.SEncryptInfo{})
 	if err != nil {
 		return nil, err
 	} else {
@@ -298,8 +298,8 @@ func (d *SRBDDisk) ResetFromSnapshot(ctx context.Context, params interface{}) (j
 		diskId = d.GetId()
 	}
 	storage := d.Storage.(*SRbdStorage)
-	pool, _ := storage.StorageConf.GetString("pool")
-	return nil, storage.resetDisk(pool, diskId, resetParams.SnapshotId)
+
+	return nil, storage.resetDisk(diskId, resetParams.SnapshotId)
 }
 
 func (d *SRBDDisk) CreateFromRbdSnapshot(ctx context.Context, snapshot, srcDiskId, srcPool string) error {

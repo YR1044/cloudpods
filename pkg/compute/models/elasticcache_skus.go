@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/jsonutils"
@@ -34,12 +35,15 @@ import (
 	"yunion.io/x/onecloud/pkg/cloudcommon/db/lockman"
 	"yunion.io/x/onecloud/pkg/cloudcommon/policy"
 	"yunion.io/x/onecloud/pkg/cloudcommon/validators"
+	"yunion.io/x/onecloud/pkg/compute/options"
 	"yunion.io/x/onecloud/pkg/httperrors"
 	"yunion.io/x/onecloud/pkg/mcclient"
 	"yunion.io/x/onecloud/pkg/util/stringutils2"
 	"yunion.io/x/onecloud/pkg/util/yunionmeta"
 )
 
+// +onecloud:swagger-gen-model-singular=elasticcachesku
+// +onecloud:swagger-gen-model-plural=elasticcacheskus
 type SElasticcacheSkuManager struct {
 	db.SStatusStandaloneResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -398,7 +402,7 @@ func (manager *SElasticcacheSkuManager) SyncElasticcacheSkus(ctx context.Context
 		if cnt, _ := removed[i].GetElasticcacheCount(); cnt > 0 {
 			err = removed[i].MarkAsSoldout(ctx)
 		} else {
-			err = removed[i].Delete(ctx, userCred)
+			err = db.RealDeleteModel(ctx, userCred, &removed[i])
 		}
 		if err != nil {
 			syncResult.DeleteError(err)
@@ -416,14 +420,26 @@ func (manager *SElasticcacheSkuManager) SyncElasticcacheSkus(ctx context.Context
 			}
 		}
 	}
+	ch := make(chan struct{}, options.Options.SkuBatchSync)
+	defer close(ch)
+	var wg sync.WaitGroup
 	for i := 0; i < len(added); i += 1 {
-		err = region.newFromPublicCloudSku(ctx, userCred, added[i].GetExternalId())
-		if err != nil {
-			syncResult.AddError(err)
-		} else {
+		ch <- struct{}{}
+		wg.Add(1)
+		go func(sku SElasticcacheSku) {
+			defer func() {
+				wg.Done()
+				<-ch
+			}()
+			err = region.newFromPublicCloudSku(ctx, userCred, sku.GetExternalId())
+			if err != nil {
+				syncResult.AddError(err)
+				return
+			}
 			syncResult.Add()
-		}
+		}(added[i])
 	}
+	wg.Wait()
 	return syncResult
 }
 
@@ -460,7 +476,7 @@ func (self *SCloudregion) newFromPublicCloudSku(ctx context.Context, userCred mc
 		zoneMaps[zone.ExternalId] = zone.Id
 	}
 
-	skuUrl := fmt.Sprintf("%s/%s/%s.json", meta.ElasticCacheBase, self.ExternalId, externalId)
+	skuUrl := self.getMetaUrl(meta.ElasticCacheBase, externalId)
 	sku := &SElasticcacheSku{}
 	sku.SetModelManager(ElasticcacheSkuManager, sku)
 	err = meta.Get(skuUrl, sku)
@@ -627,7 +643,7 @@ func (manager *SElasticcacheSkuManager) PerformActionSync(ctx context.Context, u
 	}
 
 	for _, v := range keyV {
-		if err := v.Validate(data); err != nil {
+		if err := v.Validate(ctx, data); err != nil {
 			return nil, err
 		}
 	}
@@ -792,6 +808,10 @@ func SyncElasticCacheSkus(ctx context.Context, userCred mcclient.TokenCredential
 			return
 		}
 	}
+	cloudregions := fetchSkuSyncCloudregions()
+	if len(cloudregions) == 0 {
+		return
+	}
 
 	meta, err := yunionmeta.FetchYunionmeta(ctx)
 	if err != nil {
@@ -805,7 +825,6 @@ func SyncElasticCacheSkus(ctx context.Context, userCred mcclient.TokenCredential
 		return
 	}
 
-	cloudregions := fetchSkuSyncCloudregions()
 	for i := range cloudregions {
 		region := &cloudregions[i]
 

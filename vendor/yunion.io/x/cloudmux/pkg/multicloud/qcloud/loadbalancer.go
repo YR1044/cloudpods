@@ -51,7 +51,6 @@ type SLoadbalancer struct {
 	region *SRegion
 
 	Status            int64     `json:"Status"` // 0：创建中，1：正常运行
-	Domain            string    `json:"Domain"`
 	VpcId             string    `json:"VpcId"`
 	Log               string    `json:"Log"`
 	ProjectId         int64     `json:"ProjectId"`
@@ -72,6 +71,9 @@ type SLoadbalancer struct {
 		InternetChargeType      string
 		InternetMaxBandwidthOut int
 	}
+	LoadBalancerDomain string `json:"LoadBalancerDomain"`
+
+	SecureGroups []string
 }
 
 type ZoneSet struct {
@@ -93,6 +95,10 @@ func (self *SLoadbalancer) GetChargeType() string {
 
 func (self *SLoadbalancer) GetEgressMbps() int {
 	return self.NetworkAttributes.InternetMaxBandwidthOut
+}
+
+func (lb *SLoadbalancer) GetSecurityGroupIds() ([]string, error) {
+	return lb.SecureGroups, nil
 }
 
 // https://cloud.tencent.com/document/product/214/30689
@@ -213,7 +219,10 @@ func (self *SLoadbalancer) Refresh() error {
 
 // 腾讯云当前不支持一个LB绑定多个ip，每个LB只支持绑定一个ip
 func (self *SLoadbalancer) GetAddress() string {
-	return self.LoadBalancerVips[0]
+	for _, addr := range self.LoadBalancerVips {
+		return addr
+	}
+	return self.LoadBalancerDomain
 }
 
 func (self *SLoadbalancer) GetAddressType() string {

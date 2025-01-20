@@ -17,7 +17,6 @@ package models
 import (
 	"context"
 	"database/sql"
-	"fmt"
 
 	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
@@ -28,6 +27,7 @@ import (
 	"yunion.io/x/onecloud/pkg/util/yunionmeta"
 )
 
+// +onecloud:swagger-gen-ignore
 type SCloudimageManager struct {
 	db.SStandaloneResourceBaseManager
 	db.SExternalizedResourceBaseManager
@@ -47,6 +47,7 @@ func init() {
 	CloudimageManager.SetVirtualObject(CloudimageManager)
 }
 
+// +onecloud:swagger-gen-ignore
 type SCloudimage struct {
 	db.SStandaloneResourceBase
 	db.SExternalizedResourceBase
@@ -69,6 +70,10 @@ func SyncPublicCloudImages(ctx context.Context, userCred mcclient.TokenCredentia
 	q := CloudregionManager.Query().In("provider", CloudproviderManager.GetPublicProviderProvidersQuery())
 	err := db.FetchModelObjects(CloudregionManager, q, &regions)
 	if err != nil {
+		return
+	}
+
+	if len(regions) == 0 {
 		return
 	}
 
@@ -136,13 +141,17 @@ func (self *SCloudimage) syncRemove(ctx context.Context, userCred mcclient.Token
 	return self.Delete(ctx, userCred)
 }
 
+func (self *SCloudimage) Delete(ctx context.Context, userCred mcclient.TokenCredential) error {
+	return db.RealDeleteModel(ctx, userCred, self)
+}
+
 func (self *SCloudimage) syncWithImage(ctx context.Context, userCred mcclient.TokenCredential, image SCachedimage, region *SCloudregion) error {
 	meta, err := yunionmeta.FetchYunionmeta(ctx)
 	if err != nil {
 		return err
 	}
 
-	skuUrl := fmt.Sprintf("%s/%s/%s.json", meta.ImageBase, region.ExternalId, image.GetGlobalId())
+	skuUrl := region.getMetaUrl(meta.ImageBase, image.GetGlobalId())
 
 	obj, err := db.FetchByExternalId(CachedimageManager, image.GetGlobalId())
 	if err != nil {

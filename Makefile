@@ -81,7 +81,7 @@ gencopyright:
 	@bash scripts/gencopyright.sh pkg cmd
 
 test:
-	@go test $(GO_BUILD_FLAGS) $(shell go list ./... | egrep -v 'host-image|hostimage')
+	@go test $(GO_BUILD_FLAGS) $(shell go list ./... | egrep -v 'host-image|hostimage|torrent')
 
 vet:
 	go vet ./...
@@ -89,11 +89,14 @@ vet:
 # cmd/esxi-agent: prepare_dir
 # 	CGO_ENABLED=0 $(GO_BUILD) -o $(BIN_DIR)/$(shell basename $@) $(REPO_PREFIX)/$@
 
-cmd/fetcherfs: prepare_dir
-	CGO_ENABLED=0 $(GO_BUILD) -o $(BIN_DIR)/$(shell basename $@) $(REPO_PREFIX)/$@
+cmd/host: prepare_dir
+	CGO_ENABLED=1 $(GO_BUILD) -o $(BIN_DIR)/$(shell basename $@) $(REPO_PREFIX)/$@
+
+cmd/host-image: prepare_dir
+	CGO_ENABLED=1 $(GO_BUILD) -o $(BIN_DIR)/$(shell basename $@) $(REPO_PREFIX)/$@
 
 cmd/%: prepare_dir
-	$(GO_BUILD) -o $(BIN_DIR)/$(shell basename $@) $(REPO_PREFIX)/$@
+	CGO_ENABLED=0 $(GO_BUILD) -o $(BIN_DIR)/$(shell basename $@) $(REPO_PREFIX)/$@
 
 rpm/%: cmd/%
 	$(BUILD_SCRIPT) $*
@@ -288,8 +291,8 @@ GOPROXY ?= direct
 mod:
 	GOPROXY=$(GOPROXY) GONOSUMDB=yunion.io/x go get -d yunion.io/x/cloudmux@$(RELEASE_BRANCH)
 	GOPROXY=$(GOPROXY) GONOSUMDB=yunion.io/x go get -d $(patsubst %,%@master,$(shell GO111MODULE=on go mod edit -print  | sed -n -e 's|.*\(yunion.io/x/[a-z].*\) v.*|\1|p' | grep -v '/cloudmux$$'))
-	go mod tidy
-	go mod vendor -v
+	GOPROXY=$(GOPROXY) GONOSUMDB=yunion.io/x go mod tidy
+	GOPROXY=$(GOPROXY) GONOSUMDB=yunion.io/x go mod vendor -v
 
 define helpText
 Build with docker
@@ -349,7 +352,7 @@ image:
 .PHONY: image
 
 image-telegraf-raid-plugin:
-	VERSION=release-1.6.4 ARCH=all make image telegraf-raid-plugin
+	VERSION=release-1.6.5 ARCH=all make image telegraf-raid-plugin
 
 %:
 	@:

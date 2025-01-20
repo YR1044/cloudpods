@@ -152,10 +152,6 @@ func (self *SInstance) GetSecurityGroupIds() ([]string, error) {
 	return ret, nil
 }
 
-func (self *SInstance) AssignSecurityGroup(secgroupId string) error {
-	return nil
-}
-
 func (self *SInstance) SetSecurityGroups(secgroupIds []string) error {
 	return self.node.cluster.region.modifyInstanceAttribute(self.InstancesSet.InstanceId, map[string]string{"GroupId": secgroupIds[0]})
 }
@@ -172,9 +168,9 @@ func (self *SInstance) ChangeConfig(ctx context.Context, config *cloudprovider.S
 	return cloudprovider.ErrNotImplemented
 }
 
-func (self *SInstance) DeployVM(ctx context.Context, name string, username string, password string, publicKey string, deleteKeypair bool, description string) error {
+func (self *SInstance) DeployVM(ctx context.Context, opts *cloudprovider.SInstanceDeployOptions) error {
 	attrs := make(map[string]string)
-	if password != "" {
+	if opts.Password != "" {
 		attrs["InstanceAction"] = "ResetPassword"
 	}
 	return self.node.cluster.region.modifyInstanceAttribute(self.InstancesSet.InstanceId, attrs)
@@ -430,8 +426,8 @@ func (self *SInstance) UpdateInstanceType(instanceType string) error {
 	return self.node.cluster.region.modifyInstanceAttribute(self.InstancesSet.InstanceId, map[string]string{"InstanceType": instanceType})
 }
 
-func (self *SInstance) UpdateVM(ctx context.Context, name string) error {
-	return self.node.cluster.region.modifyInstanceAttribute(self.InstancesSet.InstanceId, map[string]string{"InstanceName": name})
+func (self *SInstance) UpdateVM(ctx context.Context, input cloudprovider.SInstanceUpdateOptions) error {
+	return self.node.cluster.region.modifyInstanceAttribute(self.InstancesSet.InstanceId, map[string]string{"InstanceName": input.NAME})
 }
 
 func (self *SInstance) CreateInstanceSnapshot(ctx context.Context, name string, desc string) (cloudprovider.ICloudInstanceSnapshot, error) {

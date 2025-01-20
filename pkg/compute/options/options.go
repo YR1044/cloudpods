@@ -25,9 +25,10 @@ import (
 type ComputeOptions struct {
 	PortV2 int `help:"Listening port for region V2"`
 
-	DNSServer    string   `help:"Address of DNS server"`
-	DNSDomain    string   `help:"Domain suffix for virtual servers"`
-	DNSResolvers []string `help:"Upstream DNS resolvers"`
+	DNSServer    string   `help:"Address of DNS server" json:"dns_server"`
+	DNSDomain    string   `help:"Domain suffix for virtual servers" json:"dns_domain"`
+	DNSResolvers []string `help:"Upstream DNS resolvers" json:"dns_resolvers"`
+	// EnableDefaultDNS bool     `help:"Enable default DNS if dns server not specific" default:"true"`
 
 	DefaultCPUOvercommitBound     float32 `default:"8.0" help:"Default cpu overcommit bound for host, default to 8"`
 	DefaultMemoryOvercommitBound  float32 `default:"1.0" help:"Default memory overcommit bound for host, default to 1"`
@@ -41,7 +42,7 @@ type ComputeOptions struct {
 	pending_delete.SPendingDeleteOptions
 
 	PrepaidExpireCheck              bool `default:"false" help:"clean expired servers or disks"`
-	PrepaidDeleteExpireCheck        bool `default:"true" help:"check prepaid expired before delete"`
+	PrepaidDeleteExpireCheck        bool `default:"false" help:"check prepaid expired before delete"`
 	PrepaidExpireCheckSeconds       int  `default:"600" help:"How long to wait to scan expired prepaid VM or disks, default is 10 minutes"`
 	ExpiredPrepaidMaxCleanBatchSize int  `default:"50" help:"How many expired prepaid servers can be deleted in a batch"`
 
@@ -98,17 +99,18 @@ type ComputeOptions struct {
 	BaremetalPreparePackageUrl string `help:"Baremetal online register package"`
 
 	// snapshot options
-	AutoSnapshotDay               int `default:"1" help:"Days auto snapshot disks, default 1 day"`
-	AutoSnapshotHour              int `default:"2" help:"What hour take sanpshot, default 02:00"`
-	DefaultMaxSnapshotCount       int `default:"9" help:"Per Disk max snapshot count, default 9"`
-	DefaultMaxManualSnapshotCount int `default:"2" help:"Per Disk max manual snapshot count, default 2"`
+	AutoSnapshotDay  int `default:"1" help:"Days auto snapshot disks, default 1 day"`
+	AutoSnapshotHour int `default:"2" help:"What hour take sanpshot, default 02:00"`
 
 	//snapshot policy options
-	RetentionDaysLimit  int `default:"49" help:"Days of snapshot retention, default 49 days"`
-	TimePointsLimit     int `default:"1" help:"time point of every days, default 1 point"`
-	RepeatWeekdaysLimit int `default:"7" help:"day point of every weekday, default 7 points"`
+	RetentionDaysLimit int `default:"49" help:"Days of snapshot retention, default 49 days"`
+	TimePointsLimit    int `default:"1" help:"time point of every days, default 1 point"`
+
+	ServerStatusSyncIntervalMinutes int `default:"5" help:"Interval to sync server status, defualt is 5 minutes"`
+	CloudAccountBatchSyncSize       int `default:"10" help:"How many cloud account syncing in a batch"`
 
 	ServerSkuSyncIntervalMinutes int `default:"60" help:"Interval to sync public cloud server skus, defualt is 1 hour"`
+	SkuBatchSync                 int `default:"5" help:"How many skus can be sync in a batch"`
 
 	// sku sync
 	SyncSkusDay  int `default:"1" help:"Days auto sync skus data, default 1 day"`
@@ -121,6 +123,7 @@ type ComputeOptions struct {
 	// cloud image sync
 	CloudImagesSyncIntervalHours int `default:"3" help:"Interval to sync public cloud image, defualt is 3 hour"`
 
+	// 由云管(Cloudpods)负责分配IP地址，默认为false。默认是由对应具备IPAM能力的云平台自主分配IP地址
 	EnablePreAllocateIpAddr bool `help:"Enable private and public cloud private ip pre allocate, default false" default:"false"`
 
 	// 创建虚拟机失败后, 自动使用其他相同配置套餐
@@ -131,13 +134,15 @@ type ComputeOptions struct {
 	SnapshotCreateDiskProtocol string `help:"Snapshot create disk protocol" choices:"url|fuse" default:"fuse"`
 
 	HostOfflineMaxSeconds        int `help:"Maximal seconds interval that a host considered offline during which it did not ping region, default is 3 minues" default:"180"`
-	HostOfflineDetectionInterval int `help:"Interval to check offline hosts, defualt is half a minute" default:"30"`
+	HostOfflineDetectionInterval int `help:"Interval to check offline hosts, default is half a minute" default:"30"`
+
+	ManagedHostSyncStatusIntervalSeconds int `help:"interval to automatically sync status of managed hosts, default is 5 minutes" default:"300"`
 
 	MinimalIpAddrReusedIntervalSeconds int `help:"Minimal seconds when a release IP address can be reallocate" default:"30"`
 
 	CloudSyncWorkerCount         int `help:"how many current synchronization threads" default:"5"`
 	CloudProviderSyncWorkerCount int `help:"how many current providers synchronize their regions, practically no limit" default:"10"`
-	CloudAutoSyncIntervalSeconds int `help:"frequency to check auto sync tasks" default:"30"`
+	CloudAutoSyncIntervalSeconds int `help:"frequency to check auto sync tasks" default:"300"`
 	DefaultSyncIntervalSeconds   int `help:"minimal synchronization interval, default 15 minutes" default:"900"`
 	MaxCloudAccountErrorCount    int `help:"maximal consecutive error count allow for a cloud account" default:"5"`
 
@@ -161,16 +166,14 @@ type ComputeOptions struct {
 	SyncStorageCapacityUsedIntervalMinutes int  `help:"interval sync storage capacity used" default:"20"`
 	LockStorageFromCachedimage             bool `help:"must use storage in where selected cachedimage when creating vm"`
 
-	SyncExtDiskSnapshotIntervalMinutes int  `help:"sync snapshot for external disk" default:"20"`
-	AutoReconcileBackupServers         bool `help:"auto reconcile backup servers" default:"false"`
+	AutoReconcileBackupServers   bool `help:"auto reconcile backup servers" default:"false"`
+	SetKVMServerAsDaemonOnCreate bool `help:"set kvm guest as daemon server on create" default:"false"`
 
 	SCapabilityOptions
 	SASControllerOptions
 	common_options.CommonOptions
 	common_options.DBOptions
 
-	EnableAutoMergeSecurityGroup bool `help:"Enable auto merge secgroup when sync security group from cloud, default False" default:"false"`
-	EnableAutoSplitSecurityGroup bool `help:"Enable auto split secgroup when sync security group with diffrent rules from cloud, default False" default:"true"`
 	DeleteSnapshotExpiredRelease bool `help:"Should the virtual machine be automatically deleted when the virtual machine expires?" default:"false"`
 	DeleteEipExpiredRelease      bool `help:"Should the EIP  be automatically deleted when the virtual machine expires?" default:"false"`
 	DeleteDisksExpiredRelease    bool `help:"Should the Disks be automatically deleted when the virtual machine expires?" default:"false"`
@@ -191,6 +194,8 @@ type ComputeOptions struct {
 	// 弹性伸缩中的ecs一般会有特殊的系统标签，通过指定这些标签可以忽略这部分ecs的同步, 指定多个key需要以 ',' 分隔
 	SkipServerBySysTagKeys  string `help:"skip server,disk sync and create with system tags" default:""`
 	SkipServerByUserTagKeys string `help:"skip server,disk sync and create with user tags" default:""`
+	// 修改标签时不再同步至云上, 云账号同步资源时不会冲掉本地打的标签(key相同的会覆盖), 云账号开启只读同步和此参数效果相同,且仅影响开启只读同步的账号
+	KeepTagLocalization bool `help:"keep tag localization, not synchronized to the cloud" default:"false"`
 
 	EnableMonitorAgent bool `help:"enable public cloud vm monitor agent" default:"false"`
 
@@ -203,7 +208,7 @@ type ComputeOptions struct {
 	ForceUseOriginVnc                 bool   `help:"force openstack use origin vnc console" default:"true"`
 
 	LocalDataDiskMinSizeGB int `help:"Data disk min size when using local storage" default:"10"`
-	LocalDataDiskMaxSizeGB int `help:"Data disk max size when using local storage" default:"40960"`
+	LocalDataDiskMaxSizeGB int `help:"Data disk max size when using local storage" default:"10240"`
 
 	LocalSysDiskMinSizeGB int `help:"System disk min size when using local storage" default:"30"`
 	LocalSysDiskMaxSizeGB int `help:"System disk max size when using local storage" default:"2048"`
@@ -215,7 +220,12 @@ type ComputeOptions struct {
 
 	ResourceExpiredNotifyDays []int `help:"The notify of resource expired" default:"1,3,30"`
 
+	SkipSyncHostConfigInfoProviders    string `help:"Skip sync host cpu and mem config by provider"`
+	SkipSyncStorageConfigInfoProviders string `help:"Skip sync storage capacity and media type config by provider"`
+
 	esxi.EsxiOptions
+
+	NetworkAlwaysManualConfig bool `help:"always manually configure network settings" default:"false"`
 }
 
 type SCapabilityOptions struct {

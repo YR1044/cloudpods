@@ -263,6 +263,22 @@ func (rds *SDBInstance) GetPort() int {
 	return rds.Endpoint.Port
 }
 
+func (rds *SDBInstance) GetDescription() string {
+	return rds.AwsTags.GetDescription()
+}
+
+func (rds *SDBInstance) Update(ctx context.Context, input cloudprovider.SDBInstanceUpdateOptions) error {
+	return rds.SetTags(map[string]string{"Description": input.Description}, false)
+}
+
+func (region *SRegion) Update(instanceId string, input cloudprovider.SDBInstanceUpdateOptions) error {
+	dbinstance, err := region.GetDBInstance(instanceId)
+	if err != nil {
+		return errors.Wrap(err, "GetDBInstance")
+	}
+	return dbinstance.SetTags(map[string]string{"Description": input.Description}, false)
+}
+
 func (rds *SDBInstance) GetMaintainTime() string {
 	return rds.PreferredMaintenanceWindow
 }
@@ -302,15 +318,7 @@ func (region *SRegion) GetDBInstance(instanceId string) (*SDBInstance, error) {
 }
 
 func (rds *SDBInstance) GetZone1Id() string {
-	if len(rds.AvailabilityZone) > 0 {
-		zone, err := rds.region.getZoneById(rds.AvailabilityZone)
-		if err != nil {
-			log.Errorf("rds.GetIZoneId %s error: %v", rds.DBInstanceIdentifier, err)
-			return ""
-		}
-		return zone.GetGlobalId()
-	}
-	return ""
+	return rds.AvailabilityZone
 }
 
 func (rds *SDBInstance) GetZone2Id() string {

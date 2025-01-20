@@ -44,6 +44,14 @@ const (
 	HOST_TYPE_H3C            = "h3c"
 	HOST_TYPE_KSYUN          = "ksyun"
 	HOST_TYPE_BAIDU          = "baidu"
+	HOST_TYPE_CUCLOUD        = "cucloud"
+	HOST_TYPE_QINGCLOUD      = "qingcloud"
+	HOST_TYPE_VOLCENGINE     = "volcengine"
+	HOST_TYPE_ORACLE         = "oracle"
+	HOST_TYPE_SANGFOR        = "sangfor"
+	HOST_TYPE_ZETTAKIT       = "zettakit"
+	HOST_TYPE_UIS            = "uis"
+	HOST_TYPE_CAS            = "cas"
 
 	// # possible status
 	HOST_ONLINE  = "online"

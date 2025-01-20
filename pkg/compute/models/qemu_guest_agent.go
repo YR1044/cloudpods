@@ -58,8 +58,7 @@ func (self *SGuest) PerformQgaSetPassword(
 	if err != nil {
 		return nil, err
 	}
-	self.SetStatus(userCred, api.VM_QGA_SET_PASSWORD, "")
-	self.UpdateQgaStatus(api.QGA_STATUS_EXCUTING)
+	self.SetStatus(ctx, userCred, api.VM_QGA_SET_PASSWORD, "")
 	params := jsonutils.Marshal(input).(*jsonutils.JSONDict)
 	task, err := taskman.TaskManager.NewTask(ctx, "GuestQgaSetPasswordTask", self, userCred, params, "", "", nil)
 	if err != nil {
@@ -80,8 +79,15 @@ func (self *SGuest) PerformQgaPing(
 	}
 
 	res := jsonutils.NewDict()
-	host, _ := self.GetHost()
-	err := self.GetDriver().QgaRequestGuestPing(ctx, mcclient.GetTokenHeaders(userCred), host, self, false, input)
+	host, err := self.GetHost()
+	if err != nil {
+		return nil, err
+	}
+	drv, err := self.GetDriver()
+	if err != nil {
+		return nil, err
+	}
+	err = drv.QgaRequestGuestPing(ctx, mcclient.GetTokenHeaders(userCred), host, self, false, input)
 	if err != nil {
 		res.Set("ping_error", jsonutils.NewString(err.Error()))
 	}
@@ -100,6 +106,64 @@ func (self *SGuest) PerformQgaCommand(
 	if input.Command == "" {
 		return nil, httperrors.NewMissingParameterError("command")
 	}
-	host, _ := self.GetHost()
-	return self.GetDriver().RequestQgaCommand(ctx, userCred, jsonutils.Marshal(input), host, self)
+	host, err := self.GetHost()
+	if err != nil {
+		return nil, err
+	}
+	drv, err := self.GetDriver()
+	if err != nil {
+		return nil, err
+	}
+	return drv.RequestQgaCommand(ctx, userCred, jsonutils.Marshal(input), host, self)
+}
+
+func (self *SGuest) PerformQgaGuestInfoTask(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	input *api.ServerQgaGuestInfoTaskInput,
+) (jsonutils.JSONObject, error) {
+	if self.PowerStates != api.VM_POWER_STATES_ON {
+		return nil, httperrors.NewBadRequestError("can't use qga in vm status: %s", self.Status)
+	}
+	host, err := self.GetHost()
+	if err != nil {
+		return nil, err
+	}
+	drv, err := self.GetDriver()
+	if err != nil {
+		return nil, err
+	}
+	return drv.QgaRequestGuestInfoTask(ctx, userCred, nil, host, self)
+}
+
+func (self *SGuest) PerformQgaGetNetwork(
+	ctx context.Context,
+	userCred mcclient.TokenCredential,
+	query jsonutils.JSONObject,
+	input *api.ServerQgaGetNetworkInput,
+) (jsonutils.JSONObject, error) {
+	if self.PowerStates != api.VM_POWER_STATES_ON {
+		return nil, httperrors.NewBadRequestError("can't use qga in vm status: %s", self.Status)
+	}
+	host, err := self.GetHost()
+	if err != nil {
+		return nil, err
+	}
+	drv, err := self.GetDriver()
+	if err != nil {
+		return nil, err
+	}
+	return drv.QgaRequestGetNetwork(ctx, userCred, nil, host, self)
+}
+
+func (self *SGuest) startQgaSyncOsInfoTask(ctx context.Context, userCred mcclient.TokenCredential, parentTaskId string) error {
+	self.SetStatus(ctx, userCred, api.VM_QGA_SYNC_OS_INFO, "")
+	kwargs := jsonutils.NewDict()
+	task, err := taskman.TaskManager.NewTask(ctx, "GuestQgaSyncOsInfoTask", self, userCred, kwargs, parentTaskId, "", nil)
+	if err != nil {
+		return err
+	}
+	task.ScheduleRun(nil)
+	return nil
 }

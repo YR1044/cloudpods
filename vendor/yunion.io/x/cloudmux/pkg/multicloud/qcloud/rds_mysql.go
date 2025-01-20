@@ -755,6 +755,7 @@ func (self *SRegion) CreateMySQLDBInstance(opts *cloudprovider.SManagedDBInstanc
 		"GoodsNum":      "1",
 		"Memory":        fmt.Sprintf("%d", opts.VmemSizeMb),
 		"Volume":        fmt.Sprintf("%d", opts.DiskSizeGB),
+		"Cpu":           fmt.Sprintf("%d", opts.VcpuCount),
 		"EngineVersion": opts.EngineVersion,
 	}
 	if len(opts.VpcId) > 0 {
@@ -920,4 +921,16 @@ func (self *SRegion) GetIMySQLs() ([]cloudprovider.ICloudDBInstance, error) {
 		ret = append(ret, &mysql[i])
 	}
 	return ret, nil
+}
+
+func (self *SRegion) Update(id, name string) error {
+	params := map[string]string{
+		"InstanceId":   id,
+		"InstanceName": name,
+	}
+	_, err := self.cdbRequest("ModifyDBInstanceName", params)
+	if err != nil {
+		return errors.Wrapf(err, "cdbRequest")
+	}
+	return nil
 }
